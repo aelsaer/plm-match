@@ -1,0 +1,64 @@
+dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+
+map:
+  cache_path: ./outputs/aachen_map_cache/landmarks.pkl
+  map_feature_cache_size: 64
+
+dataset:
+  type: colmap_localization
+  image_root: images_upright
+  model_path: 3D-models/aachen_v_1_1
+  db_image_prefixes: [db/]
+  query_list: day_time_queries_with_intrinsics.txt
+
+hloc:
+  retrieval_file: pairs-query-netvlad50.txt
+  topk_db_images: 20
+  max_candidate_landmarks: 10000
+  max_index_landmarks_per_image: 1000
+  verify_image_batch_size: 1
+  verify_image_schedule: [4, 10, 20]
+
+backbone:
+  name: dinov2
+  model_name: dinov2_vits14
+  input_size: [518, 518]
+  device: cuda
+
+anchors:
+  alpha: 0.60
+  beta: 0.40
+  use_stability: true
+  topk: 128
+  grid_cells: [8, 8]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.08
+  merge_cos_sim: 0.72
+  manifold_rank: 2
+  min_obs: 3
+  max_obs_per_landmark: 8
+  max_colmap_point_error: 4.0
+  min_colmap_track_len: 3
+  min_staticness: 0.05
+
+matching:
+  topk_landmarks: 20
+  retrieval_anchor_batch_size: 256
+  materialize_topk_per_anchor: 4
+  max_materialized_landmarks: 512
+  max_matches: 512
+  group_verify_patience: 2
+  group_verify_min_inliers: 24
+  group_verify_hard_inliers: 40
+  use_pose_prior: false
+  carry_pose_prior: false
+  lambdas: [1.0, 1.2, 0.6, 0.0, 0.0]
+  min_cosine_sim: 0.25
+  min_score: 0.10
+  ratio_margin: 0.03
+
+pnp:
+  reproj_error_px: 6.0
+  iterations: 8000

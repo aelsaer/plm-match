@@ -1,0 +1,68 @@
+# Aachen day localization tuned to push DINO harder for accuracy.
+# This is intentionally slower and heavier than the default day config.
+dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+
+map:
+  cache_path: ./outputs/aachen_map_cache_dino_maxacc/landmarks.pkl
+  map_feature_cache_size: 96
+  query_cache_namespace: aachen_day_dino_maxacc_v1
+
+dataset:
+  type: colmap_localization
+  image_root: images_upright
+  model_path: 3D-models/aachen_v_1_1
+  db_image_prefixes: [db/]
+  query_list: day_time_queries_with_intrinsics.txt
+
+hloc:
+  retrieval_file: pairs-query-netvlad50.txt
+  topk_db_images: 40
+  max_candidate_landmarks: 10000
+  max_index_landmarks_per_image: 1400
+  verify_image_batch_size: 1
+  verify_image_schedule: [8, 20, 40]
+
+backbone:
+  name: dinov2
+  model_name: dinov2_vitb14
+  input_size: [518, 518]
+  device: cuda
+
+anchors:
+  alpha: 0.60
+  beta: 0.40
+  use_stability: true
+  topk: 256
+  grid_cells: [10, 10]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.08
+  merge_cos_sim: 0.72
+  manifold_rank: 2
+  cache_manifold_rank: 0
+  min_obs: 3
+  max_obs_per_landmark: 8
+  max_colmap_point_error: 4.0
+  min_colmap_track_len: 3
+  min_staticness: 0.05
+
+matching:
+  topk_landmarks: 30
+  retrieval_anchor_batch_size: 256
+  materialize_topk_per_anchor: 6
+  max_materialized_landmarks: 1536
+  max_matches: 768
+  group_verify_patience: 2
+  group_verify_min_inliers: 24
+  group_verify_hard_inliers: 48
+  use_pose_prior: false
+  carry_pose_prior: false
+  lambdas: [1.0, 1.2, 0.6, 0.0, 0.0]
+  min_cosine_sim: 0.25
+  min_score: 0.10
+  ratio_margin: 0.03
+
+pnp:
+  reproj_error_px: 6.0
+  iterations: 8000

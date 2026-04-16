@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+outputs/
+out_hloc_test/
+log.txt
+
+*.h5
+*.pkl
+*.npy
+*.npz
+
+.DS_Store

@@ -1,0 +1,154 @@
+# Table I sequential benchmark runner.
+#
+# Notes:
+# - Aachen v1.1 under this workspace does not include public query GT poses, so the
+#   threshold columns only auto-fill once you place an evaluation JSON in each run
+#   directory (default name: official_eval.json).
+# - Expected eval JSON keys are the same as the threshold keys below, for example:
+#     {
+#       "aachen_0.25m_2deg": 0.421,
+#       "aachen_0.5m_5deg": 0.638,
+#       "aachen_5m_10deg": 0.881
+#     }
+# - The HLoc rows use the local HLoc checkout under `/home/cvdp/phd/image-matching-webui/imcui`.
+#   Point `defaults.hloc_python` to a Python that has HLoc dependencies such as
+#   `pycolmap`, `h5py`, and Torch installed.
+
+defaults:
+  outputs_root: ./outputs/table_i
+  plm_python: /home/cvdp/miniconda3/envs/cv/bin/python
+  hloc_python: /home/cvdp/miniconda3/envs/cv/bin/python
+  hloc_root: /home/cvdp/phd/image-matching-webui/imcui
+  disable_query_cache: true
+  disable_map_cache: false
+
+table:
+  runtime_dataset: aachen
+
+datasets:
+  aachen:
+    hloc_dataset: aachen
+    dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+    default_eval_file: official_eval.json
+    thresholds:
+      - key: aachen_0.25m_2deg
+        label: Aachen (0.25 m, 2deg)
+        trans_m: 0.25
+        rot_deg: 2.0
+      - key: aachen_0.5m_5deg
+        label: Aachen (0.5 m, 5deg)
+        trans_m: 0.5
+        rot_deg: 5.0
+      - key: aachen_5m_10deg
+        label: Aachen (5 m, 10deg)
+        trans_m: 5.0
+        rot_deg: 10.0
+
+  inloc:
+    hloc_dataset: inloc
+    dataset_root: /home/cvdp/phd/object_matching/datasets/inloc
+    default_eval_file: official_eval.json
+    thresholds:
+      - key: inloc_0.25m_10deg
+        label: InLoc (0.25 m, 10deg)
+        trans_m: 0.25
+        rot_deg: 10.0
+      - key: inloc_0.5m_10deg
+        label: InLoc (0.5 m, 10deg)
+        trans_m: 0.5
+        rot_deg: 10.0
+
+methods:
+  - name: superpoint_superglue
+    label: SuperPoint + SuperGlue
+    runs:
+      aachen:
+        kind: hloc
+        method: superpoint_superglue
+      inloc:
+        kind: hloc
+        method: superpoint_superglue
+        query_list: queries/queries_with_intrinsics.txt
+        retrieval_file: pairs-query-netvlad50.txt
+        image_dir: images
+
+  - name: superpoint_lightglue
+    label: SuperPoint + LightGlue
+    runs:
+      aachen:
+        kind: hloc
+        method: superpoint_lightglue
+      inloc:
+        kind: hloc
+        method: superpoint_lightglue
+        query_list: queries/queries_with_intrinsics.txt
+        retrieval_file: pairs-query-netvlad50.txt
+        image_dir: images
+
+  - name: disk_lightglue
+    label: DISK + LightGlue
+    runs:
+      aachen:
+        kind: hloc
+        method: disk_lightglue
+      inloc:
+        kind: hloc
+        method: disk_lightglue
+        query_list: queries/queries_with_intrinsics.txt
+        retrieval_file: pairs-query-netvlad50.txt
+        image_dir: images
+
+  - name: xfeat
+    label: XFeat
+    runs:
+      aachen:
+        kind: hloc
+        method: xfeat
+      inloc:
+        kind: hloc
+        method: xfeat
+        query_list: queries/queries_with_intrinsics.txt
+        retrieval_file: pairs-query-netvlad50.txt
+        image_dir: images
+
+  - name: frozen_backbone_flat
+    label: Frozen backbone flat
+    runs:
+      aachen:
+        kind: plm
+        config: configs/aachen_v1_1_day_precise.yaml
+        overrides:
+          landmarks.manifold_rank: 0
+          matching.lambdas: [0.0, 1.0, 0.0, 0.0, 0.0]
+      inloc:
+        kind: plm
+        config: configs/inloc_colmap.yaml
+        overrides:
+          landmarks.manifold_rank: 0
+          matching.lambdas: [0.0, 1.0, 0.0, 0.0, 0.0]
+
+  - name: plm_mean
+    label: PLM mean
+    runs:
+      aachen:
+        kind: plm
+        config: configs/aachen_v1_1_day_precise.yaml
+        overrides:
+          landmarks.manifold_rank: 0
+          matching.lambdas: [0.0, 1.0, 0.6, 0.0, 0.0]
+      inloc:
+        kind: plm
+        config: configs/inloc_colmap.yaml
+        overrides:
+          landmarks.manifold_rank: 0
+          matching.lambdas: [0.0, 1.0, 0.6, 0.0, 0.0]
+
+  - name: plm_full
+    label: PLM full
+    runs:
+      aachen:
+        kind: plm
+        config: configs/aachen_v1_1_day_precise.yaml
+      inloc:
+        kind: plm
+        config: configs/inloc_colmap.yaml

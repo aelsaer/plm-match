@@ -1,0 +1,40 @@
+dataset_root: /path/to/inloc_colmap
+out_dir: ./outputs/inloc_colmap_plm
+
+dataset:
+  type: colmap_localization
+  image_root: images
+  model_path: sfm
+  query_list: queries/queries_with_intrinsics.txt
+  default_query_camera_from_first_map: true
+
+backbone:
+  name: dinov2
+  model_name: dinov2_vits14
+  input_size: [336, 336]
+  device: cpu
+
+anchors:
+  alpha: 0.60
+  beta: 0.40
+  use_stability: false
+  topk: 220
+  grid_cells: [4, 4]
+  nms_radius: 1
+
+landmarks:
+  manifold_rank: 2
+  min_obs: 2
+  max_colmap_point_error: 4.0
+  min_colmap_track_len: 2
+
+matching:
+  topk_landmarks: 20
+  max_matches: 256
+  use_pose_prior: false
+  carry_pose_prior: true
+  lambdas: [1.0, 1.2, 0.6, 0.3, 0.0]
+
+pnp:
+  reproj_error_px: 10.0
+  iterations: 4000

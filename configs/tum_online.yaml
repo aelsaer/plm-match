@@ -1,0 +1,54 @@
+dataset_root: /path/to/tum_rgbd_sequence
+out_dir: ./outputs/tum_online_plm
+
+sequence_dataset:
+  type: tum_rgbd_sequence
+  rgb_file: rgb.txt
+  depth_file: depth.txt
+  groundtruth_file: groundtruth.txt
+  preset: fr1
+  stride: 1
+  max_frames: 500
+  max_assoc_delta: 0.02
+  pose_assoc_delta: 0.05
+
+backbone:
+  name: dinov2
+  model_name: dinov2_vits14
+  input_size: [336, 336]
+  device: cpu
+
+anchors:
+  alpha: 0.60
+  beta: 0.40
+  use_stability: false
+  topk: 180
+  grid_cells: [4, 4]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.06
+  merge_cos_sim: 0.72
+  manifold_rank: 2
+  min_obs: 2
+  min_staticness: 0.0
+
+matching:
+  topk_landmarks: 10
+  max_matches: 256
+  use_pose_prior: true
+  carry_pose_prior: true
+  lambdas: [1.0, 1.2, 0.6, 0.3, 0.4]
+
+pnp:
+  reproj_error_px: 8.0
+  iterations: 1500
+
+online:
+  use_gt_bootstrap: true
+  bootstrap_count: 5
+  max_age_frames: 20
+  max_active_landmarks: 5000
+  integrate_on_success: true
+  integrate_pose_source: pred
+  min_staticness: 0.0

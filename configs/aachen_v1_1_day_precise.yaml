@@ -1,0 +1,60 @@
+# Aachen day localization tuned for higher correspondence precision on the
+# compact-store HLoc path.
+dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+
+map:
+  cache_path: ./outputs/aachen_map_cache_precise/landmarks.pkl
+  query_cache_namespace: aachen_day_precise_v1
+
+dataset:
+  type: colmap_localization
+  image_root: images_upright
+  model_path: 3D-models/aachen_v_1_1
+  db_image_prefixes: [db/]
+  query_list: day_time_queries_with_intrinsics.txt
+
+hloc:
+  retrieval_file: pairs-query-netvlad50.txt
+  topk_db_images: 10
+  max_candidate_landmarks: 1000
+  max_index_landmarks_per_image: 1000
+
+backbone:
+  name: dinov2
+  model_name: dinov2_vits14
+  input_size: [336, 336]
+  device: cuda
+
+anchors:
+  alpha: 0.60
+  beta: 0.40
+  use_stability: true
+  topk: 384
+  grid_cells: [8, 8]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.08
+  merge_cos_sim: 0.72
+  manifold_rank: 0
+  cache_manifold_rank: 0
+  min_obs: 5
+  max_obs_per_landmark: 8
+  max_colmap_point_error: 3.0
+  min_colmap_track_len: 4
+  min_staticness: 0.35
+
+matching:
+  topk_landmarks: 20
+  retrieval_anchor_batch_size: 256
+  max_matches: 768
+  use_pose_prior: false
+  carry_pose_prior: false
+  lambdas: [1.0, 1.2, 0.6, 0.0, 0.0]
+  min_cosine_sim: 0.25
+  min_score: 0.10
+  ratio_margin: 0.03
+
+pnp:
+  reproj_error_px: 6.0
+  iterations: 8000

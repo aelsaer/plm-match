@@ -1,0 +1,136 @@
+# Aachen day-time experiment sweep
+# Each entry runs hloc_localize with the base config + its overrides applied on top.
+# The map cache is shared across all experiments (built once on first run).
+
+base_config: configs/aachen_v1_1_day.yaml
+dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+pipeline: plm_match.pipelines.hloc_localize
+outputs_root: ./outputs/aachen_sweep
+
+experiments:
+
+  # ── Scoring ablations (what each term contributes) ──────────────────────────
+
+  - name: A_mean_only
+    overrides:
+      matching.lambdas: [0.0, 1.0, 0.0, 0.0, 0.0]
+
+  - name: B_mean_static
+    overrides:
+      matching.lambdas: [0.0, 1.0, 0.6, 0.0, 0.0]
+
+  - name: C_manifold_only
+    overrides:
+      matching.lambdas: [1.0, 0.0, 0.0, 0.0, 0.0]
+
+  - name: D_manifold_mean
+    overrides:
+      matching.lambdas: [1.0, 1.2, 0.0, 0.0, 0.0]
+
+  - name: E_manifold_mean_static
+    overrides:
+      matching.lambdas: [1.0, 1.2, 0.6, 0.0, 0.0]
+
+  - name: F_plm_full
+    overrides:
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: G_plm_view_heavy
+    overrides:
+      matching.lambdas: [1.0, 1.2, 0.6, 0.8, 0.0]
+
+  # ── Manifold rank sweep ──────────────────────────────────────────────────────
+
+  - name: H_rank0_mean_only
+    overrides:
+      landmarks.manifold_rank: 0
+      matching.lambdas: [0.0, 1.0, 0.0, 0.0, 0.0]
+
+  - name: I_rank1
+    overrides:
+      landmarks.manifold_rank: 1
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: J_rank2
+    overrides:
+      landmarks.manifold_rank: 2
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: K_rank4
+    overrides:
+      landmarks.manifold_rank: 4
+      landmarks.max_obs_per_landmark: 8
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  # ── Anchor budget sweep ──────────────────────────────────────────────────────
+
+  - name: L_anchors_100
+    overrides:
+      anchors.topk: 100
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: M_anchors_220
+    overrides:
+      anchors.topk: 220
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: N_anchors_400
+    overrides:
+      anchors.topk: 400
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  # ── Candidate landmark budget sweep ─────────────────────────────────────────
+
+  - name: O_cand_500
+    overrides:
+      hloc.max_candidate_landmarks: 500
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: P_cand_2000
+    overrides:
+      hloc.max_candidate_landmarks: 2000
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: Q_cand_4000
+    overrides:
+      hloc.max_candidate_landmarks: 4000
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  # ── Retrieval depth sweep ────────────────────────────────────────────────────
+
+  - name: R_topk_db5
+    overrides:
+      hloc.topk_db_images: 5
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: S_topk_db10
+    overrides:
+      hloc.topk_db_images: 10
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: T_topk_db20
+    overrides:
+      hloc.topk_db_images: 20
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: U_topk_db50
+    overrides:
+      hloc.topk_db_images: 50
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  # ── PnP threshold sweep ──────────────────────────────────────────────────────
+
+  - name: V_pnp_4px
+    overrides:
+      pnp.reproj_error_px: 4.0
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: W_pnp_8px
+    overrides:
+      pnp.reproj_error_px: 8.0
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+  - name: X_pnp_12px
+    overrides:
+      pnp.reproj_error_px: 12.0
+      matching.lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]

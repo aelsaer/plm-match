@@ -1,0 +1,6 @@
+{
+  "source_root": "/home/cvdp/phd/object_matching/plm_match_bench_ready/plm_match_wired/synthetic_demo",
+  "num_db_images": 6,
+  "num_query_images": 4,
+  "num_points3d": 180
+}

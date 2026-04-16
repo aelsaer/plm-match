@@ -1,0 +1,49 @@
+dataset_root: /path/to/aachen_like_root
+out_dir: ./outputs/aachen_hloc_plm
+
+dataset:
+  type: colmap_localization
+  image_root: images
+  model_path: sfm
+  db_image_prefixes: [db/]
+  query_list: queries/queries_with_intrinsics.txt
+  # query_gt_pose_dir: gt_query_poses
+
+hloc:
+  retrieval_file: pairs-query-db.txt
+  topk_db_images: 20
+  max_candidate_landmarks: 4000
+
+backbone:
+  name: dinov2
+  model_name: dinov2_vits14
+  input_size: [336, 336]
+  device: cpu
+
+anchors:
+  alpha: 0.60
+  beta: 0.40
+  use_stability: false
+  topk: 220
+  grid_cells: [4, 4]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.08
+  merge_cos_sim: 0.72
+  manifold_rank: 2
+  min_obs: 3
+  max_colmap_point_error: 8.0
+  min_colmap_track_len: 2
+  min_staticness: 0.0
+
+matching:
+  topk_landmarks: 10
+  max_matches: 512
+  use_pose_prior: false
+  carry_pose_prior: true
+  lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+pnp:
+  reproj_error_px: 8.0
+  iterations: 4000

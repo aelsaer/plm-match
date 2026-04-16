@@ -1,0 +1,48 @@
+dataset_root: ./synthetic_colmap_demo
+out_dir: ./outputs/mock_hloc
+
+dataset:
+  type: colmap_localization
+  image_root: images
+  model_path: sfm_text
+  db_image_prefixes: [db/]
+  query_list: queries/queries_with_intrinsics.txt
+  query_gt_pose_dir: query_gt_poses
+
+hloc:
+  retrieval_file: pairs-query-db.txt
+  topk_db_images: 3
+  max_candidate_landmarks: 2000
+
+backbone:
+  name: mock
+  grid_size: [30, 40]
+  dim: 128
+  seed: 13
+
+anchors:
+  alpha: 0.65
+  beta: 0.35
+  use_stability: true
+  topk: 220
+  grid_cells: [4, 4]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.05
+  merge_cos_sim: 0.60
+  manifold_rank: 2
+  min_obs: 2
+  max_colmap_point_error: 8.0
+  min_colmap_track_len: 2
+
+matching:
+  topk_landmarks: 10
+  max_matches: 256
+  use_pose_prior: true
+  carry_pose_prior: true
+  lambdas: [1.0, 1.4, 0.6, 0.2, 0.0]
+
+pnp:
+  reproj_error_px: 6.0
+  iterations: 2000

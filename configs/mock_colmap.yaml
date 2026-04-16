@@ -1,0 +1,44 @@
+dataset_root: ./synthetic_colmap_demo
+out_dir: ./outputs/mock_colmap
+
+dataset:
+  type: colmap_localization
+  image_root: images
+  model_path: sfm_text
+  query_list: queries/queries_with_intrinsics.txt
+  query_gt_pose_dir: query_gt_poses
+  default_query_camera_from_first_map: true
+
+backbone:
+  name: mock
+  grid_size: [30, 40]
+  dim: 128
+  seed: 13
+
+anchors:
+  alpha: 0.65
+  beta: 0.35
+  use_stability: true
+  topk: 240
+  grid_cells: [4, 4]
+  nms_radius: 1
+
+map:
+  max_frames: 6
+
+landmarks:
+  manifold_rank: 2
+  min_obs: 2
+  max_colmap_point_error: 1.0
+  min_colmap_track_len: 2
+
+matching:
+  topk_landmarks: 10
+  max_matches: 256
+  use_pose_prior: false
+  carry_pose_prior: true
+  lambdas: [1.0, 1.4, 0.6, 0.2, 0.0]
+
+pnp:
+  reproj_error_px: 6.0
+  iterations: 2000

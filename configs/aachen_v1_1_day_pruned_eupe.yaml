@@ -1,0 +1,55 @@
+# Aachen day localization with stricter landmark pruning and EUPE features.
+dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+
+map:
+  cache_path: ./outputs/aachen_map_cache_pruned_eupe/landmarks.pkl
+
+dataset:
+  type: colmap_localization
+  image_root: images_upright
+  model_path: 3D-models/aachen_v_1_1
+  db_image_prefixes: [db/]
+  query_list: day_time_queries_with_intrinsics.txt
+
+hloc:
+  retrieval_file: pairs-query-netvlad50.txt
+  topk_db_images: 20
+  max_candidate_landmarks: 2000
+  max_index_landmarks_per_image: 2000
+
+backbone:
+  name: eupe
+  repo_dir: /home/cvdp/phd/object_matching/maskmatch/EUPE
+  weights_path: /home/cvdp/phd/object_matching/weights/eupe_vits16.pt
+  model_name: eupe_vits16
+  input_size: [256, 256]
+  device: cuda
+
+anchors:
+  alpha: 0.60
+  beta: 0.40
+  use_stability: false
+  topk: 220
+  grid_cells: [4, 4]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.08
+  merge_cos_sim: 0.72
+  manifold_rank: 2
+  min_obs: 5
+  max_obs_per_landmark: 8
+  max_colmap_point_error: 4.0
+  min_colmap_track_len: 4
+  min_staticness: 0.20
+
+matching:
+  topk_landmarks: 10
+  max_matches: 512
+  use_pose_prior: false
+  carry_pose_prior: true
+  lambdas: [1.0, 1.2, 0.6, 0.2, 0.0]
+
+pnp:
+  reproj_error_px: 8.0
+  iterations: 4000

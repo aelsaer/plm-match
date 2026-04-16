@@ -1,0 +1,9 @@
+{
+  "num_points": 420,
+  "num_map": 6,
+  "num_query": 4,
+  "width": 320,
+  "height": 240,
+  "world_points_file": "world_points.npy",
+  "colors_file": "colors.npy"
+}
