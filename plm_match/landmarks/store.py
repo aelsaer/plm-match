@@ -19,6 +19,7 @@ from plm_match.utils.pose import camera_center_from_Twc
 @dataclass
 class FeatureCacheEntry:
     tokens: np.ndarray
+    token_xy: np.ndarray
     image_shape: tuple[int, int]
 
 
@@ -222,7 +223,7 @@ class CompactLandmarkStore:
         frame = dataset.get_map_frames()[int(frame_id)]
         image = read_image(frame.image_path)
         feats = extractor.extract(image)
-        ent = FeatureCacheEntry(tokens=feats['tokens'], image_shape=image.shape[:2])
+        ent = FeatureCacheEntry(tokens=feats['tokens'], token_xy=feats['token_xy'], image_shape=image.shape[:2])
         cache.put(frame_id, ent)
         return ent
 
@@ -267,7 +268,14 @@ class CompactLandmarkStore:
                 descs = []
                 for fid, uv in zip(obs_frame_ids_basis, obs_uvs_basis):
                     ent = self._get_features_for_frame(int(fid), dataset, extractor, feature_cache)
-                    descs.append(bilinear_sample_token_descriptor(ent.tokens, uv, ent.image_shape))
+                    descs.append(
+                        bilinear_sample_token_descriptor(
+                            ent.tokens,
+                            uv,
+                            image_shape=ent.image_shape,
+                            token_xy=ent.token_xy,
+                        )
+                    )
                 descs_np = np.stack(descs, axis=0).astype(np.float32)
                 _, basis, _, _ = compute_landmark_manifold(descs_np, rank=int(manifold_rank))
             if include_view_dirs and obs_frame_ids_view.shape[0] > 0:

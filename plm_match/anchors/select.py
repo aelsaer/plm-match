@@ -18,10 +18,17 @@ def select_anchors(tokens: np.ndarray,
     taken = np.zeros((H, W), dtype=bool)
     rows_per_cell = max(1, H // gh)
     cols_per_cell = max(1, W // gw)
-    per_cell = max(1, topk // (gh * gw))
+    num_cells = max(1, gh * gw)
+    base_per_cell = topk // num_cells
+    remainder = topk % num_cells
 
+    cell_index = 0
     for cell_r in range(gh):
         for cell_c in range(gw):
+            per_cell = base_per_cell + (1 if cell_index < remainder else 0)
+            cell_index += 1
+            if per_cell <= 0:
+                continue
             r0 = cell_r * rows_per_cell
             r1 = H if cell_r == gh - 1 else min(H, (cell_r + 1) * rows_per_cell)
             c0 = cell_c * cols_per_cell

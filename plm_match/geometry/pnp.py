@@ -48,6 +48,12 @@ def solve_pnp_ransac(matches: List[Match3D2D], intr: dict, reproj_err: float = 8
     img = np.stack([m.uv_query for m in matches], axis=0).astype(np.float64)
     K = np.array([[intr['fx'], 0.0, intr['cx']], [0.0, intr['fy'], intr['cy']], [0.0, 0.0, 1.0]], dtype=np.float64)
     dist = _distcoeffs_from_intr(intr)
+
+    def _reprojection_errors(rvec_i: np.ndarray, tvec_i: np.ndarray) -> np.ndarray:
+        proj, _ = cv2.projectPoints(obj, rvec_i, tvec_i, K, dist)
+        proj = proj.reshape(-1, 2)
+        return np.linalg.norm(proj - img, axis=1)
+
     ok, rvec, tvec, inliers = cv2.solvePnPRansac(
         objectPoints=obj,
         imagePoints=img,
@@ -60,10 +66,62 @@ def solve_pnp_ransac(matches: List[Match3D2D], intr: dict, reproj_err: float = 8
     )
     if not ok:
         return PoseResult(False, None, None, 0, len(matches), None)
-    R_cw, _ = cv2.Rodrigues(rvec)
+
+    best_rvec = rvec
+    best_tvec = tvec
+    best_errors = _reprojection_errors(rvec, tvec)
+    best_inliers = np.flatnonzero(np.isfinite(best_errors) & (best_errors <= float(reproj_err)))
+    if inliers is not None and len(inliers) > 0:
+        best_inliers = np.asarray(inliers, dtype=np.int64).reshape(-1)
+
+    if best_inliers.shape[0] >= 4:
+        try:
+            if hasattr(cv2, 'solvePnPRefineLM'):
+                ref_rvec = best_rvec.copy()
+                ref_tvec = best_tvec.copy()
+                cv2.solvePnPRefineLM(
+                    objectPoints=obj[best_inliers],
+                    imagePoints=img[best_inliers],
+                    cameraMatrix=K,
+                    distCoeffs=dist,
+                    rvec=ref_rvec,
+                    tvec=ref_tvec,
+                )
+                cand_rvec, cand_tvec = ref_rvec, ref_tvec
+            else:
+                ok_ref, ref_rvec, ref_tvec = cv2.solvePnP(
+                    objectPoints=obj[best_inliers],
+                    imagePoints=img[best_inliers],
+                    cameraMatrix=K,
+                    distCoeffs=dist,
+                    rvec=best_rvec,
+                    tvec=best_tvec,
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                cand_rvec, cand_tvec = (ref_rvec, ref_tvec) if ok_ref else (best_rvec, best_tvec)
+            cand_errors = _reprojection_errors(cand_rvec, cand_tvec)
+            cand_inliers = np.flatnonzero(np.isfinite(cand_errors) & (cand_errors <= float(reproj_err)))
+            cand_mean = float(np.mean(cand_errors[cand_inliers])) if cand_inliers.size > 0 else float('inf')
+            best_mean = float(np.mean(best_errors[best_inliers])) if best_inliers.size > 0 else float('inf')
+            if (
+                cand_inliers.shape[0] > best_inliers.shape[0]
+                or (cand_inliers.shape[0] == best_inliers.shape[0] and cand_mean < best_mean)
+            ):
+                best_rvec, best_tvec = cand_rvec, cand_tvec
+                best_errors = cand_errors
+                best_inliers = cand_inliers
+        except cv2.error:
+            pass
+
+    if best_inliers.shape[0] < 4:
+        return PoseResult(False, None, None, 0, len(matches), None)
+
+    R_cw, _ = cv2.Rodrigues(best_rvec)
     T_cw = np.eye(4, dtype=np.float64)
     T_cw[:3, :3] = R_cw
-    T_cw[:3, 3] = tvec.reshape(3)
+    T_cw[:3, 3] = best_tvec.reshape(3)
     T_wc = invert_pose(T_cw)
-    num_inliers = int(0 if inliers is None else len(inliers))
-    return PoseResult(True, T_wc, inliers, num_inliers, len(matches), None)
+    num_inliers = int(best_inliers.shape[0])
+    reproj_mean = float(np.mean(best_errors[best_inliers])) if num_inliers > 0 else None
+    return PoseResult(True, T_wc, best_inliers.reshape(-1, 1), num_inliers, len(matches), reproj_mean)

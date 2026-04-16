@@ -100,6 +100,21 @@ def main() -> None:
         db_names = retrievals.get(qname, [])[:topk_images] if retrievals else []
         groups: list[LandmarkCandidateGroup] = []
         candidate_total = 0
+        stage_image_limits = []
+        total_images = max(1, len(db_names)) if db_names else 1
+        for value in verify_image_schedule_cfg:
+            try:
+                limit = int(value)
+            except (TypeError, ValueError):
+                continue
+            if limit > 0:
+                stage_image_limits.append(min(limit, total_images))
+        stage_image_limits.append(total_images)
+        stage_image_limits = sorted(set(stage_image_limits))
+        max_stage_images = max(stage_image_limits) if stage_image_limits else total_images
+        per_image_candidate_budget = None
+        if max_candidate_landmarks > 0:
+            per_image_candidate_budget = max(1, int(np.ceil(float(max_candidate_landmarks) / float(max_stage_images))))
         if db_names:
             valid_pairs = [(name, name_to_frame_id[name]) for name in db_names if name in name_to_frame_id]
             for start in range(0, len(valid_pairs), verify_image_batch_size):
@@ -117,12 +132,10 @@ def main() -> None:
                         seen.add(idx)
                         merged_list.append(idx)
                 merged = np.asarray(merged_list, dtype=np.int32) if merged_list else np.zeros((0,), dtype=np.int32)
-                if max_candidate_landmarks > 0:
-                    remaining = max_candidate_landmarks - candidate_total
-                    if remaining <= 0:
-                        break
-                    if merged.shape[0] > remaining:
-                        merged = merged[:remaining]
+                if per_image_candidate_budget is not None:
+                    batch_budget = int(per_image_candidate_budget * max(1, len(frame_ids)))
+                    if merged.shape[0] > batch_budget:
+                        merged = merged[:batch_budget]
                 candidate_total += int(merged.shape[0])
                 groups.append(
                     LandmarkCandidateGroup(
@@ -167,26 +180,15 @@ def main() -> None:
                 )
             )
 
-        stage_limits = []
-        total_images = max(1, len(db_names)) if db_names else 1
-        for value in verify_image_schedule_cfg:
-            try:
-                limit = int(value)
-            except (TypeError, ValueError):
-                continue
-            if limit > 0:
-                stage_limits.append(min(limit, total_images))
-        stage_limits.append(total_images)
-        stage_limits = sorted(set(stage_limits))
-
         return LandmarkCandidateSchedule(
             groups=groups,
-            stages=stage_limits,
+            stages=stage_image_limits,
             meta={
                 'db_images': int(len(db_names)),
                 'candidate_indices_total': int(candidate_total),
                 'grouped_verification': True,
                 'verify_image_batch_size': int(verify_image_batch_size),
+                'per_image_candidate_budget': (int(per_image_candidate_budget) if per_image_candidate_budget is not None else None),
             },
         )
 

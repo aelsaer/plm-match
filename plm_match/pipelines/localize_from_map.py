@@ -289,6 +289,7 @@ class PLMMapLocalizer:
             image = read_image(frame.image_path)
             feats = self.extract_feature_map(image)
             tokens = feats['tokens']
+            token_xy = feats['token_xy']
             T_wc = frame.pose if frame.pose is not None else None
             if T_wc is None:
                 continue
@@ -302,9 +303,12 @@ class PLMMapLocalizer:
                 pt = dataset.points3d[point_id]
                 if float(pt.error) > max_point_error or len(pt.image_ids) < min_track_len:
                     continue
-                if len(point_groups[point_id][1]) >= max_obs:
-                    continue
-                desc = bilinear_sample_token_descriptor(tokens, np.asarray(uv, dtype=np.float32), image.shape[:2]).astype(np.float16)
+                desc = bilinear_sample_token_descriptor(
+                    tokens,
+                    np.asarray(uv, dtype=np.float32),
+                    image_shape=image.shape[:2],
+                    token_xy=token_xy,
+                ).astype(np.float16)
                 obs = LandmarkObservation(
                     frame_id=frame_id,
                     uv=np.asarray(uv, dtype=np.float16),

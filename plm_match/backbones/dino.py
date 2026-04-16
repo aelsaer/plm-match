@@ -62,9 +62,18 @@ class DINOv2FeatureExtractor(BaseFeatureExtractor):
         Wt = self.input_size[1] // self.patch
         tokens = patch_tokens.reshape(Ht, Wt, -1).astype(np.float32)
         tokens = tokens / (np.linalg.norm(tokens, axis=-1, keepdims=True) + 1e-8)
-        yy, xx = np.meshgrid(np.linspace(0.0, 1.0, Ht, dtype=np.float32),
-                             np.linspace(0.0, 1.0, Wt, dtype=np.float32), indexing='ij')
-        token_xy = np.stack([xx * (orig_w - 1), yy * (orig_h - 1)], axis=-1)
+        # Patch tokens correspond to patch centers in the resized image, not to the
+        # image borders. Using edge-to-edge coordinates introduces a systematic
+        # offset when sampling descriptors at COLMAP pixels and when turning query
+        # tokens into 2D points for PnP.
+        resized_h = int(self.input_size[0])
+        resized_w = int(self.input_size[1])
+        center_x = ((np.arange(Wt, dtype=np.float32) + 0.5) * float(self.patch)) - 0.5
+        center_y = ((np.arange(Ht, dtype=np.float32) + 0.5) * float(self.patch)) - 0.5
+        scale_x = float(orig_w - 1) / max(1.0, float(resized_w - 1))
+        scale_y = float(orig_h - 1) / max(1.0, float(resized_h - 1))
+        xx, yy = np.meshgrid(center_x * scale_x, center_y * scale_y, indexing='xy')
+        token_xy = np.stack([xx, yy], axis=-1)
         return {
             'tokens': tokens,
             'token_xy': token_xy.astype(np.float32),
