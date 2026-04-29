@@ -1,5 +1,5 @@
 # Aachen day localization with stricter landmark pruning and EUPE features.
-dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
 
 map:
   cache_path: ./outputs/aachen_map_cache_pruned_eupe/landmarks.pkl

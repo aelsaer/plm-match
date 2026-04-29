@@ -1,0 +1,46 @@
+# Full-day Aachen scorer comparison with low-memory-safe settings.
+
+base_config: configs/aachen_v1_1_day.yaml
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
+pipeline: plm_match.pipelines.hloc_localize
+outputs_root: /tmp/plm_match_outputs/aachen_day_residual_vs_ppca
+
+experiments:
+  - name: residual
+    overrides:
+      map.cache_path: /tmp/plm_match_outputs/aachen_day_residual_vs_ppca_cache/landmarks.pkl
+      backbone.name: eupe
+      backbone.repo_dir: /home/phd/maskmatch/EUPE
+      backbone.weights_path: /home/phd/maskmatch/weights/EUPE-ViT-S.pt
+      backbone.model_name: eupe_vits16
+      backbone.input_size: [256, 256]
+      hloc.grouping: retrieval_order
+      hloc.verify_image_batch_size: 1
+      landmarks.cache_manifold_rank: 0
+      landmarks.max_obs_per_landmark: 4
+      matching.scorer: residual
+      matching.min_cosine_sim: 0.25
+      matching.min_score: 0.10
+      matching.ratio_margin: 0.03
+      matching.fine_rerank.enabled: false
+      matching.early_geometry.enabled: false
+
+  - name: ppca
+    overrides:
+      map.cache_path: /tmp/plm_match_outputs/aachen_day_residual_vs_ppca_cache/landmarks.pkl
+      backbone.name: eupe
+      backbone.repo_dir: /home/phd/maskmatch/EUPE
+      backbone.weights_path: /home/phd/maskmatch/weights/EUPE-ViT-S.pt
+      backbone.model_name: eupe_vits16
+      backbone.input_size: [256, 256]
+      hloc.grouping: retrieval_order
+      hloc.verify_image_batch_size: 1
+      landmarks.cache_manifold_rank: 0
+      landmarks.max_obs_per_landmark: 4
+      matching.scorer: ppca
+      matching.ppca_support_weight: 0.05
+      matching.min_cosine_sim: -1.0
+      matching.min_score: -1.0e9
+      matching.ratio_margin: 0.0
+      matching.fine_rerank.enabled: false
+      matching.early_geometry.enabled: false

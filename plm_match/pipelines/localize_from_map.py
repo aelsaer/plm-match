@@ -18,6 +18,8 @@ from plm_match.datasets import build_dataset
 from plm_match.geometry import solve_pnp_ransac
 from plm_match.landmarks import LandmarkMemory, CompactLandmarkStore, LRUFeatureCache, build_compact_store_from_groups
 from plm_match.matching import retrieve_topk_landmarks_batch, score_anchor_landmark, unique_landmark_assignment
+from plm_match.fine_features import LRUGrayImageCache, LocalPatchDescriptor, best_fine_similarity
+from plm_match.matching.scoring import score_anchor_landmark_fine
 from plm_match.types import (
     Landmark,
     LandmarkCandidateGroup,
@@ -118,6 +120,27 @@ class PLMMapLocalizer:
         self._map_feature_cache = LRUFeatureCache(
             max_items=int(cfg.get('map', {}).get('map_feature_cache_size', default_cache_items))
         )
+        fine_cfg = self.matching_cfg.get('fine_rerank', {})
+        self.fine_cfg = fine_cfg if isinstance(fine_cfg, dict) else {}
+        self._compute_fine_descs_at_map = bool(self.cfg.get('map', {}).get('compute_fine_descs', False))
+        self.fine_extractor: LocalPatchDescriptor | None = None
+        need_fine = (
+            bool(self.fine_cfg.get('enabled', False))
+            or self._compute_fine_descs_at_map
+            or bool(self.matching_cfg.get('xfeat_rerank_coarse', False))
+        )
+        if need_fine and self.fine_cfg.get('method'):
+            self.fine_extractor = LocalPatchDescriptor(
+                method=str(self.fine_cfg.get('method', 'xfeat')),
+                patch_size=int(self.fine_cfg.get('patch_size', 24)),
+                repo_root=self.fine_cfg.get('repo_root'),
+                top_k=int(self.fine_cfg.get('xfeat_topk', 4096)),
+                match_radius_px=float(self.fine_cfg.get('match_radius_px', self.fine_cfg.get('patch_size', 24))),
+                image_cache_size=int(self.fine_cfg.get('image_cache_size', 8)),
+            )
+        self._map_gray_cache = LRUGrayImageCache(
+            max_items=int(self.cfg.get('map', {}).get('map_gray_cache_size', default_cache_items))
+        )
 
     def _compact_cache_dir(self, cache_path: Path) -> Path:
         if cache_path.suffix:
@@ -169,6 +192,13 @@ class PLMMapLocalizer:
         feats = self.extract_feature_map(image)
         anchors, debug = self.extract_anchors_from_features(image, feats)
         return anchors, debug, feats
+
+    def _attach_anchor_fine_descs(self, image: np.ndarray, anchors: Sequence) -> None:
+        if self.fine_extractor is None or not anchors:
+            return
+        descs = self.fine_extractor.extract_at_points(image, [a.uv for a in anchors])
+        for anchor, desc in zip(anchors, descs):
+            anchor.fine_desc = desc if float(np.linalg.norm(desc)) > 1e-8 else None
 
     def integrate_frame_observations(self, image: np.ndarray, depth: np.ndarray | None, intr: dict, T_wc: np.ndarray | None, frame_id: int, image_name: str | None = None) -> int:
         if depth is None or T_wc is None:
@@ -286,16 +316,21 @@ class PLMMapLocalizer:
         max_point_error = float(self.landmark_cfg.get('max_colmap_point_error', 8.0))
         min_track_len = int(self.landmark_cfg.get('min_colmap_track_len', 2))
         for frame_id, frame in enumerate(tqdm(map_frames, desc='Building map (COLMAP)', unit='frame')):
+            if frame_id > 0 and frame_id % 200 == 0:
+                gc.collect()
             image = read_image(frame.image_path)
             feats = self.extract_feature_map(image)
             tokens = feats['tokens']
             token_xy = feats['token_xy']
+            del feats
             T_wc = frame.pose if frame.pose is not None else None
             if T_wc is None:
                 continue
             camera_center = camera_center_from_Twc(T_wc).astype(np.float32)
             xys = frame.meta.get('xys', np.zeros((0, 2), dtype=np.float64))
             point_ids = frame.meta.get('point3D_ids', np.zeros((0,), dtype=np.int64))
+            # Collect valid (uv, point) pairs and batch-extract EUPE descriptors.
+            valid_obs_data = []
             for uv, point_id in zip(xys, point_ids):
                 point_id = int(point_id)
                 if point_id < 0 or point_id not in dataset.points3d:
@@ -303,19 +338,21 @@ class PLMMapLocalizer:
                 pt = dataset.points3d[point_id]
                 if float(pt.error) > max_point_error or len(pt.image_ids) < min_track_len:
                     continue
-                desc = bilinear_sample_token_descriptor(
-                    tokens,
-                    np.asarray(uv, dtype=np.float32),
-                    image_shape=image.shape[:2],
-                    token_xy=token_xy,
-                ).astype(np.float16)
+                valid_obs_data.append((np.asarray(uv, dtype=np.float32), point_id, pt))
+            if not valid_obs_data:
+                continue
+            valid_uvs = [uv for uv, _, _ in valid_obs_data]
+            eupe_descs = np.stack([
+                bilinear_sample_token_descriptor(tokens, uv, image_shape=image.shape[:2], token_xy=token_xy)
+                for uv in valid_uvs
+            ], axis=0).astype(np.float16)
+            for i, (uv, point_id, pt) in enumerate(valid_obs_data):
                 obs = LandmarkObservation(
                     frame_id=frame_id,
-                    uv=np.asarray(uv, dtype=np.float16),
-                    desc=desc,
+                    uv=uv.astype(np.float16),
+                    desc=eupe_descs[i],
                     camera_center=camera_center,
                     reproj_error=float(pt.error),
-                    image_name=None,
                 )
                 point_groups[point_id][0] = pt.xyz.astype(np.float32)
                 _insert_diverse_observation(point_groups[point_id][1], obs, pt.xyz, max_obs=max_obs)
@@ -329,6 +366,55 @@ class PLMMapLocalizer:
         print(f'Map built: {self.landmark_store.num_landmarks} landmarks from {len(map_frames)} frames')
         point_groups.clear()
         gc.collect()
+        if self._compute_fine_descs_at_map and self.fine_extractor is not None:
+            self._compute_fine_mu_for_store(self.landmark_store, map_frames)
+        gc.collect()
+
+    def _compute_fine_mu_for_store(self, store, map_frames: list) -> None:
+        """Post-build pass: compute mean XFeat descriptor per landmark.
+
+        Processes each map frame once, sampling XFeat at all landmark UVs
+        observed in that frame. Memory cost: one image + one XFeat forward pass
+        at a time — no accumulation of per-observation descriptors.
+        """
+        D_fine = int(self.fine_extractor.dim)
+        N = int(store.num_landmarks)
+        fine_mu = np.zeros((N, D_fine), dtype=np.float32)
+        fine_counts = np.zeros((N,), dtype=np.int32)
+        unique_fids = np.unique(store.obs_frame_ids)
+        for frame_id in tqdm(unique_fids, desc='Computing fine_mu', unit='frame'):
+            frame_id = int(frame_id)
+            if frame_id >= len(map_frames):
+                continue
+            lm_indices = store.image_to_landmarks.get(frame_id)
+            if lm_indices is None or len(lm_indices) == 0:
+                continue
+            uvs: list[np.ndarray] = []
+            lm_slots: list[int] = []
+            for lm_idx in lm_indices:
+                lm_idx = int(lm_idx)
+                start = int(store.obs_offsets[lm_idx])
+                end = int(store.obs_offsets[lm_idx + 1])
+                for k in range(start, end):
+                    if int(store.obs_frame_ids[k]) == frame_id:
+                        uvs.append(store.obs_uvs[k].astype(np.float32))
+                        lm_slots.append(lm_idx)
+            if not uvs:
+                continue
+            image = read_image(map_frames[frame_id].image_path)
+            descs = self.fine_extractor.extract_at_points(image, uvs)
+            for lm_idx, desc in zip(lm_slots, descs):
+                if float(np.linalg.norm(desc)) > 1e-8:
+                    fine_mu[lm_idx] += desc.astype(np.float32)
+                    fine_counts[lm_idx] += 1
+            del image
+        valid = fine_counts > 0
+        fine_mu[valid] /= fine_counts[valid, np.newaxis]
+        norms = np.linalg.norm(fine_mu, axis=1)
+        valid_norm = norms > 1e-8
+        fine_mu[valid_norm] /= norms[valid_norm, np.newaxis]
+        store.fine_mu = fine_mu.astype(np.float16)
+        print(f'fine_mu computed for {int(valid.sum())}/{N} landmarks')
 
     def _candidate_set_from_group(self, group: LandmarkCandidateGroup) -> LandmarkCandidateSet:
         lazy_context = group.lazy_context if isinstance(group.lazy_context, dict) else None
@@ -353,6 +439,7 @@ class PLMMapLocalizer:
         pose_prior: Optional[np.ndarray] = None,
         candidate_landmarks: Optional[Sequence[Landmark] | LandmarkCandidateSet] = None,
         t_anchor_extract_s: float = 0.0,
+        force_pose_prior: Optional[bool] = None,
     ) -> Tuple[List[Match3D2D], dict]:
         match_t0 = time.perf_counter()
         q_center = camera_center_from_Twc(pose_prior) if pose_prior is not None else None
@@ -371,10 +458,24 @@ class PLMMapLocalizer:
         candidates: List[Match3D2D] = []
         topk_landmarks = int(self.matching_cfg.get('topk_landmarks', 10))
         lambdas = tuple(self.matching_cfg.get('lambdas', [1.0, 1.2, 0.6, 0.3, 0.5]))
-        use_pose_prior = bool(self.matching_cfg.get('use_pose_prior', False))
+        scorer = str(self.matching_cfg.get('scorer', 'residual')).lower()
+        ppca_parallel_weight = self.matching_cfg.get('ppca_parallel_weight', None)
+        ppca_perp_weight = self.matching_cfg.get('ppca_perp_weight', None)
+        ppca_support_weight = float(self.matching_cfg.get('ppca_support_weight', 0.0))
+        ppca_eps = float(self.matching_cfg.get('ppca_eps', 1e-6))
+        use_pose_prior = bool(self.matching_cfg.get('use_pose_prior', False)) if force_pose_prior is None else bool(force_pose_prior)
         min_cosine_sim = float(self.matching_cfg.get('min_cosine_sim', -1.0))
         min_score = float(self.matching_cfg.get('min_score', -1e9))
         ratio_margin = float(self.matching_cfg.get('ratio_margin', 0.0))
+        fine_enabled = self.fine_extractor is not None and bool(self.fine_cfg.get('enabled', False))
+        fine_topk = max(1, int(self.fine_cfg.get('topk', min(4, topk_landmarks))))
+        fine_weight = float(self.fine_cfg.get('weight', 1.0))
+        fine_support_weight = float(self.fine_cfg.get('support_weight', 0.0))
+        fine_coarse_weight = float(self.fine_cfg.get('coarse_weight', 0.0))
+        fine_fuse_coarse = bool(self.fine_cfg.get('fuse_coarse', False))
+        fine_require_descriptor = bool(self.fine_cfg.get('require_descriptor', False))
+        fine_min_score = float(self.fine_cfg.get('min_score', min_score))
+        fine_ratio_margin = float(self.fine_cfg.get('ratio_margin', ratio_margin))
         retrieval_device = str(self.cfg.get('backbone', {}).get('device', 'cpu'))
         retrieval_anchor_batch_size = int(self.matching_cfg.get('retrieval_anchor_batch_size', 256))
         materialize_topk_per_anchor = int(self.matching_cfg.get('materialize_topk_per_anchor', min(4, topk_landmarks)))
@@ -402,6 +503,10 @@ class PLMMapLocalizer:
             't_match_query_s': 0.0,
             'num_materialized_landmarks': int(len(working_landmarks)),
             'materialize_topk_per_anchor': int(materialize_topk_per_anchor),
+            'matching_scorer': scorer,
+            'fine_rerank_enabled': bool(fine_enabled),
+            't_fine_scoring_s': 0.0,
+            'num_fine_reranked': 0,
         }
         if isinstance(candidate_landmarks, LandmarkCandidateSet) and candidate_landmarks.meta:
             for key, value in candidate_landmarks.meta.items():
@@ -422,6 +527,44 @@ class PLMMapLocalizer:
             batch_size=retrieval_anchor_batch_size,
         )
         debug['t_retrieval_s'] = float(time.perf_counter() - retrieval_t0)
+
+        # XFeat coarse re-ranking: fuse EUPE cosine with stored XFeat fine_mu similarity.
+        # Runs after EUPE retrieval, before materialization, with no image loading.
+        use_xfeat_coarse = (
+            bool(self.matching_cfg.get('xfeat_rerank_coarse', False))
+            and lazy_context is not None
+            and lazy_context.get('store') is not None
+            and getattr(lazy_context['store'], 'fine_mu', None) is not None
+            and top_idx.shape[1] > 0
+            and any(a.fine_desc is not None for a in anchors)
+        )
+        if use_xfeat_coarse:
+            xfeat_rerank_t0 = time.perf_counter()
+            store_fmu = lazy_context['store'].fine_mu
+            group_indices = lazy_context['indices']
+            d_fine = store_fmu.shape[1]
+            anchor_fine = np.stack([
+                a.fine_desc if (a.fine_desc is not None and len(a.fine_desc) == d_fine)
+                else np.zeros(d_fine, dtype=np.float32)
+                for a in anchors
+            ]).astype(np.float32)
+            flat_local = top_idx.reshape(-1).astype(np.int64)
+            flat_store = group_indices[flat_local].astype(np.int64)
+            cand_fmu = store_fmu[flat_store].astype(np.float32).reshape(
+                len(anchors), top_idx.shape[1], d_fine
+            )
+            xfeat_sims = np.einsum('ad,akd->ak', anchor_fine, cand_fmu)
+            xfeat_w = float(self.matching_cfg.get('xfeat_rerank_weight', 0.5))
+            combined = (1.0 - xfeat_w) * top_sim + xfeat_w * xfeat_sims
+            order = np.argsort(-combined, axis=1)
+            top_idx = np.take_along_axis(top_idx, order, axis=1)
+            top_sim = np.take_along_axis(combined, order, axis=1)
+            debug['t_xfeat_coarse_rerank_s'] = float(time.perf_counter() - xfeat_rerank_t0)
+
+        # Adaptive per-anchor cosine threshold: always allows at least the top
+        # candidates within adaptive_cosine_margin of the anchor's best match.
+        use_adaptive = bool(self.matching_cfg.get('adaptive_min_cosine', False))
+        adaptive_margin = float(self.matching_cfg.get('adaptive_cosine_margin', 0.2))
 
         materialized_lookup = None
         if lazy_context is not None and len(working_landmarks) == 0:
@@ -465,6 +608,10 @@ class PLMMapLocalizer:
                 feature_cache=lazy_context.get('feature_cache'),
                 include_view_dirs=bool(lazy_context.get('include_view_dirs', True)),
                 preferred_frame_ids=lazy_context.get('preferred_frame_ids'),
+                fine_extractor=None,
+                fine_image_cache=None,
+                include_fine_descs=False,
+                max_fine_obs_per_landmark=int(self.fine_cfg.get('max_obs_per_landmark', 4)),
             )
             materialized_lookup = {
                 int(local_idx): lm for local_idx, lm in zip(unique_local.tolist(), selected_set.landmarks)
@@ -472,17 +619,64 @@ class PLMMapLocalizer:
             debug['num_materialized_landmarks'] = int(len(materialized_lookup))
             debug['t_materialize_selected_s'] = float(time.perf_counter() - materialize_t0)
 
+        # Cache for lazily-extracted fine descriptors, keyed by store index.
+        # Populated on demand only for the coarse-shortlisted candidates.
+        _fine_desc_cache: dict[int, object] = {}
+
+        def _ensure_fine_descs(lm_idx: int, lm) -> None:
+            if not fine_enabled or lazy_context is None:
+                return
+            if lm.fine_descs is not None:
+                return
+            store = lazy_context.get('store')
+            if store is None:
+                return
+            store_idx = int(lazy_context['indices'][lm_idx])
+            if store_idx in _fine_desc_cache:
+                lm.fine_descs = _fine_desc_cache[store_idx]
+                return
+            start, end = store._obs_slice(store_idx)
+            obs_fids = store.obs_frame_ids[start:end].astype(np.int32, copy=False)
+            obs_uvs_raw = store.obs_uvs[start:end].astype(np.float32, copy=False)
+            preferred = lazy_context.get('preferred_frame_ids')
+            if preferred is not None and len(preferred) > 0:
+                pref_arr = np.asarray(list(preferred), dtype=np.int32)
+                mask = np.isin(obs_fids, pref_arr)
+                if np.any(mask):
+                    obs_fids = obs_fids[mask]
+                    obs_uvs_raw = obs_uvs_raw[mask]
+            max_obs = int(self.fine_cfg.get('max_obs_per_landmark', 4))
+            if obs_fids.shape[0] > max_obs:
+                obs_fids = obs_fids[:max_obs]
+                obs_uvs_raw = obs_uvs_raw[:max_obs]
+            from plm_match.fine_features import get_gray_frame
+            descs = []
+            for fid, uv in zip(obs_fids, obs_uvs_raw):
+                gray = get_gray_frame(int(fid), dataset=lazy_context['dataset'], cache=self._map_gray_cache)
+                d = self.fine_extractor.extract_from_gray(gray, [uv])[0]
+                if float(np.linalg.norm(d)) > 1e-8:
+                    descs.append(d.astype(np.float32))
+            result = np.stack(descs, axis=0).astype(np.float32) if descs else None
+            _fine_desc_cache[store_idx] = result
+            lm.fine_descs = result
+
         scoring_t0 = time.perf_counter()
         for i, a in enumerate(anchors):
             if top_idx.shape[1] > 0:
                 debug['anchors_with_retrievals'] += 1
-            best = None
-            second_score = None
+            # Adaptive threshold: allow at least the top candidates within
+            # adaptive_cosine_margin of this anchor's best match.
+            if use_adaptive and top_idx.shape[1] > 0:
+                anchor_best = float(top_sim[i, 0])
+                effective_min_cosine = max(min_cosine_sim, anchor_best - adaptive_margin)
+            else:
+                effective_min_cosine = min_cosine_sim
             cosine_rejected = 0
+            scored_candidates = []
             for j in range(top_idx.shape[1]):
                 lm_idx = int(top_idx[i, j])
                 cos_sim = float(top_sim[i, j])
-                if cos_sim < min_cosine_sim:
+                if cos_sim < effective_min_cosine:
                     cosine_rejected += 1
                     continue
                 if materialized_lookup is not None:
@@ -499,33 +693,133 @@ class PLMMapLocalizer:
                     intr=intr,
                     query_camera_center=q_center,
                     lambdas=lambdas,
+                    scorer=scorer,
+                    ppca_parallel_weight=ppca_parallel_weight,
+                    ppca_perp_weight=ppca_perp_weight,
+                    ppca_support_weight=ppca_support_weight,
+                    ppca_eps=ppca_eps,
                 )
                 if not np.isfinite(s):
                     continue
-                if best is None or s > best.score:
-                    if best is not None:
-                        second_score = best.score if second_score is None else max(float(second_score), float(best.score))
-                    best = Match3D2D(
-                        landmark_id=lm.id,
-                        uv_query=a.uv,
-                        xyz_landmark=lm.xyz,
-                        score=float(s),
-                        anchor_idx=i,
-                    )
-                elif second_score is None or s > second_score:
-                    second_score = float(s)
-            if best is None:
+                scored_candidates.append({
+                    'lm': lm,
+                    'lm_idx': lm_idx,
+                    'coarse_score': float(s),
+                    'final_score': float(s),
+                    'fine_similarity': None,
+                })
+            if not scored_candidates:
                 if top_idx.shape[1] > 0 and cosine_rejected == int(top_idx.shape[1]):
                     debug['anchors_rejected_cosine'] += 1
                 continue
-            if best.score < min_score:
+
+            threshold_score = min_score
+            threshold_margin = ratio_margin
+            if fine_enabled and a.fine_desc is not None:
+                fine_t0 = time.perf_counter()
+                reranked = []
+                for cand in sorted(scored_candidates, key=lambda item: item['coarse_score'], reverse=True)[:fine_topk]:
+                    _ensure_fine_descs(cand['lm_idx'], cand['lm'])
+                    fine_similarity = best_fine_similarity(a.fine_desc, cand['lm'].fine_descs)
+                    if fine_similarity is None:
+                        if fine_require_descriptor:
+                            continue
+                        reranked.append(cand)
+                        continue
+                    final_score = score_anchor_landmark_fine(
+                        a,
+                        cand['lm'],
+                        fine_similarity,
+                        pose_prior=pose_prior if use_pose_prior else None,
+                        intr=intr,
+                        query_camera_center=q_center,
+                        lambdas=lambdas,
+                        fine_weight=fine_weight,
+                        support_weight=fine_support_weight,
+                    )
+                    if fine_fuse_coarse:
+                        final_score += float(fine_coarse_weight) * float(cand['coarse_score'])
+                    reranked.append({
+                        **cand,
+                        'final_score': float(final_score),
+                        'fine_similarity': float(fine_similarity),
+                    })
+                debug['t_fine_scoring_s'] += float(time.perf_counter() - fine_t0)
+                if reranked:
+                    debug['num_fine_reranked'] += int(len(reranked))
+                    scored_candidates = reranked
+                    threshold_score = fine_min_score
+                    threshold_margin = fine_ratio_margin
+
+            scored_candidates = [cand for cand in scored_candidates if np.isfinite(float(cand['final_score']))]
+            if not scored_candidates:
+                continue
+            scored_candidates.sort(key=lambda item: float(item['final_score']), reverse=True)
+            best_cand = scored_candidates[0]
+            best = Match3D2D(
+                landmark_id=best_cand['lm'].id,
+                uv_query=a.uv,
+                xyz_landmark=best_cand['lm'].xyz,
+                score=float(best_cand['final_score']),
+                anchor_idx=i,
+            )
+            second_score = float(scored_candidates[1]['final_score']) if len(scored_candidates) > 1 else None
+            if best.score < threshold_score:
                 debug['anchors_rejected_score'] += 1
                 continue
-            if second_score is not None and (best.score - float(second_score)) < ratio_margin:
+            if second_score is not None and (best.score - float(second_score)) < threshold_margin:
                 debug['anchors_rejected_margin'] += 1
                 continue
             candidates.append(best)
         debug['t_scoring_s'] = float(time.perf_counter() - scoring_t0)
+
+        # Minimum-match fallback: if too few correspondences survived the
+        # filters, run a second pass with all thresholds disabled and keep
+        # the top-1 match per anchor by raw score. This guarantees PnP
+        # always has enough correspondences to attempt a pose.
+        min_match_guarantee = int(self.matching_cfg.get('min_match_guarantee', 0))
+        if min_match_guarantee > 0 and len(candidates) < min_match_guarantee:
+            fallback_candidates = list(candidates)
+            used_lm_ids = {c.landmark_id for c in fallback_candidates}
+            for i, a in enumerate(anchors):
+                if top_idx.shape[1] == 0:
+                    break
+                best_fallback: Match3D2D | None = None
+                best_fallback_score = -float('inf')
+                for j in range(top_idx.shape[1]):
+                    lm_idx = int(top_idx[i, j])
+                    if materialized_lookup is not None:
+                        lm = materialized_lookup.get(lm_idx)
+                        if lm is None:
+                            continue
+                    else:
+                        lm = working_landmarks[lm_idx]
+                    if lm.id in used_lm_ids:
+                        continue
+                    cos_sim = float(top_sim[i, j])
+                    s = score_anchor_landmark(
+                        a, lm, cos_sim,
+                        query_camera_center=q_center,
+                        lambdas=lambdas,
+                        scorer='residual',
+                    )
+                    if np.isfinite(s) and s > best_fallback_score:
+                        best_fallback_score = s
+                        best_fallback = Match3D2D(
+                            landmark_id=lm.id,
+                            uv_query=a.uv,
+                            xyz_landmark=lm.xyz,
+                            score=s,
+                            anchor_idx=i,
+                        )
+                if best_fallback is not None:
+                    fallback_candidates.append(best_fallback)
+                    used_lm_ids.add(best_fallback.landmark_id)
+                    if len(fallback_candidates) >= min_match_guarantee:
+                        break
+            candidates = fallback_candidates
+            debug['fallback_triggered'] = True
+            debug['num_fallback_matches'] = int(len(candidates))
 
         assignment_t0 = time.perf_counter()
         unique = unique_landmark_assignment(candidates)
@@ -547,6 +841,7 @@ class PLMMapLocalizer:
     ) -> Tuple[List[Match3D2D], dict]:
         match_t0 = time.perf_counter()
         anchors, anchor_debug, _ = self.extract_anchors(image)
+        self._attach_anchor_fine_descs(image, anchors)
         t_anchor_extract_s = float(time.perf_counter() - match_t0)
         return self._match_anchors_to_candidates(
             anchors,
@@ -568,11 +863,18 @@ class PLMMapLocalizer:
         localize_t0 = time.perf_counter()
         anchor_t0 = time.perf_counter()
         anchors, anchor_debug, _ = self.extract_anchors(image)
+        self._attach_anchor_fine_descs(image, anchors)
         t_anchor_extract_s = float(time.perf_counter() - anchor_t0)
         groups = list(candidate_schedule.groups)
         max_matches = int(self.matching_cfg.get('max_matches', 256))
         min_inliers = max(4, int(self.matching_cfg.get('group_verify_min_inliers', 24)))
         hard_inliers = max(min_inliers, int(self.matching_cfg.get('group_verify_hard_inliers', 40)))
+        early_geom_cfg = self.matching_cfg.get('early_geometry', {})
+        early_geom_enabled = isinstance(early_geom_cfg, dict) and bool(early_geom_cfg.get('enabled', False))
+        early_geom_min_matches = int(early_geom_cfg.get('min_matches', 12))
+        early_geom_min_inliers = int(early_geom_cfg.get('min_inliers', 8))
+        early_geom_reproj = float(early_geom_cfg.get('reproj_error_px', max(float(self.cfg['pnp'].get('reproj_error_px', 8.0)) * 1.5, 8.0)))
+        early_geom_iterations = int(early_geom_cfg.get('iterations', 512))
 
         stage_limits = [int(x) for x in candidate_schedule.stages if int(x) > 0]
         if not stage_limits:
@@ -606,6 +908,9 @@ class PLMMapLocalizer:
             't_assignment_s': 0.0,
             't_match_query_s': t_anchor_extract_s,
             't_pnp_s': 0.0,
+            't_fine_scoring_s': 0.0,
+            'num_fine_reranked': 0,
+            'early_geometry_enabled': bool(early_geom_enabled),
             'early_stop_reason': 'exhausted_stages',
         }
         for key, value in candidate_schedule.meta.items():
@@ -698,16 +1003,59 @@ class PLMMapLocalizer:
                 'num_matches_pre_assignment',
                 'num_matches_post_assignment',
                 'num_matches_final',
+                'num_fine_reranked',
             ):
                 aggregate_debug[key] = int(stage_debug.get(key, aggregate_debug.get(key, 0)))
             for key in (
                 't_retrieval_s',
                 't_materialize_selected_s',
                 't_scoring_s',
+                't_fine_scoring_s',
                 't_assignment_s',
                 't_match_query_s',
             ):
                 aggregate_debug[key] += float(stage_debug.get(key, 0.0))
+
+            if early_geom_enabled and len(kept) >= early_geom_min_matches:
+                fast_pnp_t0 = time.perf_counter()
+                early_pose = solve_pnp_ransac(
+                    kept[:max_matches],
+                    intr,
+                    reproj_err=early_geom_reproj,
+                    iterations=early_geom_iterations,
+                )
+                aggregate_debug['t_pnp_s'] += float(time.perf_counter() - fast_pnp_t0)
+                if early_pose.success and int(early_pose.num_inliers) >= early_geom_min_inliers:
+                    kept, geom_debug = self._match_anchors_to_candidates(
+                        anchors,
+                        anchor_debug,
+                        intr,
+                        pose_prior=early_pose.T_wc,
+                        candidate_landmarks=stage_set,
+                        t_anchor_extract_s=0.0,
+                        force_pose_prior=True,
+                    )
+                    for key in (
+                        'anchors_with_retrievals',
+                        'anchors_rejected_cosine',
+                        'anchors_rejected_score',
+                        'anchors_rejected_margin',
+                        'num_materialized_landmarks',
+                        'num_matches_pre_assignment',
+                        'num_matches_post_assignment',
+                        'num_matches_final',
+                        'num_fine_reranked',
+                    ):
+                        aggregate_debug[key] = int(geom_debug.get(key, aggregate_debug.get(key, 0)))
+                    for key in (
+                        't_retrieval_s',
+                        't_materialize_selected_s',
+                        't_scoring_s',
+                        't_fine_scoring_s',
+                        't_assignment_s',
+                        't_match_query_s',
+                    ):
+                        aggregate_debug[key] += float(geom_debug.get(key, 0.0))
 
             pnp_t0 = time.perf_counter()
             pose_res = solve_pnp_ransac(
@@ -744,6 +1092,25 @@ class PLMMapLocalizer:
         if best_pose_res is not None:
             pose_res = best_pose_res
             aggregate_debug['num_matches_final'] = int(best_matches)
+
+        # Multi-pass PnP: if no pose found, retry with progressively relaxed
+        # reprojection thresholds on the last stage's match set.
+        if not pose_res.success and bool(self.cfg.get('pnp', {}).get('multi_pass', False)) and len(kept) >= 4:
+            base_reproj = float(self.cfg['pnp'].get('reproj_error_px', 10.0))
+            pnp_iters = max(512, int(self.cfg['pnp'].get('iterations', 8000)) // 4)
+            for factor in (1.6, 2.5):
+                pnp_retry_t0 = time.perf_counter()
+                retry_res = solve_pnp_ransac(
+                    kept[:max_matches], intr,
+                    reproj_err=base_reproj * factor,
+                    iterations=pnp_iters,
+                )
+                aggregate_debug['t_pnp_s'] += float(time.perf_counter() - pnp_retry_t0)
+                if retry_res.success:
+                    pose_res = retry_res
+                    aggregate_debug['pnp_fallback_factor'] = float(factor)
+                    break
+
         aggregate_debug['t_localize_image_s'] = float(time.perf_counter() - localize_t0)
         return {
             'success': bool(pose_res.success),

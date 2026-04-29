@@ -4,7 +4,7 @@ from typing import List, Optional
 import numpy as np
 
 from plm_match.types import Landmark, LandmarkObservation
-from .manifold import compute_landmark_manifold
+from .manifold import compute_landmark_ppca
 from .staticness import compute_staticness
 
 
@@ -21,6 +21,21 @@ def _view_diversity_score(view_dirs: list[np.ndarray]) -> float:
     mean_angle = float(np.mean(angles))
     max_angle = float(np.max(angles))
     return float(np.clip(0.65 * (mean_angle / 25.0) + 0.35 * (max_angle / 45.0), 0.0, 1.0))
+
+
+def _view_envelope_stats(view_dirs: list[np.ndarray]) -> tuple[np.ndarray, float, float]:
+    if len(view_dirs) == 0:
+        return np.zeros((3,), dtype=np.float32), -1.0, 1.0
+    V = np.stack(view_dirs, axis=0).astype(np.float64)
+    V /= np.linalg.norm(V, axis=1, keepdims=True) + 1e-12
+    mean_dir = np.mean(V, axis=0)
+    mean_norm = np.linalg.norm(mean_dir)
+    if mean_norm <= 1e-12:
+        mean_dir = V[0]
+    else:
+        mean_dir = mean_dir / mean_norm
+    cosines = np.clip(V @ mean_dir, -1.0, 1.0)
+    return mean_dir.astype(np.float32), float(np.min(cosines)), float(np.max(cosines))
 
 
 class LandmarkMemory:
@@ -70,7 +85,7 @@ class LandmarkMemory:
             if lm.xyz is None or len(lm.observations) == 0:
                 continue
             descs = np.stack([o.desc for o in lm.observations], axis=0).astype(np.float32)
-            mu, basis, eigvals, spread = compute_landmark_manifold(descs, rank=self.manifold_rank)
+            mu, basis, eigvals, sigma_perp2, spread = compute_landmark_ppca(descs, rank=self.manifold_rank)
             view_dirs = []
             reproj_errs = []
             frame_ids = []
@@ -85,6 +100,7 @@ class LandmarkMemory:
                 if dn > 1e-8:
                     view_dirs.append((d / dn).astype(np.float32))
             vis_consistency = _view_diversity_score(view_dirs)
+            mean_view_dir, min_view_cos, max_view_cos = _view_envelope_stats(view_dirs)
             staticness = compute_staticness(
                 track_len=len(lm.observations),
                 descriptor_spread=spread,
@@ -94,11 +110,15 @@ class LandmarkMemory:
             lm.mu = mu
             lm.basis = basis
             lm.eigvals = eigvals
+            lm.sigma_perp2 = float(sigma_perp2)
             lm.n_obs = len(lm.observations)
             lm.first_frame = min(frame_ids)
             lm.last_frame = max(frame_ids)
             lm.staticness = staticness
             lm.view_dirs = view_dirs
+            lm.mean_view_dir = mean_view_dir
+            lm.min_view_cos = min_view_cos
+            lm.max_view_cos = max_view_cos
             lm.reproj_error_mean = float(np.mean(reproj_errs)) if reproj_errs else 0.0
             lm.descriptor_spread = spread
             lm.observed_frame_ids = sorted(set(int(x) for x in frame_ids))

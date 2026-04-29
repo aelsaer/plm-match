@@ -22,6 +22,38 @@ def write_hloc_results(path: str | Path, rows: list[tuple[str, object]]) -> None
             f.write(f"{name} {q[0]:.8f} {q[1]:.8f} {q[2]:.8f} {q[3]:.8f} {t[0]:.8f} {t[1]:.8f} {t[2]:.8f}\n")
 
 
+def _batch_groups(valid_pairs: list[tuple[str, int]], batch_size: int) -> list[list[tuple[str, int]]]:
+    return [valid_pairs[start : start + batch_size] for start in range(0, len(valid_pairs), batch_size)]
+
+
+def _covisibility_groups(valid_pairs: list[tuple[str, int]], store, batch_size: int) -> list[list[tuple[str, int]]]:
+    if batch_size <= 1 or len(valid_pairs) <= 1:
+        return _batch_groups(valid_pairs, batch_size)
+    remaining = list(range(len(valid_pairs)))
+    groups: list[list[tuple[str, int]]] = []
+    empty = np.zeros((0,), dtype=np.int32)
+    while remaining:
+        seed_idx = remaining.pop(0)
+        group_indices = [seed_idx]
+        merged = store.image_to_landmarks.get(int(valid_pairs[seed_idx][1]), empty).astype(np.int64, copy=False)
+        while remaining and len(group_indices) < batch_size:
+            best_pos = 0
+            best_overlap = -1
+            for pos, cand_idx in enumerate(remaining):
+                cand = store.image_to_landmarks.get(int(valid_pairs[cand_idx][1]), empty).astype(np.int64, copy=False)
+                overlap = int(np.intersect1d(merged, cand, assume_unique=False).size)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_pos = pos
+            chosen = remaining.pop(best_pos)
+            group_indices.append(chosen)
+            cand = store.image_to_landmarks.get(int(valid_pairs[chosen][1]), empty).astype(np.int64, copy=False)
+            if cand.size > 0:
+                merged = np.unique(np.concatenate([merged, cand], axis=0))
+        groups.append([valid_pairs[idx] for idx in group_indices])
+    return groups
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='PLM-MATCH HLoc/COLMAP custom localizer')
     parser.add_argument('--config', required=True, type=str)
@@ -65,6 +97,7 @@ def main() -> None:
     max_index_landmarks_per_image = cfg.get('hloc', {}).get('max_index_landmarks_per_image', None)
     verify_image_batch_size = max(1, int(cfg.get('hloc', {}).get('verify_image_batch_size', 1)))
     verify_image_schedule_cfg = cfg.get('hloc', {}).get('verify_image_schedule', [4, 10, 20])
+    grouping_method = str(cfg.get('hloc', {}).get('grouping', 'covisibility')).lower()
     manifold_rank = int(cfg.get('landmarks', {}).get('manifold_rank', 0))
     include_view = float(cfg.get('matching', {}).get('lambdas', [0, 0, 0, 0, 0])[3]) != 0.0
 
@@ -117,8 +150,11 @@ def main() -> None:
             per_image_candidate_budget = max(1, int(np.ceil(float(max_candidate_landmarks) / float(max_stage_images))))
         if db_names:
             valid_pairs = [(name, name_to_frame_id[name]) for name in db_names if name in name_to_frame_id]
-            for start in range(0, len(valid_pairs), verify_image_batch_size):
-                batch = valid_pairs[start : start + verify_image_batch_size]
+            if grouping_method == 'covisibility':
+                grouped_pairs = _covisibility_groups(valid_pairs, store, verify_image_batch_size)
+            else:
+                grouped_pairs = _batch_groups(valid_pairs, verify_image_batch_size)
+            for batch in grouped_pairs:
                 image_names = tuple(name for name, _ in batch)
                 frame_ids = tuple(int(fid) for _, fid in batch)
                 merged_list = []
@@ -188,6 +224,7 @@ def main() -> None:
                 'candidate_indices_total': int(candidate_total),
                 'grouped_verification': True,
                 'verify_image_batch_size': int(verify_image_batch_size),
+                'grouping': grouping_method,
                 'per_image_candidate_budget': (int(per_image_candidate_budget) if per_image_candidate_budget is not None else None),
             },
         )

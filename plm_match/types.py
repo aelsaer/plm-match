@@ -12,6 +12,7 @@ class Anchor:
     score: float
     cell_id: Tuple[int, int]
     token_rc: Tuple[int, int]
+    fine_desc: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -37,6 +38,7 @@ class LandmarkObservation:
     camera_center: np.ndarray
     reproj_error: float = 0.0
     image_name: str | None = None
+    fine_desc: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -47,11 +49,17 @@ class Landmark:
     mu: Optional[np.ndarray] = None
     basis: Optional[np.ndarray] = None
     eigvals: Optional[np.ndarray] = None
+    sigma_perp2: Optional[float] = None
     n_obs: int = 0
     first_frame: int = -1
     last_frame: int = -1
     staticness: float = 0.0
     view_dirs: List[np.ndarray] = field(default_factory=list)
+    mean_view_dir: Optional[np.ndarray] = None
+    min_view_cos: Optional[float] = None
+    max_view_cos: Optional[float] = None
+    fine_descs: Optional[np.ndarray] = None
+    fine_obs_frame_ids: List[int] = field(default_factory=list)
     reproj_error_mean: float = 0.0
     descriptor_spread: float = 0.0
     observed_frame_ids: List[int] = field(default_factory=list)

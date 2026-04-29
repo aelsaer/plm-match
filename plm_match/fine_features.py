@@ -1,0 +1,340 @@
+from __future__ import annotations
+
+import importlib
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
+import sys
+from typing import Any, Optional, Sequence
+
+import cv2
+import numpy as np
+import torch
+
+from plm_match.utils.io import read_image
+
+
+@dataclass
+class GrayImageCacheEntry:
+    gray: np.ndarray
+
+
+@dataclass
+class XFeatImageCacheEntry:
+    keypoints: np.ndarray
+    descriptors: np.ndarray
+
+
+class LRUGrayImageCache:
+    def __init__(self, max_items: int = 16):
+        self.max_items = int(max_items)
+        self._data: OrderedDict[int, GrayImageCacheEntry] = OrderedDict()
+
+    def get(self, key: int) -> Optional[GrayImageCacheEntry]:
+        val = self._data.get(int(key))
+        if val is None:
+            return None
+        self._data.move_to_end(int(key))
+        return val
+
+    def put(self, key: int, value: GrayImageCacheEntry) -> None:
+        key = int(key)
+        self._data[key] = value
+        self._data.move_to_end(key)
+        while len(self._data) > self.max_items:
+            self._data.popitem(last=False)
+
+
+class LocalPatchDescriptor:
+    """Sparse local descriptor head for shortlist reranking."""
+
+    def __init__(
+        self,
+        method: str = 'sift',
+        patch_size: int = 24,
+        *,
+        repo_root: str | None = None,
+        top_k: int = 4096,
+        match_radius_px: float | None = None,
+        image_cache_size: int = 8,
+    ):
+        self.method = str(method).lower()
+        self.patch_size = float(max(8, int(patch_size)))
+        self.top_k = int(max(0, top_k))
+        self.match_radius_px = float(match_radius_px) if match_radius_px is not None else float(max(6.0, self.patch_size))
+        self.repo_root = repo_root
+        self._xfeat_cache: OrderedDict[tuple[int, tuple[int, ...]], XFeatImageCacheEntry] = OrderedDict()
+        self._xfeat_cache_size = int(max(1, image_cache_size))
+        if self.method == 'sift':
+            if not hasattr(cv2, 'SIFT_create'):
+                raise RuntimeError('OpenCV SIFT is unavailable in this environment.')
+            self.impl = cv2.SIFT_create(nfeatures=0)
+            self._dim = 128
+            self._binary = False
+        elif self.method == 'xfeat':
+            self.impl = self._load_xfeat(repo_root=repo_root, top_k=self.top_k)
+            self._dim = 64
+            self._binary = False
+        elif self.method == 'orb':
+            self.impl = cv2.ORB_create(nfeatures=0, patchSize=int(self.patch_size))
+            self._dim = 32
+            self._binary = True
+        else:
+            raise ValueError(f'Unsupported local descriptor method: {method}')
+
+    @property
+    def dim(self) -> int:
+        return int(self._dim)
+
+    def _normalize(self, desc: np.ndarray) -> np.ndarray:
+        desc = np.asarray(desc, dtype=np.float32).reshape(-1)
+        if self._binary:
+            desc = desc.astype(np.float32)
+        norm = float(np.linalg.norm(desc))
+        if norm <= 1e-8:
+            return np.zeros_like(desc, dtype=np.float32)
+        return (desc / norm).astype(np.float32)
+
+    def _load_xfeat(self, *, repo_root: str | None, top_k: int):
+        # Explicit repo_root takes priority.
+        candidates_to_add: list[Path] = []
+        if repo_root:
+            root = Path(repo_root).expanduser().resolve()
+            candidates_to_add += [root, root.parent if root.name == 'modules' else root]
+        # Also try known torch.hub cache locations and installed packages.
+        try:
+            hub_dir = Path(torch.hub.get_dir()) / 'hub'
+            if hub_dir.exists():
+                for d in hub_dir.glob('verlab_accelerated_features*'):
+                    candidates_to_add.append(d)
+        except Exception:
+            pass
+        # imm package ships accelerated_features internally
+        try:
+            import imm
+            imm_root = Path(imm.__file__).parent / 'third_party' / 'accelerated_features'
+            if imm_root.exists():
+                candidates_to_add.append(imm_root)
+        except Exception:
+            pass
+        for cand in candidates_to_add:
+            cand_s = str(cand)
+            if cand_s not in sys.path:
+                sys.path.insert(0, cand_s)
+        last_error: Exception | None = None
+        cls = None
+        for module_name in ('xfeat', 'modules.xfeat'):
+            try:
+                module = importlib.import_module(module_name)
+                cls = getattr(module, 'XFeat', None)
+                if cls is not None:
+                    break
+            except Exception as exc:
+                last_error = exc
+        if cls is None:
+            try:
+                return torch.hub.load(
+                    'verlab/accelerated_features',
+                    'XFeat',
+                    pretrained=True,
+                    top_k=top_k,
+                )
+            except Exception as exc:
+                cause = exc if last_error is None else last_error
+                raise RuntimeError(
+                    'XFeat support was requested, but no XFeat package was found and '
+                    'torch.hub could not download the official model. Install an '
+                    'importable `xfeat` package, provide '
+                    '`matching.fine_rerank.repo_root`, or make torch.hub downloads '
+                    'available for `verlab/accelerated_features`.'
+                ) from cause
+        try:
+            return cls(top_k=top_k)
+        except TypeError:
+            inst = cls()
+            if hasattr(inst, 'top_k'):
+                try:
+                    setattr(inst, 'top_k', top_k)
+                except Exception:
+                    pass
+            return inst
+
+    def _to_numpy(self, value: Any) -> np.ndarray | None:
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            return value
+        if torch.is_tensor(value):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    def _normalize_xfeat_output(self, output: Any) -> XFeatImageCacheEntry:
+        if isinstance(output, (list, tuple)):
+            if len(output) == 1:
+                return self._normalize_xfeat_output(output[0])
+            if len(output) >= 2 and not isinstance(output[0], dict):
+                kpts = self._to_numpy(output[0])
+                desc = self._to_numpy(output[1])
+                return self._pack_xfeat_output(kpts, desc)
+            if len(output) >= 1 and isinstance(output[0], dict):
+                return self._normalize_xfeat_output(output[0])
+        if isinstance(output, dict):
+            kpts = None
+            for key in ('keypoints', 'points', 'mkpts', 'mkpts0'):
+                if key in output:
+                    kpts = output[key]
+                    break
+            desc = None
+            for key in ('descriptors', 'desc', 'descriptors0'):
+                if key in output:
+                    desc = output[key]
+                    break
+            return self._pack_xfeat_output(self._to_numpy(kpts), self._to_numpy(desc))
+        raise RuntimeError(f'Unsupported XFeat output type: {type(output).__name__}')
+
+    def _pack_xfeat_output(self, keypoints: np.ndarray | None, descriptors: np.ndarray | None) -> XFeatImageCacheEntry:
+        if keypoints is None or descriptors is None:
+            return XFeatImageCacheEntry(
+                keypoints=np.zeros((0, 2), dtype=np.float32),
+                descriptors=np.zeros((0, self.dim), dtype=np.float32),
+            )
+        keypoints = np.asarray(keypoints, dtype=np.float32)
+        descriptors = np.asarray(descriptors, dtype=np.float32)
+        if keypoints.ndim == 3 and keypoints.shape[0] == 1:
+            keypoints = keypoints[0]
+        if descriptors.ndim == 3 and descriptors.shape[0] == 1:
+            descriptors = descriptors[0]
+        keypoints = keypoints.reshape(-1, 2).astype(np.float32, copy=False)
+        descriptors = descriptors.reshape(descriptors.shape[0], -1).astype(np.float32, copy=False)
+        if descriptors.shape[0] != keypoints.shape[0]:
+            n = min(keypoints.shape[0], descriptors.shape[0])
+            keypoints = keypoints[:n]
+            descriptors = descriptors[:n]
+        if descriptors.shape[0] == 0:
+            descriptors = np.zeros((0, self.dim), dtype=np.float32)
+        else:
+            descriptors = np.stack([self._normalize(d) for d in descriptors], axis=0).astype(np.float32)
+            self._dim = int(descriptors.shape[1])
+        return XFeatImageCacheEntry(keypoints=keypoints, descriptors=descriptors)
+
+    def _xfeat_cache_get(self, key: tuple[int, tuple[int, ...]]) -> XFeatImageCacheEntry | None:
+        val = self._xfeat_cache.get(key)
+        if val is None:
+            return None
+        self._xfeat_cache.move_to_end(key)
+        return val
+
+    def _xfeat_cache_put(self, key: tuple[int, tuple[int, ...]], value: XFeatImageCacheEntry) -> None:
+        self._xfeat_cache[key] = value
+        self._xfeat_cache.move_to_end(key)
+        while len(self._xfeat_cache) > self._xfeat_cache_size:
+            self._xfeat_cache.popitem(last=False)
+
+    def _run_xfeat(self, image_rgb: np.ndarray) -> XFeatImageCacheEntry:
+        cache_key = (id(image_rgb), tuple(int(x) for x in image_rgb.shape))
+        cached = self._xfeat_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        img = np.asarray(image_rgb)
+        if img.ndim == 2:
+            img = np.repeat(img[..., None], 3, axis=2)
+        if img.dtype != np.float32:
+            img = img.astype(np.float32) / 255.0
+        tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+        attempts = [
+            lambda: self.impl.detectAndCompute(tensor, top_k=self.top_k),
+            lambda: self.impl.detectAndCompute(tensor),
+            lambda: self.impl.detectAndCompute((img * 255.0).astype(np.uint8), top_k=self.top_k),
+            lambda: self.impl.detectAndCompute((img * 255.0).astype(np.uint8)),
+        ]
+        last_error: Exception | None = None
+        for attempt in attempts:
+            try:
+                entry = self._normalize_xfeat_output(attempt())
+                self._xfeat_cache_put(cache_key, entry)
+                return entry
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f'Failed to run XFeat detectAndCompute: {last_error}') from last_error
+
+    def _extract_xfeat(self, image_rgb: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
+        entry = self._run_xfeat(image_rgb)
+        if not points:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        if entry.keypoints.shape[0] == 0 or entry.descriptors.shape[0] == 0:
+            return np.zeros((len(points), self.dim), dtype=np.float32)
+        pts = np.asarray([np.asarray(p, dtype=np.float32).reshape(2) for p in points], dtype=np.float32)
+        kpts = entry.keypoints.astype(np.float32, copy=False)
+        diff = pts[:, None, :] - kpts[None, :, :]
+        d2 = np.sum(diff * diff, axis=-1)
+        best = np.argmin(d2, axis=1)
+        best_d2 = d2[np.arange(d2.shape[0]), best]
+        out = np.zeros((pts.shape[0], entry.descriptors.shape[1]), dtype=np.float32)
+        valid = best_d2 <= float(self.match_radius_px * self.match_radius_px)
+        if np.any(valid):
+            out[valid] = entry.descriptors[best[valid]]
+        return out
+
+    def _compute_one(self, gray: np.ndarray, uv: np.ndarray) -> np.ndarray | None:
+        x = float(uv[0])
+        y = float(uv[1])
+        h, w = gray.shape[:2]
+        if x < 0.0 or x >= float(w) or y < 0.0 or y >= float(h):
+            return None
+        kp = cv2.KeyPoint(x, y, self.patch_size)
+        _, desc = self.impl.compute(gray, [kp])
+        if desc is None or desc.shape[0] == 0:
+            return None
+        return self._normalize(desc[0])
+
+    def extract_at_points(self, image_rgb: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
+        if self.method == 'xfeat':
+            return self._extract_xfeat(image_rgb, points)
+        gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+        return self.extract_from_gray(gray, points)
+
+    def extract_from_gray(self, gray: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
+        if self.method == 'xfeat':
+            image_rgb = np.repeat(gray[..., None], 3, axis=2)
+            return self._extract_xfeat(image_rgb, points)
+        descs = []
+        for uv in points:
+            desc = self._compute_one(gray, np.asarray(uv, dtype=np.float32))
+            if desc is None:
+                desc = np.zeros((self.dim,), dtype=np.float32)
+            descs.append(desc)
+        if not descs:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        return np.stack(descs, axis=0).astype(np.float32)
+
+
+def best_fine_similarity(query_desc: np.ndarray | None, landmark_descs: np.ndarray | None) -> float | None:
+    if query_desc is None or landmark_descs is None:
+        return None
+    q = np.asarray(query_desc, dtype=np.float32).reshape(-1)
+    if landmark_descs.ndim != 2 or landmark_descs.shape[0] == 0:
+        return None
+    sims = landmark_descs.astype(np.float32) @ q
+    if sims.size == 0:
+        return None
+    return float(np.max(sims))
+
+
+def get_gray_frame(
+    frame_id: int,
+    *,
+    dataset,
+    cache: LRUGrayImageCache | None = None,
+) -> np.ndarray:
+    if cache is not None:
+        ent = cache.get(frame_id)
+        if ent is not None:
+            return ent.gray
+    frame = dataset.get_map_frames()[int(frame_id)]
+    image = read_image(frame.image_path)
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    if cache is not None:
+        cache.put(int(frame_id), GrayImageCacheEntry(gray=gray))
+    return gray

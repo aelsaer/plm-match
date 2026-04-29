@@ -1,19 +1,19 @@
-dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
 
 map:
   max_queries: 10
-  cache_path: ./outputs/aachen_minitest_cache/landmarks.pkl
+  cache_path: /tmp/plm_match_outputs/aachen_minitest_cache/landmarks.pkl
 
 dataset:
   type: colmap_localization
   image_root: images_upright
   model_path: 3D-models/aachen_v_1_1
   db_image_prefixes: [db/]
-  db_image_names_file: /home/cvdp/phd/object_matching/plm_match_bench_ready/plm_match_wired/outputs/aachen_minitest_cache/minitest_db_names.txt
-  query_list: /home/cvdp/phd/object_matching/plm_match_bench_ready/plm_match_wired/outputs/aachen_minitest_cache/minitest_queries.txt
+  db_image_names_file: /tmp/plm_match_outputs/aachen_minitest_files/minitest_db_names.txt
+  query_list: /tmp/plm_match_outputs/aachen_minitest_files/minitest_queries.txt
 
 hloc:
-  retrieval_file: /home/cvdp/phd/object_matching/plm_match_bench_ready/plm_match_wired/outputs/aachen_minitest_cache/minitest_pairs.txt
+  retrieval_file: /tmp/plm_match_outputs/aachen_minitest_files/minitest_pairs.txt
   topk_db_images: 20
   max_candidate_landmarks: 30000
 

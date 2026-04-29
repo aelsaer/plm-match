@@ -1,0 +1,38 @@
+# Phase 1 real-data Aachen baselines from the linked public dataset.
+#
+# These runs force CPU because the current `sam3` env reports `torch.cuda.is_available() == False`.
+# If you later switch to a CUDA-capable env, remove the `backbone.device: cpu` overrides and
+# write results to a separate outputs root so CPU and CUDA timings do not mix.
+
+base_config: configs/aachen_v1_1_day_precise.yaml
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
+pipeline: plm_match.pipelines.hloc_localize
+outputs_root: /tmp/plm_match_outputs/aachen_phase1_real_cpu
+
+experiments:
+  - name: precise_cpu
+    overrides:
+      map.cache_path: /tmp/plm_match_outputs/aachen_map_cache_precise/landmarks.pkl
+      backbone.device: cpu
+
+  - name: full_cpu
+    overrides:
+      map.cache_path: /tmp/plm_match_outputs/aachen_map_cache/landmarks.pkl
+      map.query_cache_namespace: aachen_day_full_cpu_v1
+      hloc.topk_db_images: 20
+      hloc.max_candidate_landmarks: 10000
+      anchors.topk: 128
+      landmarks.manifold_rank: 2
+      landmarks.cache_manifold_rank: 2
+      landmarks.min_obs: 3
+      landmarks.max_colmap_point_error: 4.0
+      landmarks.min_colmap_track_len: 3
+      landmarks.min_staticness: 0.05
+      matching.materialize_topk_per_anchor: 4
+      matching.max_materialized_landmarks: 512
+      matching.max_matches: 512
+      matching.group_verify_patience: 2
+      matching.group_verify_min_inliers: 24
+      matching.group_verify_hard_inliers: 40
+      backbone.input_size: [518, 518]
+      backbone.device: cpu

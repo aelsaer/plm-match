@@ -1,17 +1,17 @@
-# Aachen day localization tuned for higher correspondence precision on the
-# compact-store HLoc path.
 dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
 
 map:
+  # Reuse the same compact store built for the day precise run — the map is
+  # identical (same db images, same COLMAP model).
   cache_path: ./outputs/aachen_map_cache_precise/landmarks.pkl
-  query_cache_namespace: aachen_day_precise_v1
+  query_cache_namespace: aachen_night_precise_v1
 
 dataset:
   type: colmap_localization
   image_root: images_upright
   model_path: 3D-models/aachen_v_1_1
   db_image_prefixes: [db/]
-  query_list: day_time_queries_with_intrinsics.txt
+  query_list: queries/night_time_queries_with_intrinsics.txt
 
 hloc:
   retrieval_file: pairs-query-netvlad50.txt
@@ -39,7 +39,7 @@ landmarks:
   manifold_rank: 0
   cache_manifold_rank: 0
   min_obs: 5
-  max_obs_per_landmark: 8
+  max_obs_per_landmark: 4
   max_colmap_point_error: 3.0
   min_colmap_track_len: 4
   min_staticness: 0.35
@@ -51,9 +51,10 @@ matching:
   use_pose_prior: false
   carry_pose_prior: false
   lambdas: [1.0, 1.2, 0.6, 0.0, 0.0]
-  min_cosine_sim: 0.25
-  min_score: 0.10
-  ratio_margin: 0.03
+  # Relaxed vs day: night→day appearance gap reduces cosine similarity.
+  min_cosine_sim: 0.10
+  min_score: -1.0e9
+  ratio_margin: 0.0
 
 pnp:
   reproj_error_px: 6.0

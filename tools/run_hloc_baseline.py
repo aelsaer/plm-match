@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".JPG", ".JPEG", ".PNG"}
 
@@ -18,17 +20,15 @@ METHOD_PRESETS = {
     },
     "superpoint_lightglue": {
         "extractor_conf": "superpoint_max",
-        "matcher_conf": "superpoint-lightglue",
+        "matcher_conf": "superpoint+lightglue",
     },
     "disk_lightglue": {
         "extractor_conf": "disk",
-        "matcher_conf": "disk-lightglue",
+        "matcher_conf": "disk+lightglue",
     },
-    # Robust sparse XFeat fallback. If you validate an image-based XFeat-LightGlue
-    # path later, switch matcher_conf at the CLI/manifest.
-    "xfeat": {
-        "extractor_conf": "xfeat",
-        "matcher_conf": "NN-mutual",
+    "aliked_lightglue": {
+        "extractor_conf": "aliked-n16",
+        "matcher_conf": "aliked+lightglue",
     },
 }
 
@@ -58,19 +58,23 @@ def _resolve_path(root: Path, value: str | None) -> Path | None:
     return path
 
 
-def _import_hloc(hloc_root: Path):
-    root = hloc_root
-    if root.name == "hloc":
-        root = root.parent
-    sys.path.insert(0, str(root))
+def _import_hloc(hloc_root: Path | None):
+    if hloc_root is not None:
+        root = hloc_root
+        if root.name == "hloc":
+            root = root.parent
+        sys.path.insert(0, str(root))
     try:
-        from hloc import extract_features, localize_inloc, localize_sfm, match_features
+        from hloc import extract_features, localize_sfm, match_features
         from hloc.utils.parsers import parse_image_lists, parse_retrieval
-    except Exception as exc:  # pragma: no cover - dependency-gated in real envs
+        try:
+            from hloc import localize_inloc
+        except ImportError:
+            localize_inloc = None
+    except Exception as exc:
         raise RuntimeError(
-            f"Failed to import HLoc from {root}. "
-            "Use --hloc-root with a valid HLoc checkout and a Python env that has "
-            f"its dependencies installed. Original error: {exc}"
+            f"Failed to import HLoc. Install with: pip install git+https://github.com/cvg/Hierarchical-Localization\n"
+            f"Original error: {exc}"
         ) from exc
     return extract_features, localize_inloc, localize_sfm, match_features, parse_image_lists, parse_retrieval
 
@@ -152,7 +156,7 @@ def run(args: argparse.Namespace) -> dict:
     artifacts_dir = out_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    hloc_root = Path(args.hloc_root)
+    hloc_root = Path(args.hloc_root) if args.hloc_root else None
     extract_features, localize_inloc, localize_sfm, match_features, parse_image_lists, parse_retrieval = _import_hloc(hloc_root)
 
     image_dir = _resolve_path(dataset_root, args.image_dir or preset.get("image_dir"))
@@ -318,7 +322,117 @@ def run(args: argparse.Namespace) -> dict:
         "matches_file": str(matches_path),
     }
     _write_json(out_dir / "run_summary.json", summary)
+
+    if args.dataset == "aachen":
+        metrics = _evaluate_aachen(results_path, dataset_root, query_list, summary)
+        if metrics is not None:
+            _write_json(out_dir / "metrics.json", metrics)
+
     return summary
+
+
+def _parse_hloc_results(results_path: Path) -> dict[str, np.ndarray]:
+    """Parse hloc_results.txt → {image_name: T_wc (4x4)}."""
+    from scipy.spatial.transform import Rotation
+    poses = {}
+    with open(results_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            name = parts[0]
+            qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+            tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
+            # hloc writes T_cw (world-to-camera): R_cw, t_cw
+            R_cw = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+            t_cw = np.array([tx, ty, tz])
+            # invert to T_wc
+            R_wc = R_cw.T
+            t_wc = -R_wc @ t_cw
+            T_wc = np.eye(4)
+            T_wc[:3, :3] = R_wc
+            T_wc[:3, 3] = t_wc
+            poses[name] = T_wc
+    return poses
+
+
+def _rot_err_deg(T_est: np.ndarray, T_gt: np.ndarray) -> float:
+    R_est = T_est[:3, :3]
+    R_gt = T_gt[:3, :3]
+    R_rel = R_est.T @ R_gt
+    cos = float(np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos)))
+
+
+def _trans_err_m(T_est: np.ndarray, T_gt: np.ndarray) -> float:
+    return float(np.linalg.norm(T_est[:3, 3] - T_gt[:3, 3]))
+
+
+def _evaluate_aachen(
+    results_path: Path,
+    dataset_root: Path,
+    query_list: Path | None,
+    summary: dict,
+) -> dict | None:
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from plm_match.datasets import build_dataset
+        from plm_match.utils.pose import rotation_error_deg, translation_error
+    except Exception:
+        return None
+
+    if not results_path.exists():
+        return None
+
+    try:
+        predicted = _parse_hloc_results(results_path)
+    except Exception:
+        return None
+
+    try:
+        cfg = {
+            "type": "colmap_localization",
+            "image_root": "images_upright",
+            "model_path": "3D-models/aachen_v_1_1",
+            "db_image_prefixes": ["db/"],
+        }
+        if query_list is not None and query_list.exists():
+            cfg["query_list"] = str(query_list.relative_to(dataset_root) if query_list.is_relative_to(dataset_root) else query_list)
+        dataset = build_dataset(str(dataset_root), cfg)
+        query_frames = dataset.get_query_frames()
+    except Exception:
+        return None
+
+    frames_out = []
+    for frame in query_frames:
+        name = str(frame.meta.get("relative_path", frame.image_path.name))
+        gt_pose = frame.pose
+        pred_pose = predicted.get(name)
+        row: dict = {"query": name, "success": pred_pose is not None}
+        if pred_pose is not None and gt_pose is not None:
+            row["rot_err_deg"] = float(rotation_error_deg(pred_pose, gt_pose))
+            row["trans_err_m"] = float(translation_error(pred_pose, gt_pose))
+            row["mean_query_time_s"] = float(summary.get("mean_query_time_s", 0.0))
+        frames_out.append(row)
+
+    num = len(frames_out)
+    succ = sum(1 for r in frames_out if r["success"])
+    rot = [r["rot_err_deg"] for r in frames_out if "rot_err_deg" in r]
+    trans = [r["trans_err_m"] for r in frames_out if "trans_err_m" in r]
+    eval_summary: dict = {
+        "num_queries": num,
+        "num_success": succ,
+        "success_rate": float(succ / max(1, num)),
+        "mean_query_time_s": float(summary.get("mean_query_time_s", 0.0)),
+    }
+    if rot:
+        eval_summary["median_rot_err_deg"] = float(np.median(rot))
+        eval_summary["mean_rot_err_deg"] = float(np.mean(rot))
+    if trans:
+        eval_summary["median_trans_err_m"] = float(np.median(trans))
+        eval_summary["mean_trans_err_m"] = float(np.mean(trans))
+    return {"summary": eval_summary, "frames": frames_out}
 
 
 def main() -> None:
@@ -327,7 +441,7 @@ def main() -> None:
     parser.add_argument("--method", choices=sorted(METHOD_PRESETS.keys()), required=True)
     parser.add_argument("--dataset_root", required=True, type=str)
     parser.add_argument("--out_dir", required=True, type=str)
-    parser.add_argument("--hloc_root", type=str, default="/home/cvdp/phd/image-matching-webui/imcui")
+    parser.add_argument("--hloc_root", type=str, default=None)
     parser.add_argument("--image_dir", type=str, default=None)
     parser.add_argument("--reference_sfm", type=str, default=None)
     parser.add_argument("--query_list", type=str, default=None)

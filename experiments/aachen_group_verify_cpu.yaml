@@ -1,0 +1,38 @@
+# Phase 2 grouped-verification sweep on real Aachen data.
+#
+# This keeps the precise pre-PPCA matcher fixed and varies only the multi-image
+# grouping behavior in the HLoc candidate scheduler.
+
+base_config: configs/aachen_v1_1_day_precise.yaml
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
+pipeline: plm_match.pipelines.hloc_localize
+outputs_root: /tmp/plm_match_outputs/aachen_group_verify_cpu
+
+experiments:
+  - name: group_1_cpu
+    overrides:
+      map.cache_path: /tmp/plm_match_outputs/aachen_map_cache_precise/landmarks.pkl
+      backbone.device: cpu
+      hloc.verify_image_batch_size: 1
+      hloc.verify_image_schedule: [1, 20]
+
+  - name: group_5_cpu
+    overrides:
+      map.cache_path: /tmp/plm_match_outputs/aachen_map_cache_precise/landmarks.pkl
+      backbone.device: cpu
+      hloc.verify_image_batch_size: 5
+      hloc.verify_image_schedule: [5, 20]
+
+  - name: group_10_cpu
+    overrides:
+      map.cache_path: /tmp/plm_match_outputs/aachen_map_cache_precise/landmarks.pkl
+      backbone.device: cpu
+      hloc.verify_image_batch_size: 10
+      hloc.verify_image_schedule: [10, 20]
+
+  - name: group_20_cpu
+    overrides:
+      map.cache_path: /tmp/plm_match_outputs/aachen_map_cache_precise/landmarks.pkl
+      backbone.device: cpu
+      hloc.verify_image_batch_size: 20
+      hloc.verify_image_schedule: [20]

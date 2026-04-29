@@ -3,7 +3,7 @@
 # The map cache is shared across all experiments (built once on first run).
 
 base_config: configs/aachen_v1_1_day.yaml
-dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
 pipeline: plm_match.pipelines.hloc_localize
 outputs_root: ./outputs/aachen_sweep
 

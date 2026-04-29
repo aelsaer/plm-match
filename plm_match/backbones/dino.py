@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 from typing import Dict, Tuple
 import numpy as np
 import torch
 import cv2
 
 from .base import BaseFeatureExtractor
+
+
+def _ensure_writable_torch_hub_dir() -> None:
+    hub_dir = Path(torch.hub.get_dir())
+    try:
+        hub_dir.mkdir(parents=True, exist_ok=True)
+        probe = hub_dir / '.write_probe'
+        probe.write_text('ok', encoding='utf-8')
+        probe.unlink()
+        return
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / 'torch-hub'
+        fallback.mkdir(parents=True, exist_ok=True)
+        torch.hub.set_dir(str(fallback))
 
 
 class DINOv2FeatureExtractor(BaseFeatureExtractor):
@@ -17,6 +33,9 @@ class DINOv2FeatureExtractor(BaseFeatureExtractor):
         if self._use_cuda:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+        # Some sandboxed environments expose a read-only home cache. Fall back to
+        # a writable temp hub dir before torch.hub tries to clone/load DINOv2.
+        _ensure_writable_torch_hub_dir()
         self.model = torch.hub.load('facebookresearch/dinov2', model_name).to(device)
         self.model.eval()
         patch_size = getattr(getattr(self.model, 'patch_embed', None), 'patch_size', (14, 14))

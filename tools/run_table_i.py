@@ -213,9 +213,7 @@ def run_hloc(
         return "cached", None
 
     python_bin = run_spec.get("python") or defaults.get("hloc_python") or sys.executable
-    hloc_root = run_spec.get("hloc_root") or defaults.get("hloc_root")
-    if not hloc_root:
-        return "missing_hloc_root", None
+    hloc_root = run_spec.get("hloc_root") or defaults.get("hloc_root") or None
     cmd = [
         str(python_bin),
         str(ROOT / "tools" / "run_hloc_baseline.py"),
@@ -227,9 +225,9 @@ def run_hloc(
         str(dataset_spec["dataset_root"]),
         "--out_dir",
         str(out_dir),
-        "--hloc_root",
-        str(hloc_root),
     ]
+    if hloc_root:
+        cmd.extend(["--hloc_root", str(hloc_root)])
 
     optional_keys = (
         "image_dir",
@@ -253,13 +251,17 @@ def run_hloc(
     if bool(run_spec.get("covisibility_clustering", False)):
         cmd.append("--covisibility-clustering")
 
-    env = None
-    pythonpath_entries = [str(Path(hloc_root))]
-    if defaults.get("extra_pythonpath"):
-        pythonpath_entries.append(str(defaults["extra_pythonpath"]))
     env = dict(**__import__("os").environ)
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = ":".join(pythonpath_entries + ([existing] if existing else []))
+    pythonpath_entries = []
+    if hloc_root:
+        pythonpath_entries.append(str(Path(hloc_root)))
+    for key in ("extra_pythonpath", "superglue_pythonpath"):
+        val = run_spec.get(key) or defaults.get(key)
+        if val:
+            pythonpath_entries.append(str(val))
+    if pythonpath_entries:
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = ":".join(pythonpath_entries + ([existing] if existing else []))
 
     t0 = time.perf_counter()
     result = subprocess.run(cmd, cwd=str(ROOT), env=env)

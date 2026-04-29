@@ -10,15 +10,14 @@
 #       "aachen_0.5m_5deg": 0.638,
 #       "aachen_5m_10deg": 0.881
 #     }
-# - The HLoc rows use the local HLoc checkout under `/home/cvdp/phd/image-matching-webui/imcui`.
-#   Point `defaults.hloc_python` to a Python that has HLoc dependencies such as
-#   `pycolmap`, `h5py`, and Torch installed.
+# - HLoc is pip-installed in sam3 (hloc_root is not needed).
 
 defaults:
   outputs_root: ./outputs/table_i
-  plm_python: /home/cvdp/miniconda3/envs/cv/bin/python
-  hloc_python: /home/cvdp/miniconda3/envs/cv/bin/python
-  hloc_root: /home/cvdp/phd/image-matching-webui/imcui
+  plm_python: /home/andreas/anaconda3/envs/sam3/bin/python
+  hloc_python: /home/andreas/anaconda3/envs/sam3/bin/python
+  hloc_root: null
+  superglue_pythonpath: /tmp
   disable_query_cache: true
   disable_map_cache: false
 
@@ -28,7 +27,7 @@ table:
 datasets:
   aachen:
     hloc_dataset: aachen
-    dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+    dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
     default_eval_file: official_eval.json
     thresholds:
       - key: aachen_0.25m_2deg
@@ -98,57 +97,73 @@ methods:
         retrieval_file: pairs-query-netvlad50.txt
         image_dir: images
 
-  - name: xfeat
-    label: XFeat
+  - name: aliked_lightglue
+    label: ALIKED + LightGlue
     runs:
       aachen:
         kind: hloc
-        method: xfeat
-      inloc:
-        kind: hloc
-        method: xfeat
-        query_list: queries/queries_with_intrinsics.txt
-        retrieval_file: pairs-query-netvlad50.txt
-        image_dir: images
+        method: aliked_lightglue
 
   - name: frozen_backbone_flat
-    label: Frozen backbone flat
+    label: Frozen backbone (cosine only)
     runs:
       aachen:
         kind: plm
-        config: configs/aachen_v1_1_day_precise.yaml
+        config: configs/aachen_v1_1_day_refactor.yaml
         overrides:
+          matching.scorer: residual
           landmarks.manifold_rank: 0
           matching.lambdas: [0.0, 1.0, 0.0, 0.0, 0.0]
-      inloc:
-        kind: plm
-        config: configs/inloc_colmap.yaml
-        overrides:
-          landmarks.manifold_rank: 0
-          matching.lambdas: [0.0, 1.0, 0.0, 0.0, 0.0]
+          matching.min_cosine_sim: 0.25
+          matching.min_score: 0.10
+          matching.ratio_margin: 0.03
+          matching.min_match_guarantee: 0
+          matching.fine_rerank.enabled: false
+          matching.early_geometry.enabled: false
 
   - name: plm_mean
-    label: PLM mean
+    label: PLM mean + staticness
     runs:
       aachen:
         kind: plm
-        config: configs/aachen_v1_1_day_precise.yaml
+        config: configs/aachen_v1_1_day_refactor.yaml
         overrides:
+          matching.scorer: residual
           landmarks.manifold_rank: 0
-          matching.lambdas: [0.0, 1.0, 0.6, 0.0, 0.0]
-      inloc:
-        kind: plm
-        config: configs/inloc_colmap.yaml
-        overrides:
-          landmarks.manifold_rank: 0
-          matching.lambdas: [0.0, 1.0, 0.6, 0.0, 0.0]
+          matching.lambdas: [0.0, 1.2, 0.6, 0.0, 0.0]
+          matching.min_cosine_sim: 0.25
+          matching.min_score: 0.10
+          matching.ratio_margin: 0.03
+          matching.min_match_guarantee: 0
+          matching.fine_rerank.enabled: false
+          matching.early_geometry.enabled: false
 
-  - name: plm_full
-    label: PLM full
+  - name: plm_residual
+    label: PLM residual manifold
     runs:
       aachen:
         kind: plm
-        config: configs/aachen_v1_1_day_precise.yaml
-      inloc:
+        config: configs/aachen_v1_1_day_refactor.yaml
+        overrides:
+          matching.scorer: residual
+          matching.fine_rerank.enabled: false
+          matching.early_geometry.enabled: false
+
+  - name: plm_ppca
+    label: PLM PPCA manifold
+    runs:
+      aachen:
         kind: plm
-        config: configs/inloc_colmap.yaml
+        config: configs/aachen_v1_1_day_refactor.yaml
+        overrides:
+          matching.fine_rerank.enabled: false
+          matching.early_geometry.enabled: false
+
+  - name: plm_full_refactor
+    label: PLM PPCA + early geom
+    runs:
+      aachen:
+        kind: plm
+        config: configs/aachen_v1_1_day_refactor.yaml
+        overrides:
+          matching.fine_rerank.enabled: false

@@ -34,7 +34,7 @@ for entry in "${ABLATIONS[@]}"; do
 
   python -m plm_match.pipelines.hloc_localize \
     --config "$tmp_cfg" \
-    --dataset_root /home/cvdp/phd/object_matching/datasets/aachen_v1_1 \
+    --dataset_root /home/phd/plm-match/datasets/aachen_v1_1 \
     --out_dir "$out_dir"
 
   echo "  -> done: $out_dir/metrics.json"

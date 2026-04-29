@@ -1,0 +1,99 @@
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
+
+map:
+  cache_path: ./outputs/aachen_day_refactor_cache/landmarks.pkl
+  map_feature_cache_size: 64
+  map_gray_cache_size: 64
+  compute_fine_descs: true
+
+dataset:
+  type: colmap_localization
+  image_root: images_upright
+  model_path: 3D-models/aachen_v_1_1
+  db_image_prefixes: [db/]
+  query_list: day_time_queries_with_intrinsics.txt
+
+hloc:
+  retrieval_file: pairs-query-netvlad50.txt
+  topk_db_images: 50
+  max_candidate_landmarks: 10000
+  max_index_landmarks_per_image: 1000
+  verify_image_batch_size: 5
+  verify_image_schedule: [5, 20, 50]
+  grouping: covisibility
+
+backbone:
+  name: eupe
+  repo_dir: /home/phd/maskmatch/EUPE
+  weights_path: /home/phd/maskmatch/weights/EUPE-ViT-S.pt
+  model_name: eupe_vits16
+  input_size: [512, 512]
+  device: cuda
+
+anchors:
+  alpha: 0.60
+  beta: 0.40
+  use_stability: true
+  topk: 512
+  grid_cells: [16, 16]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.08
+  merge_cos_sim: 0.72
+  manifold_rank: 2
+  cache_manifold_rank: 0
+  min_obs: 3
+  max_obs_per_landmark: 4
+  max_colmap_point_error: 4.0
+  min_colmap_track_len: 3
+  min_staticness: 0.05
+
+matching:
+  topk_landmarks: 40
+  retrieval_anchor_batch_size: 256
+  materialize_topk_per_anchor: 4
+  max_materialized_landmarks: 512
+  max_matches: 512
+  group_verify_patience: 2
+  group_verify_min_inliers: 8
+  group_verify_hard_inliers: 24
+  use_pose_prior: false
+  carry_pose_prior: false
+  scorer: ppca
+  lambdas: [1.0, 1.2, 0.6, 0.2, 0.2]
+  ppca_support_weight: 0.05
+  min_cosine_sim: -1.0
+  min_score: -1.0e9
+  ratio_margin: 0.0
+  min_match_guarantee: 12
+  xfeat_rerank_coarse: true
+  xfeat_rerank_weight: 0.5
+  adaptive_min_cosine: true
+  adaptive_cosine_margin: 0.25
+  fine_rerank:
+    enabled: true
+    method: xfeat
+    patch_size: 24
+    xfeat_topk: 4096
+    match_radius_px: 12.0
+    topk: 6
+    max_obs_per_landmark: 4
+    weight: 1.0
+    support_weight: 0.05
+    fuse_coarse: false
+    coarse_weight: 0.15
+    min_score: -1.0e9
+    ratio_margin: 0.0
+    require_descriptor: false
+  early_geometry:
+    enabled: true
+    min_matches: 12
+    min_inliers: 8
+    reproj_error_px: 12.0
+    iterations: 512
+
+pnp:
+  reproj_error_px: 10.0
+  iterations: 8000
+  multi_pass: true

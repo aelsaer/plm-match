@@ -1,6 +1,6 @@
 # Aachen day localization tuned to push DINO harder for accuracy.
 # This is intentionally slower and heavier than the default day config.
-dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
 
 map:
   cache_path: ./outputs/aachen_map_cache_dino_maxacc/landmarks.pkl

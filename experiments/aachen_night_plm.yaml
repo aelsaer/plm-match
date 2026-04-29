@@ -1,0 +1,63 @@
+# PLM-Match night-query ablation on Aachen v1.1 (191 night queries).
+#
+# This manifest runs PLM-only variants. Run the HLoc baseline separately:
+#
+#   source /home/andreas/anaconda3/etc/profile.d/conda.sh && conda activate sam3
+#   python tools/run_hloc_baseline.py \
+#     --dataset aachen \
+#     --method disk_lightglue \
+#     --dataset_root /home/phd/plm-match/datasets/aachen_v1_1 \
+#     --out_dir /tmp/plm_match_outputs/aachen_night/hloc_disk_lightglue \
+#     --query_list queries/night_time_queries_with_intrinsics.txt \
+#     --hloc_root /home/cvdp/phd/image-matching-webui/imcui
+#
+# After both runs, compare success_rate in the summary JSONs.
+
+base_config: configs/aachen_v1_1_night_refactor.yaml
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
+pipeline: plm_match.pipelines.hloc_localize
+outputs_root: /tmp/plm_match_outputs/aachen_night
+
+experiments:
+  # Baseline: DINOv2, residual scorer, no grouping, no fine reranking.
+  # Uses the day-precise map cache (same db/COLMAP model).
+  - name: plm_dinov2_residual
+    overrides:
+      map.cache_path: ./outputs/aachen_map_cache_precise/landmarks.pkl
+      map.query_cache_namespace: aachen_night_precise_v1
+      dataset.query_list: queries/night_time_queries_with_intrinsics.txt
+      backbone.name: dinov2
+      backbone.model_name: dinov2_vits14
+      backbone.input_size: [336, 336]
+      anchors.topk: 384
+      anchors.grid_cells: [8, 8]
+      landmarks.min_obs: 5
+      landmarks.max_obs_per_landmark: 8
+      landmarks.max_colmap_point_error: 3.0
+      landmarks.min_colmap_track_len: 4
+      landmarks.min_staticness: 0.35
+      hloc.topk_db_images: 10
+      hloc.max_candidate_landmarks: 1000
+      hloc.verify_image_batch_size: 1
+      hloc.verify_image_schedule: [1, 10]
+      hloc.grouping: retrieval_order
+      matching.scorer: residual
+      matching.lambdas: [1.0, 1.2, 0.6, 0.0, 0.0]
+      matching.topk_landmarks: 20
+      matching.max_matches: 768
+      matching.min_cosine_sim: 0.10
+      matching.min_score: -1.0e9
+      matching.ratio_margin: 0.0
+      matching.fine_rerank.enabled: false
+      matching.early_geometry.enabled: false
+
+  # PPCA + covisibility grouping, no fine reranking.
+  # Uses the day-refactor map cache (EUPE backbone).
+  - name: plm_eupe_ppca_multiview
+    overrides:
+      matching.fine_rerank.enabled: false
+      matching.early_geometry.enabled: false
+
+  # Full refactor: PPCA + covisibility + XFeat fine reranking + early geometry.
+  - name: plm_eupe_full_refactor
+    overrides: {}

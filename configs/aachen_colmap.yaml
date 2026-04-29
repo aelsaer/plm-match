@@ -1,4 +1,4 @@
-dataset_root: /path/to/aachen_v1_1
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
 out_dir: ./outputs/aachen_plm
 
 dataset:

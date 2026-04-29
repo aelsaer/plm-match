@@ -1,5 +1,5 @@
 # Ablation: cosine mean + staticness (no manifold)
-dataset_root: /home/cvdp/phd/object_matching/datasets/aachen_v1_1
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
 
 map:
   cache_path: ./outputs/aachen_map_cache/landmarks.pkl

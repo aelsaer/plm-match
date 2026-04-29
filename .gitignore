@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 
+datasets/
+
 outputs/
 out_hloc_test/
 log.txt

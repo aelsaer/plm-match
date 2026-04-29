@@ -21,7 +21,7 @@ def build_extractor(cfg: dict):
     if name == 'eupe':
         return EUPEFeatureExtractor(
             repo_dir=cfg['repo_dir'],
-            weights_path=cfg['weights_path'],
+            weights_path=cfg.get('weights_path'),
             model_name=cfg.get('model_name', 'eupe_vits16'),
             input_size=tuple(cfg.get('input_size', [256, 256])),
             device=cfg.get('device', 'cpu'),

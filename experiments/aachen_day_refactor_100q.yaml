@@ -1,0 +1,61 @@
+# 100-query comparison manifest for the full PLM-Match refactor stack.
+
+base_config: configs/aachen_v1_1_day_refactor.yaml
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
+pipeline: plm_match.pipelines.hloc_localize
+outputs_root: /tmp/plm_match_outputs/aachen_day_refactor_100q
+
+experiments:
+  - name: baseline_residual
+    overrides:
+      map.max_queries: 100
+      map.cache_path: /tmp/plm_match_outputs/aachen_day_refactor_cache_100q/landmarks.pkl
+      hloc.verify_image_batch_size: 1
+      hloc.verify_image_schedule: [1, 20]
+      hloc.grouping: retrieval_order
+      landmarks.cache_manifold_rank: 0
+      landmarks.max_obs_per_landmark: 4
+      matching.scorer: residual
+      matching.min_cosine_sim: 0.25
+      matching.min_score: 0.10
+      matching.ratio_margin: 0.03
+      matching.fine_rerank.enabled: false
+      matching.early_geometry.enabled: false
+
+  - name: ppca_multiview
+    overrides:
+      map.max_queries: 100
+      map.cache_path: /tmp/plm_match_outputs/aachen_day_refactor_cache_100q/landmarks.pkl
+      hloc.verify_image_batch_size: 5
+      hloc.verify_image_schedule: [5, 10, 20]
+      hloc.grouping: covisibility
+      landmarks.cache_manifold_rank: 0
+      landmarks.max_obs_per_landmark: 4
+      matching.scorer: ppca
+      matching.ppca_support_weight: 0.05
+      matching.min_cosine_sim: -1.0
+      matching.min_score: -1.0e9
+      matching.ratio_margin: 0.0
+      matching.fine_rerank.enabled: false
+      matching.early_geometry.enabled: false
+
+  - name: full_refactor
+    overrides:
+      map.max_queries: 100
+      map.cache_path: /tmp/plm_match_outputs/aachen_day_refactor_cache_100q/landmarks.pkl
+      hloc.verify_image_batch_size: 5
+      hloc.verify_image_schedule: [5, 10, 20]
+      hloc.grouping: covisibility
+      landmarks.cache_manifold_rank: 0
+      landmarks.max_obs_per_landmark: 4
+      matching.scorer: ppca
+      matching.ppca_support_weight: 0.05
+      matching.min_cosine_sim: -1.0
+      matching.min_score: -1.0e9
+      matching.ratio_margin: 0.0
+      matching.fine_rerank.enabled: true
+      matching.fine_rerank.method: xfeat
+      matching.fine_rerank.xfeat_topk: 4096
+      matching.fine_rerank.match_radius_px: 12.0
+      matching.fine_rerank.topk: 6
+      matching.early_geometry.enabled: true

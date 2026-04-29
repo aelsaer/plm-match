@@ -1,0 +1,31 @@
+# Grouped-verification sweep on the real Aachen minitest subset.
+#
+# This reuses the compact store written by `configs/aachen_minitest.yaml` under
+# `/tmp/plm_match_outputs/aachen_minitest_cache`, so repeated runs focus on
+# query-time behavior rather than rebuilding the map each time.
+
+base_config: configs/aachen_minitest.yaml
+dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
+pipeline: plm_match.pipelines.hloc_localize
+outputs_root: /tmp/plm_match_outputs/aachen_minitest_group_verify_gpu
+
+experiments:
+  - name: group_1
+    overrides:
+      hloc.verify_image_batch_size: 1
+      hloc.verify_image_schedule: [1, 20]
+
+  - name: group_5
+    overrides:
+      hloc.verify_image_batch_size: 5
+      hloc.verify_image_schedule: [5, 20]
+
+  - name: group_10
+    overrides:
+      hloc.verify_image_batch_size: 10
+      hloc.verify_image_schedule: [10, 20]
+
+  - name: group_20
+    overrides:
+      hloc.verify_image_batch_size: 20
+      hloc.verify_image_schedule: [20]

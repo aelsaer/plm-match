@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 from typing import Dict, Tuple
 import numpy as np
 import torch
@@ -8,14 +10,43 @@ import cv2
 from .base import BaseFeatureExtractor
 
 
+def _ensure_writable_torch_hub_dir() -> None:
+    hub_dir = Path(torch.hub.get_dir())
+    try:
+        hub_dir.mkdir(parents=True, exist_ok=True)
+        probe = hub_dir / '.write_probe'
+        probe.write_text('ok', encoding='utf-8')
+        probe.unlink()
+        return
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / 'torch-hub'
+        fallback.mkdir(parents=True, exist_ok=True)
+        torch.hub.set_dir(str(fallback))
+
+
 class EUPEFeatureExtractor(BaseFeatureExtractor):
-    def __init__(self, repo_dir: str, weights_path: str, model_name: str = 'eupe_vits16', input_size: Tuple[int, int] = (256, 256), device: str = 'cpu'):
+    def __init__(
+        self,
+        repo_dir: str,
+        weights_path: str | None = None,
+        model_name: str = 'eupe_vits16',
+        input_size: Tuple[int, int] = (256, 256),
+        device: str = 'cpu',
+    ):
         self.repo_dir = repo_dir
         self.weights_path = weights_path
         self.model_name = model_name
         self.input_size = input_size
         self._device = device
-        self.model = torch.hub.load(repo_dir, model_name, source='local', weights=weights_path).to(device)
+        self._use_cuda = str(device).startswith('cuda') and torch.cuda.is_available()
+        if self._use_cuda:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        _ensure_writable_torch_hub_dir()
+        load_kwargs = {'source': 'local'}
+        if weights_path not in (None, ''):
+            load_kwargs['weights'] = weights_path
+        self.model = torch.hub.load(repo_dir, model_name, **load_kwargs).to(device)
         self.model.eval()
         self.patch = 16
         self._dim = 384 if 'vits' in model_name else 192 if 'vitt' in model_name else 768
@@ -45,7 +76,11 @@ class EUPEFeatureExtractor(BaseFeatureExtractor):
     def extract(self, image: np.ndarray) -> Dict[str, object]:
         orig_h, orig_w = image.shape[:2]
         x = self._prep(image)
-        feats = self.model.forward_features(x)
+        if self._use_cuda:
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                feats = self.model.forward_features(x)
+        else:
+            feats = self.model.forward_features(x)
         patch_tokens = feats['x_norm_patchtokens'][0].detach().cpu().numpy()
         cls_token = feats['x_norm_clstoken'][0].detach().cpu()
         Ht = self.input_size[0] // self.patch
