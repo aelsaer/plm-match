@@ -7,7 +7,7 @@ import struct
 import numpy as np
 
 
-@dataclass
+@dataclass(slots=True)
 class Camera:
     id: int
     model: str
@@ -16,7 +16,7 @@ class Camera:
     params: np.ndarray
 
 
-@dataclass
+@dataclass(slots=True)
 class Image:
     id: int
     qvec: np.ndarray
@@ -27,7 +27,7 @@ class Image:
     point3D_ids: np.ndarray
 
 
-@dataclass
+@dataclass(slots=True)
 class Point3D:
     id: int
     xyz: np.ndarray
