@@ -2662,6 +2662,19 @@ class PLMMapLocalizer:
             'corr_graph_supported_nodes': 0,
             'corr_graph_output': 0,
             't_correspondence_graph_s': 0.0,
+            'local_memory_vps_enabled': bool(
+                isinstance(self.matching_cfg.get('local_memory', {}).get('vps', {}), dict)
+                and self.matching_cfg.get('local_memory', {}).get('vps', {}).get('enabled', False)
+            ),
+            'local_memory_vps_processed_anchors': 0,
+            'local_memory_vps_valid_anchors': 0,
+            'local_memory_vps_found_correspondences': 0,
+            'local_memory_vps_scored_observations': 0,
+            'local_memory_vps_skipped_large_buckets': 0,
+            'local_memory_vps_stop_reached': False,
+            'local_memory_vps_word_count_median': 0.0,
+            'local_memory_vps_word_count_max': 0,
+            'local_memory_vps_time_s': 0.0,
         }
         for key, value in candidate_schedule.meta.items():
             aggregate_debug[f'candidate_{key}'] = value
@@ -2783,8 +2796,26 @@ class PLMMapLocalizer:
                 'observation_coherence_cluster_frames',
                 'observation_coherence_unique_anchors',
                 'observation_coherence_unique_landmarks',
+                'local_memory_vps_processed_anchors',
+                'local_memory_vps_valid_anchors',
+                'local_memory_vps_found_correspondences',
+                'local_memory_vps_scored_observations',
+                'local_memory_vps_skipped_large_buckets',
+                'local_memory_vps_word_count_max',
             ):
                 aggregate_debug[key] = int(stage_debug.get(key, aggregate_debug.get(key, 0)))
+            if 'local_memory_retrieval_mode' in stage_debug:
+                aggregate_debug['local_memory_retrieval_mode'] = str(stage_debug.get('local_memory_retrieval_mode', ''))
+            if 'local_memory_vps_enabled' in stage_debug:
+                aggregate_debug['local_memory_vps_enabled'] = bool(stage_debug.get('local_memory_vps_enabled', False))
+            if 'local_memory_vps_stop_reached' in stage_debug:
+                aggregate_debug['local_memory_vps_stop_reached'] = bool(stage_debug.get('local_memory_vps_stop_reached', False))
+            for key in (
+                'local_memory_vps_word_count_median',
+                'local_memory_vps_time_s',
+            ):
+                if key in stage_debug:
+                    aggregate_debug[key] = float(stage_debug.get(key, aggregate_debug.get(key, 0.0)))
             if 'observation_coherence_reason' in stage_debug:
                 aggregate_debug['observation_coherence_reason'] = str(stage_debug.get('observation_coherence_reason', ''))
             if 'observation_coherence_score' in stage_debug:
@@ -2841,8 +2872,26 @@ class PLMMapLocalizer:
                         'observation_coherence_cluster_frames',
                         'observation_coherence_unique_anchors',
                         'observation_coherence_unique_landmarks',
+                        'local_memory_vps_processed_anchors',
+                        'local_memory_vps_valid_anchors',
+                        'local_memory_vps_found_correspondences',
+                        'local_memory_vps_scored_observations',
+                        'local_memory_vps_skipped_large_buckets',
+                        'local_memory_vps_word_count_max',
                     ):
                         aggregate_debug[key] = int(geom_debug.get(key, aggregate_debug.get(key, 0)))
+                    if 'local_memory_retrieval_mode' in geom_debug:
+                        aggregate_debug['local_memory_retrieval_mode'] = str(geom_debug.get('local_memory_retrieval_mode', ''))
+                    if 'local_memory_vps_enabled' in geom_debug:
+                        aggregate_debug['local_memory_vps_enabled'] = bool(geom_debug.get('local_memory_vps_enabled', False))
+                    if 'local_memory_vps_stop_reached' in geom_debug:
+                        aggregate_debug['local_memory_vps_stop_reached'] = bool(geom_debug.get('local_memory_vps_stop_reached', False))
+                    for key in (
+                        'local_memory_vps_word_count_median',
+                        'local_memory_vps_time_s',
+                    ):
+                        if key in geom_debug:
+                            aggregate_debug[key] = float(geom_debug.get(key, aggregate_debug.get(key, 0.0)))
                     if 'observation_coherence_reason' in geom_debug:
                         aggregate_debug['observation_coherence_reason'] = str(geom_debug.get('observation_coherence_reason', ''))
                     if 'observation_coherence_score' in geom_debug:

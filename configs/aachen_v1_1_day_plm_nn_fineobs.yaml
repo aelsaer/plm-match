@@ -127,9 +127,9 @@ matching:
     vps:
       enabled: false
       num_words: 256
-      top_words: 1
-      target_correspondences: 200
-      topk_observations_per_anchor: 64
+      top_words: 4
+      target_correspondences: 0
+      topk_observations_per_anchor: 128
       max_train_descriptors: 16384
       iterations: 4
       batch_size: 8192
