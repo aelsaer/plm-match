@@ -251,39 +251,71 @@ def _match_descriptors(
     ratio: float,
     mutual_nn: bool,
     min_similarity: float,
+    match_batch_size: int = 512,
+    max_matches: int = 0,
 ) -> np.ndarray:
     if desc0.shape[0] == 0 or desc1.shape[0] == 0:
         return np.zeros((0, 3), dtype=np.float32)
-    sim = desc0.astype(np.float32, copy=False) @ desc1.astype(np.float32, copy=False).T
-    if sim.shape[1] >= 2:
-        part = np.argpartition(-sim, kth=1, axis=1)[:, :2]
-        vals = np.take_along_axis(sim, part, axis=1)
-        order = np.argsort(-vals, axis=1)
-        top_idx = np.take_along_axis(part, order, axis=1)
-        top_vals = np.take_along_axis(vals, order, axis=1)
-        best_j = top_idx[:, 0]
-        best_sim = top_vals[:, 0]
-        second_sim = top_vals[:, 1]
-    else:
-        best_j = np.zeros((sim.shape[0],), dtype=np.int64)
-        best_sim = sim[:, 0]
-        second_sim = np.full((sim.shape[0],), -1.0, dtype=np.float32)
+    desc0 = desc0.astype(np.float32, copy=False)
+    desc1_t = desc1.astype(np.float32, copy=False).T
+    n0 = int(desc0.shape[0])
+    n1 = int(desc1_t.shape[1])
+    batch_size = int(match_batch_size)
+    if batch_size <= 0:
+        batch_size = n0
+    batch_size = max(1, min(batch_size, n0))
 
-    rows = np.arange(sim.shape[0], dtype=np.int64)
+    best_j = np.zeros((n0,), dtype=np.int64)
+    best_sim = np.full((n0,), -np.inf, dtype=np.float32)
+    second_sim = np.full((n0,), -np.inf, dtype=np.float32)
+    mutual_best_i = np.full((n1,), -1, dtype=np.int64)
+    mutual_best_sim = np.full((n1,), -np.inf, dtype=np.float32)
+
+    for start in range(0, n0, batch_size):
+        end = min(n0, start + batch_size)
+        sim = desc0[start:end] @ desc1_t
+        if n1 >= 2:
+            part = np.argpartition(-sim, kth=1, axis=1)[:, :2]
+            vals = np.take_along_axis(sim, part, axis=1)
+            order = np.argsort(-vals, axis=1)
+            top_idx = np.take_along_axis(part, order, axis=1)
+            top_vals = np.take_along_axis(vals, order, axis=1)
+            best_j[start:end] = top_idx[:, 0].astype(np.int64, copy=False)
+            best_sim[start:end] = top_vals[:, 0].astype(np.float32, copy=False)
+            second_sim[start:end] = top_vals[:, 1].astype(np.float32, copy=False)
+        else:
+            best_j[start:end] = 0
+            best_sim[start:end] = sim[:, 0].astype(np.float32, copy=False)
+            second_sim[start:end] = -1.0
+
+        if mutual_nn:
+            local_i = np.argmax(sim, axis=0).astype(np.int64, copy=False)
+            col = np.arange(n1, dtype=np.int64)
+            local_sim = sim[local_i, col].astype(np.float32, copy=False)
+            update = local_sim > mutual_best_sim
+            if np.any(update):
+                mutual_best_sim[update] = local_sim[update]
+                mutual_best_i[update] = start + local_i[update]
+        del sim
+
+    rows = np.arange(n0, dtype=np.int64)
     keep = best_sim >= float(min_similarity)
     if ratio > 0.0:
         best_dist = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * best_sim))
         second_dist = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * second_sim))
         keep &= best_dist <= (float(ratio) * np.maximum(second_dist, 1e-6))
     if mutual_nn:
-        best_i_for_j = np.argmax(sim, axis=0).astype(np.int64)
-        keep &= best_i_for_j[best_j] == rows
+        keep &= mutual_best_i[best_j] == rows
     if not np.any(keep):
         return np.zeros((0, 3), dtype=np.float32)
-    return np.stack(
+    out = np.stack(
         [rows[keep].astype(np.float32), best_j[keep].astype(np.float32), best_sim[keep].astype(np.float32)],
         axis=1,
     )
+    if max_matches > 0 and out.shape[0] > int(max_matches):
+        order = np.argsort(-out[:, 2], kind='stable')[: int(max_matches)]
+        out = out[order]
+    return out.astype(np.float32, copy=False)
 
 
 def _skew(t: np.ndarray) -> np.ndarray:
@@ -416,6 +448,8 @@ def _pair_tracks(
             ratio=float(args.ratio),
             mutual_nn=bool(args.mutual_nn),
             min_similarity=float(args.min_similarity),
+            match_batch_size=int(getattr(args, 'match_batch_size', 512)),
+            max_matches=int(getattr(args, 'max_pair_matches', 0)),
         )
         stats['pairs_processed'] += 1
         stats['raw_matches'] += int(matches.shape[0])
@@ -581,6 +615,8 @@ def build_micro_map(args: argparse.Namespace) -> dict[str, object]:
             'num_pairs': int(len(pairs)),
             'num_landmarks': int(store.num_landmarks),
             'num_observations': int(store.obs_frame_ids.shape[0]),
+            'match_batch_size': int(getattr(args, 'match_batch_size', 512)),
+            'max_pair_matches': int(getattr(args, 'max_pair_matches', 0)),
             'descriptor_dim': int(store.mu.shape[1]) if store.mu.ndim == 2 else 0,
             'fine_descriptor_dim': int(store.fine_obs_descs.shape[1])
             if store.fine_obs_descs is not None and store.fine_obs_descs.ndim == 2
@@ -615,6 +651,8 @@ def main() -> None:
     parser.add_argument('--min_shared_points', type=int, default=20)
     parser.add_argument('--pairs_per_image', type=int, default=12)
     parser.add_argument('--max_pairs', type=int, default=0)
+    parser.add_argument('--match_batch_size', type=int, default=512)
+    parser.add_argument('--max_pair_matches', type=int, default=4096)
     parser.add_argument('--mutual_nn', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--ratio', type=float, default=0.8)
     parser.add_argument('--min_similarity', type=float, default=-1.0)

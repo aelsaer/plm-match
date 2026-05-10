@@ -10,13 +10,15 @@ SP_MAX_KEYPOINTS="${SP_MAX_KEYPOINTS:-2048}"
 SP_MIN_SHARED_POINTS="${SP_MIN_SHARED_POINTS:-30}"
 SP_PAIRS_PER_IMAGE="${SP_PAIRS_PER_IMAGE:-6}"
 SP_MAX_PAIRS="${SP_MAX_PAIRS:-120}"
+SP_MATCH_BATCH_SIZE="${SP_MATCH_BATCH_SIZE:-512}"
+SP_MAX_PAIR_MATCHES="${SP_MAX_PAIR_MATCHES:-2048}"
 LM_TOPK_OBS="${LM_TOPK_OBS:-64}"
 RETRIEVAL_BATCH="${RETRIEVAL_BATCH:-64}"
 
 TAG="${MARGIN//./p}"
 BASE=outputs/loo_aachen_benchmark/loo_aachen_500
-OUT="$BASE/plm_sp_micro_${MODE}_${TAG}_q${MAX_Q}_top${TOPK_DB}_k${SP_MAX_KEYPOINTS}"
-MICRO_CACHE="$BASE/sp_micro_maps/top${TOPK_DB}_k${SP_MAX_KEYPOINTS}_ms${SP_MIN_SHARED_POINTS}_p${SP_PAIRS_PER_IMAGE}_max${SP_MAX_PAIRS}_r08_epi1_reproj2"
+OUT="$BASE/plm_sp_micro_${MODE}_${TAG}_q${MAX_Q}_top${TOPK_DB}_k${SP_MAX_KEYPOINTS}_b${SP_MATCH_BATCH_SIZE}"
+MICRO_CACHE="$BASE/sp_micro_maps/top${TOPK_DB}_k${SP_MAX_KEYPOINTS}_ms${SP_MIN_SHARED_POINTS}_p${SP_PAIRS_PER_IMAGE}_max${SP_MAX_PAIRS}_b${SP_MATCH_BATCH_SIZE}_pm${SP_MAX_PAIR_MATCHES}_r08_epi1_reproj2"
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -85,6 +87,8 @@ TORCH_HOME=/tmp/torch-hub /home/andreas/anaconda3/envs/sam3/bin/python \
   --sp_micro_min_shared_points "$SP_MIN_SHARED_POINTS" \
   --sp_micro_pairs_per_image "$SP_PAIRS_PER_IMAGE" \
   --sp_micro_max_pairs "$SP_MAX_PAIRS" \
+  --sp_micro_match_batch_size "$SP_MATCH_BATCH_SIZE" \
+  --sp_micro_max_pair_matches "$SP_MAX_PAIR_MATCHES" \
   --sp_micro_ratio 0.8 \
   --sp_micro_epipolar_error_px 1.0 \
   --sp_micro_reproj_error_px 2.0 \

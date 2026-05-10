@@ -717,6 +717,8 @@ def _sp_micro_build_or_load_store(
         "min_shared_points": int(micro_args.min_shared_points),
         "pairs_per_image": int(micro_args.pairs_per_image),
         "max_pairs": int(micro_args.max_pairs),
+        "match_batch_size": int(micro_args.match_batch_size),
+        "max_pair_matches": int(micro_args.max_pair_matches),
         "mutual_nn": bool(micro_args.mutual_nn),
         "ratio": float(micro_args.ratio),
         "min_similarity": float(micro_args.min_similarity),
@@ -777,6 +779,8 @@ def _sp_micro_build_or_load_store(
         "num_pairs": int(len(pairs)),
         "num_landmarks": int(store.num_landmarks),
         "num_observations": int(store.obs_frame_ids.shape[0]),
+        "match_batch_size": int(micro_args.match_batch_size),
+        "max_pair_matches": int(micro_args.max_pair_matches),
         "descriptor_dim": int(store.mu.shape[1]) if store.mu.ndim == 2 else 0,
         "fine_descriptor_dim": int(store.fine_obs_descs.shape[1])
         if store.fine_obs_descs is not None and store.fine_obs_descs.ndim == 2
@@ -1005,6 +1009,8 @@ def main() -> None:
     parser.add_argument("--sp_micro_min_shared_points", type=int, default=20)
     parser.add_argument("--sp_micro_pairs_per_image", type=int, default=12)
     parser.add_argument("--sp_micro_max_pairs", type=int, default=0)
+    parser.add_argument("--sp_micro_match_batch_size", type=int, default=512)
+    parser.add_argument("--sp_micro_max_pair_matches", type=int, default=4096)
     parser.add_argument("--sp_micro_mutual_nn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sp_micro_ratio", type=float, default=0.8)
     parser.add_argument("--sp_micro_min_similarity", type=float, default=-1.0)
@@ -1145,6 +1151,8 @@ def main() -> None:
             min_shared_points=int(args.sp_micro_min_shared_points),
             pairs_per_image=int(args.sp_micro_pairs_per_image),
             max_pairs=int(args.sp_micro_max_pairs),
+            match_batch_size=int(args.sp_micro_match_batch_size),
+            max_pair_matches=int(args.sp_micro_max_pair_matches),
             mutual_nn=bool(args.sp_micro_mutual_nn),
             ratio=float(args.sp_micro_ratio),
             min_similarity=float(args.sp_micro_min_similarity),
