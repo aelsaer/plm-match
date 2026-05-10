@@ -16,12 +16,20 @@ SP_MATCH_BATCH_SIZE="${SP_MATCH_BATCH_SIZE:-512}"
 SP_MAX_PAIR_MATCHES="${SP_MAX_PAIR_MATCHES:-2048}"
 RETRIEVAL_BATCH="${RETRIEVAL_BATCH:-64}"
 LM_TOPK_OBS="${LM_TOPK_OBS:-64}"
+LM_VPS="${LM_VPS:-0}"
+LM_VPS_WORDS="${LM_VPS_WORDS:-256}"
+LM_VPS_TARGET="${LM_VPS_TARGET:-200}"
+LM_VPS_TOP_WORDS="${LM_VPS_TOP_WORDS:-1}"
+LM_VPS_TOPK_OBS="${LM_VPS_TOPK_OBS:-64}"
+LM_VPS_MAX_BUCKET="${LM_VPS_MAX_BUCKET:-4096}"
 TAG="${MARGIN//./p}"
 PNP_TAG="${PNP_REPROJ//./p}"
 ANCHOR_TAG="${ANCHOR_TOPK//./p}"
 MATCH_TAG="${MAX_MATCHES//./p}"
 SP_KEYPOINT_TAG="${SP_MAX_KEYPOINTS//./p}"
 SP_BATCH_TAG="${SP_MATCH_BATCH_SIZE//./p}"
+VPS_WORD_TAG="${LM_VPS_WORDS//./p}"
+VPS_TARGET_TAG="${LM_VPS_TARGET//./p}"
 BASE=outputs/loo_aachen_benchmark/loo_aachen_500
 SRC="$BASE/plm_local_memory_sp_ppca_rank4_obs8"
 if [[ $# -ge 2 ]]; then
@@ -37,6 +45,9 @@ if [[ $# -ge 4 ]]; then
 fi
 if [[ -n "$MAX_Q" ]]; then
   OUT=${OUT}_q${MAX_Q}
+fi
+if [[ "$LM_VPS" == "1" || "$LM_VPS" == "true" ]]; then
+  OUT=${OUT}_vps_w${VPS_WORD_TAG}_nt${VPS_TARGET_TAG}
 fi
 
 MICRO_ARGS=()
@@ -84,6 +95,16 @@ if [[ "${#MICRO_ARGS[@]}" -gt 0 ]]; then
     --override hloc.max_expanded_db_images=0
     --override matching.retrieval_anchor_batch_size="$RETRIEVAL_BATCH"
     --override matching.local_memory.topk_observations_per_anchor="$LM_TOPK_OBS"
+  )
+fi
+if [[ "$LM_VPS" == "1" || "$LM_VPS" == "true" ]]; then
+  OVERRIDES+=(
+    --override matching.local_memory.vps.enabled=true
+    --override matching.local_memory.vps.num_words="$LM_VPS_WORDS"
+    --override matching.local_memory.vps.top_words="$LM_VPS_TOP_WORDS"
+    --override matching.local_memory.vps.target_correspondences="$LM_VPS_TARGET"
+    --override matching.local_memory.vps.topk_observations_per_anchor="$LM_VPS_TOPK_OBS"
+    --override matching.local_memory.vps.max_bucket_size="$LM_VPS_MAX_BUCKET"
   )
 fi
 

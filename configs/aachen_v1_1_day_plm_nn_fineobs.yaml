@@ -124,6 +124,18 @@ matching:
     support_weight: 0.0
     staticness_weight: 0.0
     graph_support_weight: 0.0
+    vps:
+      enabled: false
+      num_words: 256
+      top_words: 1
+      target_correspondences: 200
+      topk_observations_per_anchor: 64
+      max_train_descriptors: 16384
+      iterations: 4
+      batch_size: 8192
+      max_bucket_size: 4096
+      skip_large_buckets: false
+      min_similarity: -1.0
     observation_coherence:
       enabled: false
       candidates_per_anchor: 3

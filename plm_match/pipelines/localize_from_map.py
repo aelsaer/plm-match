@@ -88,6 +88,68 @@ def _ppca_penalty_batch(
     return penalty
 
 
+def _normalize_rows(x: np.ndarray, *, eps: float = 1e-8) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    return arr / np.maximum(norms, float(eps))
+
+
+def _assign_descriptor_words(
+    descs: np.ndarray,
+    centroids: np.ndarray,
+    *,
+    batch_size: int = 8192,
+) -> np.ndarray:
+    n = int(descs.shape[0])
+    if n == 0 or centroids.shape[0] == 0:
+        return np.zeros((n,), dtype=np.int32)
+    out = np.zeros((n,), dtype=np.int32)
+    batch = max(1, int(batch_size))
+    cent = np.asarray(centroids, dtype=np.float32)
+    for start in range(0, n, batch):
+        end = min(n, start + batch)
+        sims = np.asarray(descs[start:end], dtype=np.float32) @ cent.T
+        out[start:end] = np.argmax(sims, axis=1).astype(np.int32, copy=False)
+    return out
+
+
+def _fit_descriptor_vocabulary(
+    descs: np.ndarray,
+    *,
+    num_words: int,
+    max_train_descriptors: int = 16384,
+    iterations: int = 4,
+    batch_size: int = 8192,
+    seed: int = 17,
+) -> tuple[np.ndarray, int]:
+    """Small deterministic k-means vocabulary for a candidate descriptor set."""
+    descs = _normalize_rows(descs.astype(np.float32, copy=False))
+    n = int(descs.shape[0])
+    k = min(max(1, int(num_words)), n)
+    rng = np.random.default_rng(int(seed))
+    train_n = min(n, max(1, int(max_train_descriptors)))
+    if train_n < n:
+        train_idx = rng.choice(n, size=train_n, replace=False)
+        train = descs[train_idx].astype(np.float32, copy=True)
+    else:
+        train = descs.astype(np.float32, copy=True)
+    if train.shape[0] <= k:
+        centroids = train[:k].astype(np.float32, copy=True)
+        return _normalize_rows(centroids), int(train.shape[0])
+    init_idx = rng.choice(int(train.shape[0]), size=k, replace=False)
+    centroids = _normalize_rows(train[init_idx].astype(np.float32, copy=True))
+    for _ in range(max(0, int(iterations))):
+        word_ids = _assign_descriptor_words(train, centroids, batch_size=batch_size)
+        sums = np.zeros_like(centroids, dtype=np.float32)
+        counts = np.bincount(word_ids, minlength=k).astype(np.int32, copy=False)
+        np.add.at(sums, word_ids, train)
+        nonempty = counts > 0
+        if np.any(nonempty):
+            centroids[nonempty] = sums[nonempty] / counts[nonempty, None].astype(np.float32)
+            centroids[nonempty] = _normalize_rows(centroids[nonempty])
+    return centroids.astype(np.float32, copy=False), int(train.shape[0])
+
+
 def _view_dir_from_camera(xyz_world: np.ndarray, camera_center: np.ndarray) -> np.ndarray:
     d = camera_center.astype(np.float64) - xyz_world.astype(np.float64)
     dn = np.linalg.norm(d)
@@ -1403,13 +1465,132 @@ class PLMMapLocalizer:
         topk_obs_default = max(int(topk_landmarks) * 3, int(topk_landmarks))
         topk_obs = int(local_cfg.get('topk_observations_per_anchor', topk_obs_default))
         topk_obs = min(max(1, topk_obs), int(obs_descs.shape[0]))
-        obs_top_idx, obs_top_sim = retrieve_topk_landmarks_batch(
-            anchor_fine,
-            obs_descs,
-            topk=topk_obs,
-            device=retrieval_device,
-            batch_size=retrieval_anchor_batch_size,
-        )
+        vps_cfg = local_cfg.get('vps', {})
+        if not isinstance(vps_cfg, dict):
+            vps_cfg = {}
+        vps_enabled = bool(vps_cfg.get('enabled', False))
+        vps_debug: dict[str, object] = {
+            'local_memory_retrieval_mode': 'vps' if vps_enabled else 'flat_nn',
+            'local_memory_vps_enabled': bool(vps_enabled),
+        }
+        if vps_enabled:
+            vps_t0 = time.perf_counter()
+            vps_num_words = int(vps_cfg.get('num_words', 256))
+            vps_top_words = max(1, int(vps_cfg.get('top_words', 1)))
+            vps_topk_obs = int(vps_cfg.get('topk_observations_per_anchor', min(topk_obs, 64)))
+            vps_topk_obs = min(max(1, vps_topk_obs), int(obs_descs.shape[0]))
+            vps_target = int(vps_cfg.get('target_correspondences', 200))
+            vps_max_train = int(vps_cfg.get('max_train_descriptors', 16384))
+            vps_iterations = int(vps_cfg.get('iterations', 4))
+            vps_batch_size = int(vps_cfg.get('batch_size', max(4096, retrieval_anchor_batch_size)))
+            vps_max_bucket = int(vps_cfg.get('max_bucket_size', 0))
+            vps_skip_large = bool(vps_cfg.get('skip_large_buckets', False))
+            vps_min_similarity = float(vps_cfg.get('min_similarity', -1.0))
+            vps_obs_descs = _normalize_rows(obs_descs.astype(np.float32, copy=False))
+            vps_anchor_fine = _normalize_rows(anchor_fine.astype(np.float32, copy=False))
+            centroids, train_count = _fit_descriptor_vocabulary(
+                vps_obs_descs,
+                num_words=vps_num_words,
+                max_train_descriptors=vps_max_train,
+                iterations=vps_iterations,
+                batch_size=vps_batch_size,
+                seed=int(vps_cfg.get('seed', 17)),
+            )
+            obs_words = _assign_descriptor_words(vps_obs_descs, centroids, batch_size=vps_batch_size)
+            num_words_eff = int(centroids.shape[0])
+            word_counts = np.bincount(obs_words, minlength=num_words_eff).astype(np.int32, copy=False)
+            word_order = np.argsort(obs_words, kind='stable')
+            sorted_words = obs_words[word_order]
+            word_offsets = np.searchsorted(sorted_words, np.arange(num_words_eff + 1), side='left')
+            anchor_word_sims = vps_anchor_fine @ centroids.T
+            top_words = min(vps_top_words, num_words_eff)
+            if top_words == 1:
+                anchor_words = np.argmax(anchor_word_sims, axis=1).reshape(-1, 1).astype(np.int32, copy=False)
+            else:
+                part = np.argpartition(-anchor_word_sims, top_words - 1, axis=1)[:, :top_words]
+                part_scores = np.take_along_axis(anchor_word_sims, part, axis=1)
+                order = np.argsort(-part_scores, axis=1)
+                anchor_words = np.take_along_axis(part, order, axis=1).astype(np.int32, copy=False)
+            anchor_cost = np.sum(word_counts[anchor_words], axis=1)
+            valid_anchor_indices = np.flatnonzero(valid_anchor & (anchor_cost > 0)).astype(np.int32, copy=False)
+            if valid_anchor_indices.size > 0:
+                sort_order = np.lexsort((valid_anchor_indices, anchor_cost[valid_anchor_indices]))
+                valid_anchor_indices = valid_anchor_indices[sort_order]
+            obs_top_idx = np.full((len(anchors), vps_topk_obs), -1, dtype=np.int64)
+            obs_top_sim = np.full((len(anchors), vps_topk_obs), -1e9, dtype=np.float32)
+            processed_anchors = 0
+            skipped_large = 0
+            scored_observations = 0
+            found_correspondences = 0
+            for anchor_i in valid_anchor_indices.tolist():
+                candidate_chunks = []
+                for word in anchor_words[int(anchor_i)].tolist():
+                    word = int(word)
+                    start = int(word_offsets[word])
+                    end = int(word_offsets[word + 1])
+                    if end > start:
+                        candidate_chunks.append(word_order[start:end])
+                if not candidate_chunks:
+                    continue
+                candidate_obs = (
+                    candidate_chunks[0]
+                    if len(candidate_chunks) == 1
+                    else np.unique(np.concatenate(candidate_chunks).astype(np.int64, copy=False))
+                )
+                if candidate_obs.size == 0:
+                    continue
+                if vps_max_bucket > 0 and candidate_obs.size > vps_max_bucket:
+                    if vps_skip_large:
+                        skipped_large += 1
+                        continue
+                    candidate_obs = candidate_obs[:vps_max_bucket]
+                sims = vps_obs_descs[candidate_obs].astype(np.float32, copy=False) @ vps_anchor_fine[int(anchor_i)]
+                scored_observations += int(candidate_obs.shape[0])
+                valid_sim = sims >= vps_min_similarity
+                if not np.any(valid_sim):
+                    continue
+                candidate_obs = candidate_obs[valid_sim]
+                sims = sims[valid_sim]
+                keep = min(vps_topk_obs, int(candidate_obs.shape[0]))
+                if keep <= 0:
+                    continue
+                if keep < int(candidate_obs.shape[0]):
+                    top_part = np.argpartition(-sims, keep - 1)[:keep]
+                    order = top_part[np.argsort(-sims[top_part])]
+                else:
+                    order = np.argsort(-sims)
+                obs_top_idx[int(anchor_i), :keep] = candidate_obs[order[:keep]].astype(np.int64, copy=False)
+                obs_top_sim[int(anchor_i), :keep] = sims[order[:keep]].astype(np.float32, copy=False)
+                processed_anchors += 1
+                found_correspondences += int(np.unique(obs_to_local_arr[candidate_obs[order[:keep]]]).shape[0])
+                if vps_target > 0 and found_correspondences >= vps_target:
+                    break
+            topk_obs = int(vps_topk_obs)
+            vps_debug.update({
+                'local_memory_vps_num_words': int(vps_num_words),
+                'local_memory_vps_num_words_effective': int(num_words_eff),
+                'local_memory_vps_top_words': int(top_words),
+                'local_memory_vps_target_correspondences': int(vps_target),
+                'local_memory_vps_found_correspondences': int(found_correspondences),
+                'local_memory_vps_processed_anchors': int(processed_anchors),
+                'local_memory_vps_valid_anchors': int(valid_anchor_indices.shape[0]),
+                'local_memory_vps_scored_observations': int(scored_observations),
+                'local_memory_vps_skipped_large_buckets': int(skipped_large),
+                'local_memory_vps_train_descriptors': int(train_count),
+                'local_memory_vps_word_count_min': int(np.min(word_counts)) if word_counts.size else 0,
+                'local_memory_vps_word_count_median': float(np.median(word_counts)) if word_counts.size else 0.0,
+                'local_memory_vps_word_count_max': int(np.max(word_counts)) if word_counts.size else 0,
+                'local_memory_vps_stop_reached': bool(vps_target > 0 and found_correspondences >= vps_target),
+                'local_memory_vps_time_s': float(time.perf_counter() - vps_t0),
+            })
+        else:
+            obs_top_idx, obs_top_sim = retrieve_topk_landmarks_batch(
+                anchor_fine,
+                obs_descs,
+                topk=topk_obs,
+                device=retrieval_device,
+                batch_size=retrieval_anchor_batch_size,
+            )
         mutual_nn_enabled = bool(local_cfg.get('mutual_nn', local_cfg.get('mutual_nn_enabled', False)))
         mutual_nn_strict = bool(local_cfg.get('mutual_nn_strict', True))
         mutual_best_anchor: np.ndarray | None = None
@@ -1750,6 +1931,7 @@ class PLMMapLocalizer:
             'local_memory_ppca_weight': float(ppca_weight),
             'local_memory_ppca_rank': int(store.fine_basis.shape[2]) if bool(ppca_enabled) else 0,
         })
+        debug.update(vps_debug)
         debug.update(obs_coh_debug)
         return top_idx, top_sim, debug
 
