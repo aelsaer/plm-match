@@ -2510,7 +2510,12 @@ class PLMMapLocalizer:
         force_pose_prior: Optional[bool] = None,
     ) -> Tuple[List[Match3D2D], dict]:
         match_t0 = time.perf_counter()
-        q_center = camera_center_from_Twc(pose_prior) if pose_prior is not None else None
+        use_pose_prior = (
+            bool(self.matching_cfg.get('use_pose_prior', False))
+            if force_pose_prior is None
+            else bool(force_pose_prior)
+        )
+        q_center = camera_center_from_Twc(pose_prior) if (use_pose_prior and pose_prior is not None) else None
         mus = None
         lazy_context = None
         if isinstance(candidate_landmarks, LandmarkCandidateSet):
@@ -2536,7 +2541,6 @@ class PLMMapLocalizer:
         ppca_perp_weight = self.matching_cfg.get('ppca_perp_weight', None)
         ppca_support_weight = float(self.matching_cfg.get('ppca_support_weight', 0.0))
         ppca_eps = float(self.matching_cfg.get('ppca_eps', 1e-6))
-        use_pose_prior = bool(self.matching_cfg.get('use_pose_prior', False)) if force_pose_prior is None else bool(force_pose_prior)
         min_cosine_sim = float(self.matching_cfg.get('min_cosine_sim', -1.0))
         min_score = float(self.matching_cfg.get('min_score', -1e9))
         ratio_margin = float(self.matching_cfg.get('ratio_margin', 0.0))
@@ -3312,6 +3316,7 @@ class PLMMapLocalizer:
         best_reproj = float('inf')
         best_matches = 0
         kept: list[Match3D2D] = []
+        last_kept: list[Match3D2D] = []
         images_processed = 0
         groups_processed = 0
         pose_res = PoseResult(success=False, T_wc=None, inlier_mask=None, num_inliers=0, num_matches=0)
@@ -3403,6 +3408,7 @@ class PLMMapLocalizer:
                 candidate_landmarks=stage_set,
                 t_anchor_extract_s=0.0,
             )
+            last_kept = kept
 
             for key in (
                 'anchors_with_retrievals',
@@ -3502,6 +3508,7 @@ class PLMMapLocalizer:
                         t_anchor_extract_s=0.0,
                         force_pose_prior=True,
                     )
+                    last_kept = kept
                     for key in (
                         'anchors_with_retrievals',
                         'anchors_rejected_cosine',
@@ -3619,13 +3626,14 @@ class PLMMapLocalizer:
 
         # Multi-pass PnP: if no pose found, retry with progressively relaxed
         # reprojection thresholds on the last stage's match set.
-        if not pose_res.success and bool(self.cfg.get('pnp', {}).get('multi_pass', False)) and len(kept) >= 4:
+        fallback_matches = last_kept
+        if not pose_res.success and bool(self.cfg.get('pnp', {}).get('multi_pass', False)) and len(fallback_matches) >= 4:
             base_reproj = float(self.cfg['pnp'].get('reproj_error_px', 10.0))
             pnp_iters = max(512, int(self.cfg['pnp'].get('iterations', 8000)) // 4)
             for factor in (1.6, 2.5):
                 pnp_retry_t0 = time.perf_counter()
                 retry_res = solve_pnp_ransac(
-                    kept[:max_matches], intr,
+                    fallback_matches[:max_matches], intr,
                     reproj_err=base_reproj * factor,
                     iterations=pnp_iters,
                 )
