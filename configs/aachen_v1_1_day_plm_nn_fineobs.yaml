@@ -56,7 +56,7 @@ anchors:
   alpha: 0.60
   beta: 0.40
   use_stability: true
-  topk: 1024
+  topk: 2048
   harris_method: gftt
   keypoint_max_corners: 4096
   keypoint_quality_level: 0.005
@@ -124,6 +124,21 @@ matching:
     support_weight: 0.0
     staticness_weight: 0.0
     graph_support_weight: 0.0
+    observation_prior:
+      enabled: false
+      source: retrieval_rank
+      weight: 0.03
+      rank_tau: 10.0
+      fallback_weight: 0.0
+    graph_prior:
+      enabled: false
+      source: retrieval_rank
+      rank_tau: 10.0
+      diffusion_steps: 1
+      diffusion_weight: 0.25
+      score_weight: 0.005
+      max_active_landmarks: 50000
+      min_prior: 0.0
     vps:
       enabled: false
       num_words: 256
@@ -255,6 +270,6 @@ matching:
     iterations: 512
 
 pnp:
-  reproj_error_px: 8.0
+  reproj_error_px: 4.0
   iterations: 8000
-  multi_pass: false
+  multi_pass: true

@@ -10,7 +10,12 @@ import numpy as np
 from plm_match.types import Landmark, LandmarkObservation, LandmarkCandidateSet
 from plm_match.landmarks.manifold import compute_landmark_ppca
 from plm_match.landmarks.memory import _view_diversity_score, _view_envelope_stats
-from plm_match.fine_features import LRUGrayImageCache, LocalPatchDescriptor, get_gray_frame
+from plm_match.fine_features import (
+    LRUGrayImageCache,
+    LocalPatchDescriptor,
+    get_gray_frame,
+    is_h5_local_feature_method,
+)
 from plm_match.landmarks.staticness import compute_staticness
 from plm_match.utils.interp import bilinear_sample_token_descriptor
 from plm_match.utils.io import read_image
@@ -83,6 +88,11 @@ class CompactLandmarkStore:
         graph_offsets: np.ndarray | None = None,
         graph_indices: np.ndarray | None = None,
         graph_weights: np.ndarray | None = None,
+        obs_assoc_px: np.ndarray | None = None,
+        obs_sp_score: np.ndarray | None = None,
+        obs_track_len: np.ndarray | None = None,
+        obs_track_reproj_error: np.ndarray | None = None,
+        obs_track_parallax: np.ndarray | None = None,
     ):
         self.ids = ids
         self.xyz = xyz
@@ -110,6 +120,32 @@ class CompactLandmarkStore:
         self.fine_basis = fine_basis
         self.fine_eigvals = fine_eigvals
         self.fine_sigma_perp2 = fine_sigma_perp2
+        n_obs_total = int(obs_frame_ids.shape[0])
+        self.obs_assoc_px = (
+            obs_assoc_px
+            if obs_assoc_px is not None
+            else np.zeros((n_obs_total,), dtype=np.float16)
+        )
+        self.obs_sp_score = (
+            obs_sp_score
+            if obs_sp_score is not None
+            else np.zeros((n_obs_total,), dtype=np.float16)
+        )
+        self.obs_track_len = (
+            obs_track_len
+            if obs_track_len is not None
+            else np.zeros((n_obs_total,), dtype=np.uint16)
+        )
+        self.obs_track_reproj_error = (
+            obs_track_reproj_error
+            if obs_track_reproj_error is not None
+            else np.zeros((n_obs_total,), dtype=np.float16)
+        )
+        self.obs_track_parallax = (
+            obs_track_parallax
+            if obs_track_parallax is not None
+            else np.zeros((n_obs_total,), dtype=np.float16)
+        )
         self.graph_offsets = (
             graph_offsets
             if graph_offsets is not None
@@ -333,6 +369,22 @@ class CompactLandmarkStore:
         np.save(root / 'obs_offsets.npy', self.obs_offsets)
         np.save(root / 'obs_frame_ids.npy', self.obs_frame_ids)
         np.save(root / 'obs_uvs.npy', self.obs_uvs)
+        optional_obs_arrays = {
+            'obs_assoc_px.npy': getattr(self, 'obs_assoc_px', None),
+            'obs_sp_score.npy': getattr(self, 'obs_sp_score', None),
+            'obs_track_len.npy': getattr(self, 'obs_track_len', None),
+            'obs_track_reproj_error.npy': getattr(self, 'obs_track_reproj_error', None),
+            'obs_track_parallax.npy': getattr(self, 'obs_track_parallax', None),
+        }
+        has_track_meta = bool(
+            getattr(self, 'obs_track_len', None) is not None
+            and np.any(np.asarray(self.obs_track_len) > 0)
+        )
+        for name, arr in optional_obs_arrays.items():
+            if has_track_meta and arr is not None and int(getattr(arr, 'shape', (0,))[0]) == int(self.obs_frame_ids.shape[0]):
+                np.save(root / name, arr)
+            else:
+                (root / name).unlink(missing_ok=True)
         index_dir = root / 'image_to_landmarks'
         index_dir.mkdir(parents=True, exist_ok=True)
         for p in index_dir.glob('*.npy'):
@@ -456,6 +508,10 @@ class CompactLandmarkStore:
             if graph_weights_path.exists()
             else None
         )
+        def load_optional_obs(name: str):
+            path = root / name
+            return np.load(path, mmap_mode=mmap_mode) if path.exists() else None
+
         return cls(
             ids=ids,
             xyz=np.load(root / 'xyz.npy', mmap_mode=mmap_mode),
@@ -485,6 +541,11 @@ class CompactLandmarkStore:
             graph_offsets=graph_offsets,
             graph_indices=graph_indices,
             graph_weights=graph_weights,
+            obs_assoc_px=load_optional_obs('obs_assoc_px.npy'),
+            obs_sp_score=load_optional_obs('obs_sp_score.npy'),
+            obs_track_len=load_optional_obs('obs_track_len.npy'),
+            obs_track_reproj_error=load_optional_obs('obs_track_reproj_error.npy'),
+            obs_track_parallax=load_optional_obs('obs_track_parallax.npy'),
         )
 
     def top_landmarks(self, max_landmarks: int) -> np.ndarray:
@@ -645,9 +706,7 @@ class CompactLandmarkStore:
                     for fid, uv in zip(selected_fids, selected_uvs):
                         frame = dataset.get_map_frames()[int(fid)]
                         frame_name = str(frame.meta.get('relative_path', frame.image_path.name))
-                        uses_h5_fine = str(getattr(fine_extractor, 'method', '')).lower() in (
-                            'superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'
-                        )
+                        uses_h5_fine = is_h5_local_feature_method(getattr(fine_extractor, 'method', ''))
                         gray = (
                             np.zeros((1, 1), dtype=np.uint8)
                             if uses_h5_fine

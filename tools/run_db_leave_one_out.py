@@ -20,15 +20,27 @@ sys.path.insert(0, str(ROOT))
 from plm_match.datasets import build_dataset
 from plm_match.datasets.base import FrameRecord
 from plm_match.hloc import parse_retrieval_file
-from plm_match.landmarks import CompactLandmarkStore
+from plm_match.landmarks import CompactLandmarkStore, build_compact_store_from_groups
 from plm_match.pipelines.hloc_localize import _batch_groups, _covisibility_groups, write_hloc_results
 from plm_match.pipelines.localize_from_map import PLMMapLocalizer
-from plm_match.types import LandmarkCandidateGroup, LandmarkCandidateSchedule
+from plm_match.types import LandmarkCandidateGroup, LandmarkCandidateSchedule, LandmarkObservation
 from plm_match.utils.config import load_config
 from plm_match.utils.io import read_image, write_json
 from plm_match.utils.pose import camera_center_from_Twc
 from loo_utils import evaluate_results, load_split
-from build_sp_micro_map import _build_point_groups, _load_frame_bundles, _pair_tracks, _select_pairs
+from build_sp_micro_map import (
+    UnionFind,
+    _build_point_groups,
+    _fundamental_matrix,
+    _load_frame_bundles,
+    _max_parallax_deg,
+    _pair_tracks,
+    _sampson_errors,
+    _select_pairs,
+    _track_errors_and_depths,
+    _triangulate_track,
+    _valid_triangulation,
+)
 
 
 @dataclass
@@ -177,6 +189,99 @@ def nearest_frame_order(
     dists = np.linalg.norm(map_centers - q_center[None, :], axis=1)
     order = np.argsort(dists)
     return order[: int(topk)].astype(int).tolist()
+
+
+def _observation_prior_frame_weights(
+    cfg: dict,
+    valid_pairs: list[tuple[str, int]],
+    image_scores: dict[int, float] | None = None,
+) -> dict[int, float]:
+    matching_cfg = cfg.get("matching", {})
+    local_cfg = matching_cfg.get("local_memory", {}) if isinstance(matching_cfg, dict) else {}
+    prior_cfg = local_cfg.get("observation_prior", {}) if isinstance(local_cfg, dict) else {}
+    if not isinstance(prior_cfg, dict):
+        prior_cfg = {}
+    graph_prior_cfg = local_cfg.get("graph_prior", {}) if isinstance(local_cfg, dict) else {}
+    if not isinstance(graph_prior_cfg, dict):
+        graph_prior_cfg = {}
+    # These frame weights are a shared query-context signal. When graph prior
+    # is enabled, prefer its rank temperature/source so landmark activation and
+    # diffusion use the intended schedule.
+    use_graph_cfg = bool(graph_prior_cfg.get("enabled", False))
+    tau = max(
+        float(
+            graph_prior_cfg.get("rank_tau", prior_cfg.get("rank_tau", 10.0))
+            if use_graph_cfg
+            else prior_cfg.get("rank_tau", graph_prior_cfg.get("rank_tau", 10.0))
+        ),
+        1e-3,
+    )
+    source = str(
+        graph_prior_cfg.get("source", prior_cfg.get("source", "retrieval_rank"))
+        if use_graph_cfg
+        else prior_cfg.get("source", graph_prior_cfg.get("source", "retrieval_rank"))
+    ).lower()
+    weights: dict[int, float] = {}
+    for rank_i, (_, fid_raw) in enumerate(valid_pairs):
+        fid = int(fid_raw)
+        rank_weight = float(np.exp(-float(rank_i) / tau))
+        if source in ("image_score", "db_image_score", "global_score", "context_score") and image_scores is not None:
+            weight = float(image_scores.get(fid, rank_weight))
+        elif source in ("max", "rank_or_image_score") and image_scores is not None:
+            weight = max(rank_weight, float(image_scores.get(fid, 0.0)))
+        else:
+            weight = rank_weight
+        weights[fid] = max(float(weights.get(fid, 0.0)), float(weight))
+    return weights
+
+
+def _graph_prior_enabled(cfg: dict) -> bool:
+    matching_cfg = cfg.get("matching", {})
+    local_cfg = matching_cfg.get("local_memory", {}) if isinstance(matching_cfg, dict) else {}
+    graph_prior_cfg = local_cfg.get("graph_prior", {}) if isinstance(local_cfg, dict) else {}
+    return isinstance(graph_prior_cfg, dict) and bool(graph_prior_cfg.get("enabled", False))
+
+
+def _maybe_build_store_graph_for_prior(
+    cfg: dict,
+    store: CompactLandmarkStore,
+    *,
+    save_dir: Path | None = None,
+) -> dict[str, object]:
+    graph_cfg = cfg.get("landmarks", {}).get("graph", {})
+    if not isinstance(graph_cfg, dict):
+        graph_cfg = {}
+    wants_graph = bool(graph_cfg.get("enabled", False)) or _graph_prior_enabled(cfg)
+    if not wants_graph:
+        return {
+            "graph_prior_store_graph_requested": False,
+            "graph_prior_store_graph_available": bool(getattr(store, "has_landmark_graph", False)),
+            "graph_prior_store_graph_built": False,
+        }
+    if getattr(store, "has_landmark_graph", False):
+        return {
+            "graph_prior_store_graph_requested": True,
+            "graph_prior_store_graph_available": True,
+            "graph_prior_store_graph_built": False,
+            "graph_prior_store_graph_edges": int(store.graph_indices.shape[0]),
+        }
+    store.build_covisibility_graph(
+        topk_neighbors=int(graph_cfg.get("topk_neighbors", 16)),
+        max_landmarks_per_image=int(graph_cfg.get("max_landmarks_per_image", 128)),
+        per_image_neighbors=int(graph_cfg.get("per_image_neighbors", 4)),
+        max_edge_distance_m=graph_cfg.get("max_edge_distance_m", 8.0),
+    )
+    if save_dir is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        np.save(save_dir / "graph_offsets.npy", store.graph_offsets)
+        np.save(save_dir / "graph_indices.npy", store.graph_indices)
+        np.save(save_dir / "graph_weights.npy", store.graph_weights)
+    return {
+        "graph_prior_store_graph_requested": True,
+        "graph_prior_store_graph_available": bool(getattr(store, "has_landmark_graph", False)),
+        "graph_prior_store_graph_built": True,
+        "graph_prior_store_graph_edges": int(store.graph_indices.shape[0]) if store.graph_indices is not None else 0,
+    }
 
 
 def _global_desc_from_features(feats: dict[str, object], *, pooling: str = "mean", gem_p: float = 3.0) -> np.ndarray:
@@ -566,6 +671,7 @@ def make_candidate_provider(
             base_valid_pairs = rerank_db_pairs([(map_names[i], int(i)) for i in nearest], global_sims)
             retrieval_label = "oracle_nearest_db_pose"
         valid_pairs, image_scores = expand_with_covisibility(base_valid_pairs, global_sims)
+        preferred_frame_weights = _observation_prior_frame_weights(cfg, valid_pairs, image_scores)
         total_images = len(valid_pairs)
         stage_image_limits = [min(x, total_images) for x in schedule if x > 0]
         stage_image_limits.append(total_images)
@@ -642,6 +748,7 @@ def make_candidate_provider(
                         "feature_cache": localizer._map_feature_cache,
                         "include_view_dirs": include_view,
                         "preferred_frame_ids": frame_ids,
+                        "preferred_frame_weights": preferred_frame_weights,
                         "candidate_graph_scores": candidate_graph_scores,
                     },
                 )
@@ -709,7 +816,7 @@ def _sp_micro_build_or_load_store(
     rebuild: bool,
 ) -> tuple[CompactLandmarkStore, dict[str, object]]:
     if localizer.fine_extractor is None:
-        raise RuntimeError("SP micro-SfM requires a SuperPoint fine_extractor; set matching.fine_rerank.method=superpoint_h5")
+        raise RuntimeError("Local micro-SfM requires an H5 local-feature extractor; set matching.fine_rerank.method=superpoint_h5 or d2net_h5")
 
     micro_cfg = {
         "max_keypoints": int(micro_args.max_keypoints),
@@ -739,6 +846,7 @@ def _sp_micro_build_or_load_store(
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except Exception:
             summary = {}
+        summary.update(_maybe_build_store_graph_for_prior(cfg, store, save_dir=store_dir))
         summary["cache_hit"] = True
         return store, summary
 
@@ -769,6 +877,7 @@ def _sp_micro_build_or_load_store(
         min_obs=int(micro_args.min_track_len),
         min_staticness=0.0,
     )
+    graph_summary = _maybe_build_store_graph_for_prior(cfg, store, save_dir=None)
     store.save(store_dir)
     summary = {
         "cache_hit": False,
@@ -788,6 +897,7 @@ def _sp_micro_build_or_load_store(
         **pair_stats,
         **track_stats,
     }
+    summary.update(graph_summary)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     return store, summary
 
@@ -880,6 +990,7 @@ def make_sp_micro_candidate_provider(
     def candidate_provider(frame: FrameRecord) -> LandmarkCandidateSchedule:
         qname = str(frame.meta.get("relative_path", frame.image_path.name))
         valid_pairs, retrieval_label = valid_pairs_for_query(frame)
+        preferred_frame_weights = _observation_prior_frame_weights(cfg, valid_pairs)
         image_names = [name for name, _ in valid_pairs if name != qname]
         store, micro_summary = _sp_micro_build_or_load_store(
             cfg=cfg,
@@ -915,6 +1026,7 @@ def make_sp_micro_candidate_provider(
                 "feature_cache": localizer._map_feature_cache,
                 "include_view_dirs": include_view,
                 "preferred_frame_ids": frame_ids,
+                "preferred_frame_weights": preferred_frame_weights,
                 "candidate_graph_scores": candidate_graph_scores,
             },
         )
@@ -930,6 +1042,547 @@ def make_sp_micro_candidate_provider(
         for key, value in micro_summary.items():
             meta[f"sp_micro_{key}"] = value
         return LandmarkCandidateSchedule(groups=[group], stages=[max(1, total_images)], meta=meta)
+
+    return candidate_provider
+
+
+def _sp_seeded_cache_key(qname: str, image_names: list[str], seed_cfg: dict[str, object]) -> str:
+    payload = {
+        "query": qname,
+        "images": image_names,
+        "seed_cfg": seed_cfg,
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _top_sp_candidates_for_uvs(
+    keypoints: np.ndarray,
+    scores: np.ndarray,
+    uvs: np.ndarray,
+    *,
+    radius_px: float,
+    max_candidates: int,
+    chunk_size: int = 512,
+) -> list[np.ndarray]:
+    if keypoints.shape[0] == 0 or uvs.shape[0] == 0:
+        return [np.zeros((0, 2), dtype=np.float32) for _ in range(int(uvs.shape[0]))]
+    radius2 = float(radius_px) * float(radius_px)
+    max_candidates = max(1, int(max_candidates))
+    out: list[np.ndarray] = []
+    kp = keypoints.astype(np.float32, copy=False)
+    kp_scores = scores.astype(np.float32, copy=False) if scores.shape[0] == kp.shape[0] else np.zeros((kp.shape[0],), dtype=np.float32)
+    for start in range(0, int(uvs.shape[0]), max(1, int(chunk_size))):
+        end = min(int(uvs.shape[0]), start + max(1, int(chunk_size)))
+        diff = uvs[start:end, None, :].astype(np.float32, copy=False) - kp[None, :, :]
+        d2 = np.sum(diff * diff, axis=2)
+        for row in range(int(d2.shape[0])):
+            valid = np.flatnonzero(d2[row] <= radius2)
+            if valid.size == 0:
+                out.append(np.zeros((0, 2), dtype=np.float32))
+                continue
+            if valid.size > max_candidates:
+                order_part = np.argpartition(d2[row, valid], max_candidates - 1)[:max_candidates]
+                valid = valid[order_part]
+            order = sorted(valid.tolist(), key=lambda idx: (float(d2[row, int(idx)]), -float(kp_scores[int(idx)])))
+            data = np.asarray(
+                [[int(idx), float(np.sqrt(max(float(d2[row, int(idx)]), 0.0)))] for idx in order[:max_candidates]],
+                dtype=np.float32,
+            )
+            out.append(data)
+    return out
+
+
+def _build_sp_seeded_store(
+    *,
+    dataset: LeaveOneOutDataset,
+    bundles: list,
+    seed_args: argparse.Namespace,
+) -> tuple[CompactLandmarkStore, dict[str, object]]:
+    point_candidates: dict[int, dict[tuple[int, int], dict[str, float]]] = {}
+    point_xyz: dict[int, np.ndarray] = {}
+    stats = {
+        "seeded_colmap_observations": 0,
+        "seeded_observations_with_sp_candidates": 0,
+        "seeded_sp_candidate_nodes": 0,
+        "seeded_candidate_points": 0,
+        "seeded_points_min_obs": 0,
+        "seeded_edge_tests": 0,
+        "seeded_edges_descriptor": 0,
+        "seeded_edges_epipolar": 0,
+        "seeded_edges_geometry": 0,
+        "seeded_tracks_min_len": 0,
+        "seeded_tracks_geometry_rejected": 0,
+        "seeded_tracks_stored": 0,
+        "seeded_stored_observations": 0,
+    }
+    max_point_error = float(getattr(seed_args, "max_colmap_point_error", 8.0))
+    min_colmap_track_len = int(getattr(seed_args, "min_colmap_track_len", 2))
+    for bundle in tqdm(bundles, desc="Collecting seeded SP candidates", unit="image"):
+        xys = np.asarray(bundle.frame.meta.get("xys", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
+        point_ids = np.asarray(bundle.frame.meta.get("point3D_ids", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
+        if xys.shape[0] == 0 or point_ids.shape[0] == 0:
+            continue
+        valid_mask = point_ids >= 0
+        if not np.any(valid_mask):
+            continue
+        valid_pos = np.flatnonzero(valid_mask)
+        valid_uvs = xys[valid_pos].astype(np.float32, copy=False)
+        candidate_lists = _top_sp_candidates_for_uvs(
+            bundle.keypoints,
+            bundle.scores,
+            valid_uvs,
+            radius_px=float(seed_args.seed_radius_px),
+            max_candidates=int(seed_args.max_sp_candidates_per_obs),
+        )
+        for pos_i, cand_arr in zip(valid_pos.tolist(), candidate_lists):
+            point_id = int(point_ids[int(pos_i)])
+            pt = dataset.points3d.get(point_id)
+            if pt is None:
+                continue
+            if float(getattr(pt, "error", 0.0)) > max_point_error:
+                continue
+            if len(getattr(pt, "image_ids", ())) < min_colmap_track_len:
+                continue
+            stats["seeded_colmap_observations"] += 1
+            if cand_arr.shape[0] == 0:
+                continue
+            stats["seeded_observations_with_sp_candidates"] += 1
+            point_xyz[point_id] = np.asarray(pt.xyz, dtype=np.float64)
+            node_map = point_candidates.setdefault(point_id, {})
+            for kp_idx_f, assoc_px_f in cand_arr.tolist():
+                kp_idx = int(kp_idx_f)
+                node = (int(bundle.local_idx), kp_idx)
+                prev = node_map.get(node)
+                score = float(bundle.scores[kp_idx]) if kp_idx < bundle.scores.shape[0] else 0.0
+                payload = {"assoc_px": float(assoc_px_f), "sp_score": score}
+                if prev is None or float(payload["assoc_px"]) < float(prev["assoc_px"]):
+                    node_map[node] = payload
+                    stats["seeded_sp_candidate_nodes"] += 1
+    stats["seeded_candidate_points"] = int(len(point_candidates))
+
+    point_groups: dict[int, tuple[np.ndarray, list]] = {}
+    meta_by_lid: dict[int, list[dict[str, float]]] = {}
+    F_cache: dict[tuple[int, int], np.ndarray] = {}
+    descriptor_sim_min = float(seed_args.descriptor_sim_min)
+    for point_id, node_info in tqdm(point_candidates.items(), desc="Attaching seeded SP tracks", unit="point"):
+        nodes_all = list(node_info.keys())
+        if len({int(n[0]) for n in nodes_all}) < int(seed_args.min_track_len):
+            continue
+        stats["seeded_points_min_obs"] += 1
+        xyz_colmap = point_xyz.get(int(point_id))
+        if xyz_colmap is None:
+            continue
+        uf = UnionFind()
+        edge_score: dict[tuple[tuple[int, int], tuple[int, int]], float] = {}
+        for a_i in range(len(nodes_all)):
+            node_a = nodes_all[a_i]
+            for b_i in range(a_i + 1, len(nodes_all)):
+                node_b = nodes_all[b_i]
+                if int(node_a[0]) == int(node_b[0]):
+                    continue
+                stats["seeded_edge_tests"] += 1
+                bundle_a = bundles[int(node_a[0])]
+                bundle_b = bundles[int(node_b[0])]
+                desc_a = bundle_a.descriptors[int(node_a[1])].astype(np.float32, copy=False)
+                desc_b = bundle_b.descriptors[int(node_b[1])].astype(np.float32, copy=False)
+                sim = float(np.dot(desc_a, desc_b))
+                if sim < descriptor_sim_min:
+                    continue
+                stats["seeded_edges_descriptor"] += 1
+                f_key = (int(node_a[0]), int(node_b[0]))
+                F = F_cache.get(f_key)
+                if F is None:
+                    F = _fundamental_matrix(bundle_a, bundle_b)
+                    F_cache[f_key] = F
+                epi_err = float(
+                    _sampson_errors(
+                        F,
+                        bundle_a.keypoints[[int(node_a[1])]],
+                        bundle_b.keypoints[[int(node_b[1])]],
+                    )[0]
+                )
+                if epi_err > float(seed_args.epipolar_error_px):
+                    continue
+                stats["seeded_edges_epipolar"] += 1
+                pair_nodes = [node_a, node_b]
+                xyz_pair = _triangulate_track(pair_nodes, bundles)
+                ok, errors = _valid_triangulation(
+                    xyz_pair,
+                    pair_nodes,
+                    bundles,
+                    reproj_error_px=float(seed_args.reproj_error_px),
+                    min_parallax_deg=float(seed_args.min_parallax_deg),
+                    max_depth_m=float(seed_args.max_depth_m),
+                )
+                if not ok or xyz_pair is None:
+                    continue
+                dist_to_colmap = float(np.linalg.norm(xyz_pair.astype(np.float64) - xyz_colmap.astype(np.float64)))
+                if dist_to_colmap > float(seed_args.triangulated_to_colmap_radius_m):
+                    continue
+                stats["seeded_edges_geometry"] += 1
+                uf.union(node_a, node_b)
+                key = (node_a, node_b) if node_a <= node_b else (node_b, node_a)
+                edge_score[key] = float(sim)
+
+        best_payload: tuple[float, list[tuple[int, int]], np.ndarray, np.ndarray, float] | None = None
+        for comp_raw in uf.groups().values():
+            by_frame: dict[int, list[tuple[int, int]]] = {}
+            for node in comp_raw:
+                by_frame.setdefault(int(node[0]), []).append(node)
+            nodes: list[tuple[int, int]] = []
+            for frame_idx, frame_nodes in by_frame.items():
+                if len(frame_nodes) == 1:
+                    nodes.append(frame_nodes[0])
+                    continue
+                degree: dict[tuple[int, int], int] = {node: 0 for node in frame_nodes}
+                for node in frame_nodes:
+                    for other in comp_raw:
+                        if node == other:
+                            continue
+                        key = (node, other) if node <= other else (other, node)
+                        if key in edge_score:
+                            degree[node] += 1
+                nodes.append(
+                    max(
+                        frame_nodes,
+                        key=lambda node: (
+                            int(degree.get(node, 0)),
+                            float(node_info[node]["sp_score"]),
+                            -float(node_info[node]["assoc_px"]),
+                        ),
+                    )
+                )
+            nodes = sorted(set(nodes), key=lambda item: (bundles[item[0]].frame_id, item[1]))
+            if len(nodes) < int(seed_args.min_track_len):
+                continue
+            stats["seeded_tracks_min_len"] += 1
+            xyz_track = _triangulate_track(nodes, bundles)
+            ok, errors = _valid_triangulation(
+                xyz_track,
+                nodes,
+                bundles,
+                reproj_error_px=float(seed_args.reproj_error_px),
+                min_parallax_deg=float(seed_args.min_parallax_deg),
+                max_depth_m=float(seed_args.max_depth_m),
+            )
+            if not ok or xyz_track is None:
+                stats["seeded_tracks_geometry_rejected"] += 1
+                continue
+            dist_to_colmap = float(np.linalg.norm(xyz_track.astype(np.float64) - xyz_colmap.astype(np.float64)))
+            if dist_to_colmap > float(seed_args.triangulated_to_colmap_radius_m):
+                stats["seeded_tracks_geometry_rejected"] += 1
+                continue
+            parallax = float(_max_parallax_deg(xyz_track, nodes, bundles))
+            pair_sims = []
+            for a_i in range(len(nodes)):
+                for b_i in range(a_i + 1, len(nodes)):
+                    key = (nodes[a_i], nodes[b_i]) if nodes[a_i] <= nodes[b_i] else (nodes[b_i], nodes[a_i])
+                    if key in edge_score:
+                        pair_sims.append(float(edge_score[key]))
+            mean_sim = float(np.mean(pair_sims)) if pair_sims else descriptor_sim_min
+            mean_assoc = float(np.mean([float(node_info[node]["assoc_px"]) for node in nodes]))
+            mean_reproj = float(np.mean(errors)) if errors.size else float("inf")
+            preferred_bonus = 50.0 if len(nodes) >= int(seed_args.preferred_track_len) else 0.0
+            score = (
+                preferred_bonus
+                + 10.0 * float(len(nodes))
+                + 5.0 * mean_sim
+                + 0.1 * min(parallax, 20.0)
+                - mean_reproj
+                - 0.05 * mean_assoc
+                - dist_to_colmap
+            )
+            payload = (float(score), nodes, xyz_track, errors.astype(np.float32), parallax)
+            if best_payload is None or payload[0] > best_payload[0]:
+                best_payload = payload
+
+        if best_payload is None:
+            continue
+        _, best_nodes, best_xyz, best_errors, best_parallax = best_payload
+        if int(seed_args.max_obs_per_landmark) > 0 and len(best_nodes) > int(seed_args.max_obs_per_landmark):
+            order = sorted(
+                range(len(best_nodes)),
+                key=lambda idx: (
+                    float(bundles[best_nodes[idx][0]].scores[best_nodes[idx][1]]),
+                    -float(node_info[best_nodes[idx]]["assoc_px"]),
+                ),
+                reverse=True,
+            )[: int(seed_args.max_obs_per_landmark)]
+            best_nodes = [best_nodes[i] for i in sorted(order)]
+            best_errors, _ = _track_errors_and_depths(best_xyz, best_nodes, bundles)
+        landmark_xyz = best_xyz if bool(getattr(seed_args, "use_refined_xyz", False)) else xyz_colmap
+        observations = []
+        obs_meta: list[dict[str, float]] = []
+        for obs_idx, node in enumerate(best_nodes):
+            bundle = bundles[int(node[0])]
+            kp_idx = int(node[1])
+            desc = bundle.descriptors[kp_idx].astype(np.float32, copy=False)
+            err = float(best_errors[obs_idx]) if obs_idx < best_errors.shape[0] else 0.0
+            observations.append(
+                LandmarkObservation(
+                    frame_id=int(bundle.frame_id),
+                    uv=bundle.keypoints[kp_idx].astype(np.float32, copy=False),
+                    desc=desc,
+                    camera_center=bundle.center.astype(np.float32, copy=False),
+                    reproj_error=err,
+                    image_name=bundle.name,
+                    fine_desc=desc,
+                )
+            )
+            obs_meta.append(
+                {
+                    "assoc_px": float(node_info[node]["assoc_px"]),
+                    "sp_score": float(node_info[node]["sp_score"]),
+                    "track_len": float(len(best_nodes)),
+                    "track_reproj_error": err,
+                    "track_parallax": float(best_parallax),
+                }
+            )
+        point_groups[int(point_id)] = (landmark_xyz.astype(np.float32), observations)
+        meta_by_lid[int(point_id)] = obs_meta
+        stats["seeded_tracks_stored"] += 1
+        stats["seeded_stored_observations"] += int(len(observations))
+
+    store = build_compact_store_from_groups(
+        point_groups,
+        cache_basis_rank=0,
+        min_obs=int(seed_args.min_track_len),
+        min_staticness=0.0,
+    )
+    assoc_px: list[float] = []
+    sp_score: list[float] = []
+    track_len: list[int] = []
+    track_reproj: list[float] = []
+    track_parallax: list[float] = []
+    for lid in store.ids.astype(np.int64).tolist():
+        for item in meta_by_lid.get(int(lid), []):
+            assoc_px.append(float(item["assoc_px"]))
+            sp_score.append(float(item["sp_score"]))
+            track_len.append(int(round(float(item["track_len"]))))
+            track_reproj.append(float(item["track_reproj_error"]))
+            track_parallax.append(float(item["track_parallax"]))
+    if len(assoc_px) == int(store.obs_frame_ids.shape[0]):
+        store.obs_assoc_px = np.asarray(assoc_px, dtype=np.float16)
+        store.obs_sp_score = np.asarray(sp_score, dtype=np.float16)
+        store.obs_track_len = np.asarray(track_len, dtype=np.uint16)
+        store.obs_track_reproj_error = np.asarray(track_reproj, dtype=np.float16)
+        store.obs_track_parallax = np.asarray(track_parallax, dtype=np.float16)
+    return store, stats
+
+
+def _sp_seeded_build_or_load_store(
+    *,
+    cfg: dict,
+    dataset: LeaveOneOutDataset,
+    localizer: PLMMapLocalizer,
+    image_names: list[str],
+    qname: str,
+    cache_dir: Path,
+    seed_args: argparse.Namespace,
+    rebuild: bool,
+) -> tuple[CompactLandmarkStore, dict[str, object]]:
+    if localizer.fine_extractor is None:
+        raise RuntimeError("Seeded tracks require an H5 local-feature extractor; set matching.fine_rerank.method=superpoint_h5 or d2net_h5")
+    seed_cfg = {
+        "max_keypoints": int(seed_args.max_keypoints),
+        "seed_radius_px": float(seed_args.seed_radius_px),
+        "max_sp_candidates_per_obs": int(seed_args.max_sp_candidates_per_obs),
+        "min_track_len": int(seed_args.min_track_len),
+        "preferred_track_len": int(seed_args.preferred_track_len),
+        "descriptor_sim_min": float(seed_args.descriptor_sim_min),
+        "epipolar_error_px": float(seed_args.epipolar_error_px),
+        "triangulated_to_colmap_radius_m": float(seed_args.triangulated_to_colmap_radius_m),
+        "reproj_error_px": float(seed_args.reproj_error_px),
+        "min_parallax_deg": float(seed_args.min_parallax_deg),
+        "max_depth_m": float(seed_args.max_depth_m),
+        "max_obs_per_landmark": int(seed_args.max_obs_per_landmark),
+        "use_refined_xyz": bool(seed_args.use_refined_xyz),
+        "max_colmap_point_error": float(seed_args.max_colmap_point_error),
+        "min_colmap_track_len": int(seed_args.min_colmap_track_len),
+    }
+    key = _sp_seeded_cache_key(qname, image_names, seed_cfg)
+    store_dir = cache_dir / key
+    summary_path = store_dir / "sp_seeded_tracks_summary.json"
+    if not rebuild and summary_path.exists() and (store_dir / "meta.json").exists():
+        store = CompactLandmarkStore.load(store_dir, mmap_mode="r")
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            summary = {}
+        summary.update(_maybe_build_store_graph_for_prior(cfg, store, save_dir=store_dir))
+        summary["cache_hit"] = True
+        return store, summary
+
+    bundles = _load_frame_bundles(
+        dataset,
+        image_names,
+        localizer.fine_extractor,
+        max_keypoints=int(seed_args.max_keypoints),
+    )
+    if len(bundles) < 2:
+        raise RuntimeError(f"SP seeded tracks need at least 2 usable DB frames for {qname}; got {len(bundles)}")
+    store, attach_stats = _build_sp_seeded_store(dataset=dataset, bundles=bundles, seed_args=seed_args)
+    graph_summary = _maybe_build_store_graph_for_prior(cfg, store, save_dir=None)
+    store.save(store_dir)
+    summary = {
+        "cache_hit": False,
+        "query_name": qname,
+        "query_image_excluded_from_map": qname not in set(image_names),
+        "num_requested_images": int(len(image_names)),
+        "num_loaded_images": int(len(bundles)),
+        "num_landmarks": int(store.num_landmarks),
+        "num_observations": int(store.obs_frame_ids.shape[0]),
+        "descriptor_dim": int(store.mu.shape[1]) if store.mu.ndim == 2 else 0,
+        "fine_descriptor_dim": int(store.fine_obs_descs.shape[1])
+        if store.fine_obs_descs is not None and store.fine_obs_descs.ndim == 2
+        else 0,
+        **seed_cfg,
+        **attach_stats,
+    }
+    summary.update(graph_summary)
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    return store, summary
+
+
+def make_sp_seeded_candidate_provider(
+    cfg: dict,
+    dataset: LeaveOneOutDataset,
+    localizer: PLMMapLocalizer,
+    *,
+    retrievals: dict[str, list[str]] | None,
+    cache_dir: Path,
+    seed_args: argparse.Namespace,
+    rebuild: bool = False,
+):
+    hloc_cfg = cfg.get("hloc", {})
+    topk_db_images = int(hloc_cfg.get("topk_db_images", 50))
+    max_candidate_landmarks = int(hloc_cfg.get("max_candidate_landmarks", 25000))
+    covis_neighbors_per_seed = int(hloc_cfg.get("covisibility_neighbors_per_seed", 0) or 0)
+    covis_seed_images = int(hloc_cfg.get("covisibility_expansion_seed_images", min(20, topk_db_images)) or 0)
+    max_expanded_db_images = int(hloc_cfg.get("max_expanded_db_images", 0) or 0)
+    verify_image_batch_size = int(hloc_cfg.get("verify_image_batch_size", topk_db_images))
+    manifold_rank = int(cfg.get("landmarks", {}).get("manifold_rank", 0))
+    matching_cfg = cfg.get("matching", {})
+    include_view = float(matching_cfg.get("lambdas", [0, 0, 0, 0, 0])[3]) != 0.0
+
+    map_frames = dataset.get_map_frames()
+    map_names = [str(f.meta.get("relative_path", f.image_path.name)) for f in map_frames]
+    name_to_local_fid = {name: i for i, name in enumerate(map_names)}
+    map_centers = np.stack([camera_center_from_Twc(f.pose).astype(np.float64) for f in map_frames], axis=0)
+    point_sets = [_frame_point_set(frame) for frame in map_frames]
+    point_to_fids: dict[int, list[int]] = {}
+    for fid, pset in enumerate(point_sets):
+        for pid in pset:
+            point_to_fids.setdefault(int(pid), []).append(int(fid))
+    covis_cache: dict[int, tuple[tuple[int, int], ...]] = {}
+
+    def covisible_neighbors(fid: int) -> tuple[tuple[int, int], ...]:
+        fid = int(fid)
+        cached = covis_cache.get(fid)
+        if cached is not None:
+            return cached
+        counts: dict[int, int] = {}
+        for pid in point_sets[fid]:
+            for other_fid in point_to_fids.get(int(pid), ()):
+                other_fid = int(other_fid)
+                if other_fid == fid:
+                    continue
+                counts[other_fid] = counts.get(other_fid, 0) + 1
+        ordered = tuple((int(fid2), int(count)) for fid2, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        covis_cache[fid] = ordered
+        return ordered
+
+    def valid_pairs_for_query(frame: FrameRecord) -> tuple[list[tuple[str, int]], str]:
+        qname = str(frame.meta.get("relative_path", frame.image_path.name))
+        if retrievals is not None:
+            pairs = [(name, int(name_to_local_fid[name])) for name in retrievals.get(qname, []) if name in name_to_local_fid]
+            label = "retrieval_file"
+        else:
+            q_center = camera_center_from_Twc(frame.pose).astype(np.float64)
+            order = np.argsort(np.linalg.norm(map_centers - q_center[None, :], axis=1))
+            pairs = [(map_names[int(fid)], int(fid)) for fid in order.tolist()]
+            label = "oracle_nearest_db_pose"
+        pairs = pairs[:topk_db_images]
+        if covis_neighbors_per_seed <= 0 or not pairs:
+            return pairs, label
+        expanded: list[tuple[str, int]] = []
+        seen: set[int] = set()
+        seed_limit = min(covis_seed_images, len(pairs))
+        for rank_i, (name, fid) in enumerate(pairs):
+            if int(fid) not in seen:
+                expanded.append((name, int(fid)))
+                seen.add(int(fid))
+            if rank_i < seed_limit:
+                added = 0
+                for neigh_fid, _ in covisible_neighbors(int(fid)):
+                    if int(neigh_fid) in seen:
+                        continue
+                    expanded.append((map_names[int(neigh_fid)], int(neigh_fid)))
+                    seen.add(int(neigh_fid))
+                    added += 1
+                    if added >= covis_neighbors_per_seed:
+                        break
+                    if max_expanded_db_images > 0 and len(expanded) >= max_expanded_db_images:
+                        break
+            if max_expanded_db_images > 0 and len(expanded) >= max_expanded_db_images:
+                break
+        return expanded, label
+
+    def candidate_provider(frame: FrameRecord) -> LandmarkCandidateSchedule:
+        qname = str(frame.meta.get("relative_path", frame.image_path.name))
+        valid_pairs, retrieval_label = valid_pairs_for_query(frame)
+        preferred_frame_weights = _observation_prior_frame_weights(cfg, valid_pairs)
+        image_names = [name for name, _ in valid_pairs if name != qname]
+        store, seed_summary = _sp_seeded_build_or_load_store(
+            cfg=cfg,
+            dataset=dataset,
+            localizer=localizer,
+            image_names=image_names,
+            qname=qname,
+            cache_dir=cache_dir,
+            seed_args=seed_args,
+            rebuild=rebuild,
+        )
+        indices = np.arange(store.num_landmarks, dtype=np.int32)
+        if max_candidate_landmarks > 0 and indices.shape[0] > max_candidate_landmarks:
+            order = np.lexsort((-store.n_obs.astype(np.int64), -store.staticness.astype(np.float32)))
+            indices = order[:max_candidate_landmarks].astype(np.int32)
+        frame_ids = tuple(sorted({int(fid) for _, fid in valid_pairs}))
+        candidate_graph_scores = np.zeros((int(indices.shape[0]),), dtype=np.float32)
+        group = LandmarkCandidateGroup(
+            image_names=tuple(image_names),
+            frame_ids=frame_ids,
+            landmark_indices=indices,
+            meta={
+                "candidate_indices": int(indices.shape[0]),
+                "batch_size": int(len(frame_ids)),
+                "sp_seeded_tracks": True,
+            },
+            lazy_context={
+                "store": store,
+                "indices": indices.astype(np.int32, copy=False),
+                "dataset": dataset,
+                "extractor": localizer.extractor,
+                "manifold_rank": manifold_rank,
+                "feature_cache": localizer._map_feature_cache,
+                "include_view_dirs": include_view,
+                "preferred_frame_ids": frame_ids,
+                "preferred_frame_weights": preferred_frame_weights,
+                "candidate_graph_scores": candidate_graph_scores,
+            },
+        )
+        meta = {
+            "retrieval": retrieval_label,
+            "db_images": int(len(image_names)),
+            "candidate_indices_total": int(indices.shape[0]),
+            "grouped_verification": True,
+            "verify_image_batch_size": int(verify_image_batch_size),
+            "grouping": "sp_seeded_tracks",
+        }
+        for key, value in seed_summary.items():
+            meta[f"sp_seeded_{key}"] = value
+        return LandmarkCandidateSchedule(groups=[group], stages=[max(1, len(image_names))], meta=meta)
 
     return candidate_provider
 
@@ -1021,8 +1674,28 @@ def main() -> None:
     parser.add_argument("--sp_micro_preferred_track_len", type=int, default=3)
     parser.add_argument("--sp_micro_max_depth_m", type=float, default=100.0)
     parser.add_argument("--sp_micro_max_obs_per_landmark", type=int, default=8)
+    parser.add_argument("--sp_seeded_tracks", action="store_true", help="Use per-query COLMAP-seeded SuperPoint track attachment stores.")
+    parser.add_argument("--sp_seeded_cache_dir", type=Path, default=None)
+    parser.add_argument("--sp_seeded_rebuild", action="store_true")
+    parser.add_argument("--sp_seeded_max_keypoints", type=int, default=4096)
+    parser.add_argument("--sp_seeded_seed_radius_px", type=float, default=12.0)
+    parser.add_argument("--sp_seeded_max_sp_candidates_per_obs", type=int, default=5)
+    parser.add_argument("--sp_seeded_min_track_len", type=int, default=2)
+    parser.add_argument("--sp_seeded_preferred_track_len", type=int, default=3)
+    parser.add_argument("--sp_seeded_descriptor_sim_min", type=float, default=0.65)
+    parser.add_argument("--sp_seeded_epipolar_error_px", type=float, default=1.5)
+    parser.add_argument("--sp_seeded_triangulated_to_colmap_radius_m", type=float, default=0.5)
+    parser.add_argument("--sp_seeded_reproj_error_px", type=float, default=2.0)
+    parser.add_argument("--sp_seeded_min_parallax_deg", type=float, default=1.0)
+    parser.add_argument("--sp_seeded_max_depth_m", type=float, default=100.0)
+    parser.add_argument("--sp_seeded_max_obs_per_landmark", type=int, default=8)
+    parser.add_argument("--sp_seeded_use_refined_xyz", action="store_true")
+    parser.add_argument("--sp_seeded_max_colmap_point_error", type=float, default=8.0)
+    parser.add_argument("--sp_seeded_min_colmap_track_len", type=int, default=2)
     parser.add_argument("--override", action="append", default=[], help="Dot-key config override, e.g. matching.min_cosine_sim=0.25")
     args = parser.parse_args()
+    if args.sp_micro_sfm and args.sp_seeded_tracks:
+        raise ValueError("--sp_micro_sfm and --sp_seeded_tracks are mutually exclusive")
 
     cfg = load_config(args.config)
     cfg = copy.deepcopy(cfg)
@@ -1130,7 +1803,9 @@ def main() -> None:
     t0 = time.perf_counter()
     localizer = PLMMapLocalizer(cfg)
     if args.sp_micro_sfm:
-        print("Using per-query SuperPoint micro-SfM stores; skipping global PLM map build.")
+        print("Using per-query local-feature micro-SfM stores; skipping global PLM map build.")
+    elif args.sp_seeded_tracks:
+        print("Using per-query COLMAP-seeded local-feature track stores; skipping global PLM map build.")
     else:
         localizer.build_map(loo_dataset)
     global_cache_dir = None
@@ -1172,6 +1847,34 @@ def main() -> None:
             cache_dir=micro_cache_dir,
             micro_args=micro_args,
             rebuild=bool(args.sp_micro_rebuild),
+        )
+    elif args.sp_seeded_tracks:
+        seeded_cache_dir = args.sp_seeded_cache_dir or (out_dir / "sp_seeded_tracks")
+        seed_args = argparse.Namespace(
+            max_keypoints=int(args.sp_seeded_max_keypoints),
+            seed_radius_px=float(args.sp_seeded_seed_radius_px),
+            max_sp_candidates_per_obs=int(args.sp_seeded_max_sp_candidates_per_obs),
+            min_track_len=int(args.sp_seeded_min_track_len),
+            preferred_track_len=int(args.sp_seeded_preferred_track_len),
+            descriptor_sim_min=float(args.sp_seeded_descriptor_sim_min),
+            epipolar_error_px=float(args.sp_seeded_epipolar_error_px),
+            triangulated_to_colmap_radius_m=float(args.sp_seeded_triangulated_to_colmap_radius_m),
+            reproj_error_px=float(args.sp_seeded_reproj_error_px),
+            min_parallax_deg=float(args.sp_seeded_min_parallax_deg),
+            max_depth_m=float(args.sp_seeded_max_depth_m),
+            max_obs_per_landmark=int(args.sp_seeded_max_obs_per_landmark),
+            use_refined_xyz=bool(args.sp_seeded_use_refined_xyz),
+            max_colmap_point_error=float(args.sp_seeded_max_colmap_point_error),
+            min_colmap_track_len=int(args.sp_seeded_min_colmap_track_len),
+        )
+        candidate_provider = make_sp_seeded_candidate_provider(
+            cfg,
+            loo_dataset,
+            localizer,
+            retrievals=retrievals,
+            cache_dir=seeded_cache_dir,
+            seed_args=seed_args,
+            rebuild=bool(args.sp_seeded_rebuild),
         )
     else:
         candidate_provider = make_candidate_provider(

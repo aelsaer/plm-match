@@ -90,11 +90,18 @@ class LandmarkMemory:
             reproj_errs = []
             frame_ids = []
             image_names = []
+            fine_descs = []
+            fine_frame_ids = []
             for obs in lm.observations:
                 frame_ids.append(obs.frame_id)
                 reproj_errs.append(float(obs.reproj_error))
                 if obs.image_name:
                     image_names.append(obs.image_name)
+                if obs.fine_desc is not None:
+                    fine_desc = np.asarray(obs.fine_desc, dtype=np.float32).reshape(-1)
+                    if float(np.linalg.norm(fine_desc)) > 1e-8:
+                        fine_descs.append(fine_desc)
+                        fine_frame_ids.append(int(obs.frame_id))
                 d = obs.camera_center.astype(np.float64) - lm.xyz.astype(np.float64)
                 dn = np.linalg.norm(d)
                 if dn > 1e-8:
@@ -123,6 +130,9 @@ class LandmarkMemory:
             lm.descriptor_spread = spread
             lm.observed_frame_ids = sorted(set(int(x) for x in frame_ids))
             lm.observed_image_names = sorted(set(image_names))
+            if fine_descs:
+                lm.fine_descs = np.stack(fine_descs, axis=0).astype(np.float32, copy=False)
+                lm.fine_obs_frame_ids = fine_frame_ids
             lm.observations = []  # free raw descriptors after SVD
             finalized.append(lm)
         self.landmarks = finalized

@@ -24,7 +24,12 @@ from plm_match.matching import (
     score_anchor_landmark,
     unique_landmark_assignment,
 )
-from plm_match.fine_features import LRUGrayImageCache, LocalPatchDescriptor, best_fine_similarity
+from plm_match.fine_features import (
+    LRUGrayImageCache,
+    LocalPatchDescriptor,
+    best_fine_similarity,
+    is_h5_local_feature_method,
+)
 from plm_match.matching.pairwise_verifier import SuperPointPairwiseVerifier
 from plm_match.matching.scoring import score_anchor_landmark_fine
 from plm_match.types import (
@@ -699,6 +704,20 @@ class PLMMapLocalizer:
         self.anchor_cfg = cfg['anchors']
         self.landmark_cfg = cfg['landmarks']
         self.matching_cfg = cfg['matching']
+        feature_cache_cfg = cfg.get('backbone', {}).get('feature_cache', cfg.get('backbone', {}).get('cache', {}))
+        if not isinstance(feature_cache_cfg, dict):
+            feature_cache_cfg = {}
+        self._feature_cache_enabled = bool(feature_cache_cfg.get('enabled', False))
+        self._feature_cache_dir = (
+            Path(feature_cache_cfg.get('cache_dir', feature_cache_cfg.get('path', 'outputs/feature_cache'))).expanduser()
+            if self._feature_cache_enabled
+            else None
+        )
+        self._feature_cache_dtype = str(feature_cache_cfg.get('dtype', 'float16')).lower()
+        self._feature_cache_compress = bool(feature_cache_cfg.get('compress', False))
+        self._feature_cache_namespace_override = str(feature_cache_cfg.get('namespace', ''))
+        self._feature_cache_hits = 0
+        self._feature_cache_misses = 0
         self.memory = LandmarkMemory(
             merge_radius_m=self.landmark_cfg.get('merge_radius_m', 0.08),
             merge_cos_sim=self.landmark_cfg.get('merge_cos_sim', 0.70),
@@ -814,8 +833,98 @@ class PLMMapLocalizer:
         else:
             (compact_cache_dir / 'fine_obs_descs.npy').unlink(missing_ok=True)
 
-    def extract_feature_map(self, image: np.ndarray) -> Dict[str, object]:
-        return self.extractor.extract(image)
+    def _feature_cache_namespace(self) -> str:
+        backbone_cfg = dict(self.cfg.get('backbone', {}))
+        backbone_cfg.pop('feature_cache', None)
+        backbone_cfg.pop('cache', None)
+        backbone_cfg.pop('device', None)
+        payload = {
+            'backbone': backbone_cfg,
+            'extractor_name': getattr(self.extractor, 'name', ''),
+            'extractor_dim': int(getattr(self.extractor, 'output_dim', 0) or 0),
+            'feature_cache_namespace': self._feature_cache_namespace_override,
+        }
+        raw = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
+
+    def _feature_cache_path(self, image: np.ndarray, image_name: str | None = None) -> Path | None:
+        if not self._feature_cache_enabled or self._feature_cache_dir is None:
+            return None
+        namespace = self._feature_cache_namespace()
+        image_hash = hashlib.sha1(np.ascontiguousarray(image).tobytes()).hexdigest()[:20]
+        image_id = image_hash if image_name is None else f'{image_name}::{image_hash}'
+        raw = f'{namespace}::{tuple(int(x) for x in image.shape)}::{image_id}'
+        key = hashlib.sha1(raw.encode('utf-8')).hexdigest()[:24]
+        return self._feature_cache_dir / namespace / f'{key}.npz'
+
+    @staticmethod
+    def _feature_array(value: object) -> np.ndarray | None:
+        if value is None:
+            return None
+        if hasattr(value, 'detach'):
+            value = value.detach().cpu().numpy()
+        arr = np.asarray(value)
+        if arr.size == 0:
+            return None
+        return arr.astype(np.float32, copy=False)
+
+    def _load_feature_cache(self, cache_file: Path) -> Dict[str, object] | None:
+        if not cache_file.exists():
+            return None
+        try:
+            with np.load(cache_file, allow_pickle=False) as data:
+                tokens = data['tokens'].astype(np.float32, copy=False)
+                token_xy = data['token_xy'].astype(np.float32, copy=False)
+                if tokens.ndim != 3 or token_xy.shape[:2] != tokens.shape[:2]:
+                    return None
+                feats: Dict[str, object] = {
+                    'tokens': tokens,
+                    'token_xy': token_xy,
+                }
+                if 'global_desc' in data:
+                    feats['global_desc'] = data['global_desc'].astype(np.float32, copy=False)
+                return feats
+        except Exception:
+            return None
+
+    def _save_feature_cache(self, cache_file: Path, feats: Dict[str, object]) -> None:
+        tokens = np.asarray(feats.get('tokens'), dtype=np.float32)
+        token_xy = np.asarray(feats.get('token_xy'), dtype=np.float32)
+        if tokens.ndim != 3 or token_xy.shape[:2] != tokens.shape[:2]:
+            return
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        token_dtype = np.float16 if self._feature_cache_dtype in ('float16', 'fp16', 'half') else np.float32
+        arrays: dict[str, np.ndarray] = {
+            'version': np.asarray([1], dtype=np.int32),
+            'tokens': tokens.astype(token_dtype, copy=False),
+            'token_xy': token_xy.astype(np.float32, copy=False),
+        }
+        global_desc = self._feature_array(feats.get('global_desc'))
+        if global_desc is not None:
+            arrays['global_desc'] = global_desc
+        tmp = cache_file.with_name(f'{cache_file.name}.{time.time_ns()}.tmp')
+        try:
+            with open(tmp, 'wb') as f:
+                if self._feature_cache_compress:
+                    np.savez_compressed(f, **arrays)
+                else:
+                    np.savez(f, **arrays)
+            tmp.replace(cache_file)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+
+    def extract_feature_map(self, image: np.ndarray, image_name: str | None = None) -> Dict[str, object]:
+        cache_file = self._feature_cache_path(image, image_name=image_name)
+        if cache_file is not None:
+            cached = self._load_feature_cache(cache_file)
+            if cached is not None:
+                self._feature_cache_hits += 1
+                return cached
+            self._feature_cache_misses += 1
+        feats = self.extractor.extract(image)
+        if cache_file is not None:
+            self._save_feature_cache(cache_file, feats)
+        return feats
 
     def _maybe_build_landmark_graph(self, *, save_dir: Path | None = None) -> None:
         if self.landmark_store is None:
@@ -880,7 +989,7 @@ class PLMMapLocalizer:
         context_radius = int(self.landmark_cfg.get('context_radius', 1))
         context_sigma = float(self.anchor_cfg.get('context_sigma', 1.0))
         anchors = []
-        if anchor_source in ('superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'):
+        if is_h5_local_feature_method(anchor_source):
             if self.fine_extractor is not None and hasattr(self.fine_extractor, 'extract_keypoints'):
                 max_corners = int(self.anchor_cfg.get('keypoint_max_corners', max(topk * 4, topk)))
                 keypoints_uv, kp_scores, kp_descs = self.fine_extractor.extract_keypoints(
@@ -992,7 +1101,7 @@ class PLMMapLocalizer:
         return anchors, debug
 
     def extract_anchors(self, image: np.ndarray, image_name: str | None = None):
-        feats = self.extract_feature_map(image)
+        feats = self.extract_feature_map(image, image_name=image_name)
         anchors, debug = self.extract_anchors_from_features(image, feats, image_name=image_name)
         return anchors, debug, feats
 
@@ -1006,11 +1115,18 @@ class PLMMapLocalizer:
         for anchor, desc in zip(missing, descs):
             anchor.fine_desc = desc if float(np.linalg.norm(desc)) > 1e-8 else None
 
-    def integrate_frame_observations(self, image: np.ndarray, depth: np.ndarray | None, intr: dict, T_wc: np.ndarray | None, frame_id: int, image_name: str | None = None) -> int:
+    def integrate_anchor_observations(
+        self,
+        anchors: Sequence,
+        depth: np.ndarray | None,
+        intr: dict,
+        T_wc: np.ndarray | None,
+        frame_id: int,
+        image_name: str | None = None,
+    ) -> int:
         if depth is None or T_wc is None:
             return 0
         camera_center = camera_center_from_Twc(T_wc)
-        anchors, _, _ = self.extract_anchors(image, image_name=image_name)
         count = 0
         for a in anchors:
             z = sample_depth(depth, a.uv)
@@ -1018,10 +1134,32 @@ class PLMMapLocalizer:
                 continue
             xyz_cam = backproject_depth(a.uv, z, intr)
             xyz_world = transform_points(T_wc, xyz_cam)[0]
-            obs = LandmarkObservation(frame_id=frame_id, uv=a.uv, desc=a.desc, camera_center=camera_center, reproj_error=0.0, image_name=image_name)
+            obs = LandmarkObservation(
+                frame_id=frame_id,
+                uv=a.uv,
+                desc=a.desc,
+                camera_center=camera_center,
+                reproj_error=0.0,
+                image_name=image_name,
+                fine_desc=a.fine_desc,
+            )
             self.memory.add_world_observation(xyz_world, obs)
             count += 1
         return count
+
+    def integrate_frame_observations(self, image: np.ndarray, depth: np.ndarray | None, intr: dict, T_wc: np.ndarray | None, frame_id: int, image_name: str | None = None) -> int:
+        if depth is None or T_wc is None:
+            return 0
+        anchors, _, _ = self.extract_anchors(image, image_name=image_name)
+        self._attach_anchor_fine_descs(image, anchors, image_name=image_name)
+        return self.integrate_anchor_observations(
+            anchors,
+            depth,
+            intr,
+            T_wc,
+            frame_id=frame_id,
+            image_name=image_name,
+        )
 
     def refresh_valid_landmarks(self, current_frame_id: int | None = None, max_age_frames: int | None = None, max_landmarks: int | None = None, min_staticness: float | None = None, image_names: list[str] | None = None) -> list[Landmark]:
         # Compact store path: do not materialize millions of landmarks globally.
@@ -1131,7 +1269,8 @@ class PLMMapLocalizer:
             if frame_id > 0 and frame_id % 200 == 0:
                 gc.collect()
             image = read_image(frame.image_path)
-            feats = self.extract_feature_map(image)
+            frame_name = str(frame.meta.get('relative_path', frame.image_path.name))
+            feats = self.extract_feature_map(image, image_name=frame_name)
             tokens = feats['tokens']
             token_xy = feats['token_xy']
             del feats
@@ -1262,9 +1401,7 @@ class PLMMapLocalizer:
                         obs_slots.append(int(k))
             if not uvs:
                 continue
-            uses_h5_fine = str(getattr(self.fine_extractor, 'method', '')).lower() in (
-                'superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'
-            )
+            uses_h5_fine = is_h5_local_feature_method(getattr(self.fine_extractor, 'method', ''))
             image = (
                 np.zeros((1, 1, 3), dtype=np.uint8)
                 if uses_h5_fine
@@ -1419,12 +1556,38 @@ class PLMMapLocalizer:
             if preferred_raw is not None and len(preferred_raw) > 0
             else None
         )
+        obs_prior_cfg = local_cfg.get('observation_prior', {})
+        if not isinstance(obs_prior_cfg, dict):
+            obs_prior_cfg = {}
+        obs_prior_enabled = bool(obs_prior_cfg.get('enabled', False))
+        obs_prior_weight = float(obs_prior_cfg.get('weight', obs_prior_cfg.get('frame_weight', 0.0)))
+        obs_prior_fallback = float(obs_prior_cfg.get('fallback_weight', 0.0))
+        graph_prior_cfg = local_cfg.get('graph_prior', {})
+        if not isinstance(graph_prior_cfg, dict):
+            graph_prior_cfg = {}
+        graph_prior_enabled = bool(graph_prior_cfg.get('enabled', False))
+        graph_prior_weight = float(graph_prior_cfg.get('score_weight', graph_prior_cfg.get('weight', 0.0)))
+        graph_prior_diffusion_steps = max(0, int(graph_prior_cfg.get('diffusion_steps', 1)))
+        graph_prior_diffusion_weight = float(graph_prior_cfg.get('diffusion_weight', 0.25))
+        graph_prior_max_active = int(graph_prior_cfg.get('max_active_landmarks', 50000))
+        graph_prior_min_prior = float(graph_prior_cfg.get('min_prior', 0.0))
+        graph_prior_fallback_to_seed = bool(graph_prior_cfg.get('fallback_to_seed', True))
+        frame_prior_raw = lazy_context.get('preferred_frame_weights')
+        frame_prior_by_id: dict[int, float] = {}
+        if isinstance(frame_prior_raw, dict):
+            for key, value in frame_prior_raw.items():
+                try:
+                    frame_prior_by_id[int(key)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        graph_seed = np.zeros((int(group_indices.shape[0]),), dtype=np.float32)
         preferred_landmark_hits = 0
         preferred_landmark_fallbacks = 0
         preferred_obs_kept = 0
         obs_desc_blocks: list[np.ndarray] = []
         obs_to_local: list[int] = []
         obs_to_frame: list[int] = []
+        obs_to_store_slot: list[int] = []
         landmarks_with_desc = 0
         for local_idx, store_idx in enumerate(group_indices.tolist()):
             start = int(store.obs_offsets[int(store_idx)])
@@ -1433,11 +1596,18 @@ class PLMMapLocalizer:
                 continue
             desc_block = store.fine_obs_descs[start:end].astype(np.float32, copy=False)
             frame_block = store.obs_frame_ids[start:end].astype(np.int32, copy=False)
+            slot_block = np.arange(start, end, dtype=np.int64)
+            if graph_prior_enabled and frame_prior_by_id and frame_block.shape[0] > 0:
+                best_frame_weight = 0.0
+                for fid in np.unique(frame_block).astype(np.int64).tolist():
+                    best_frame_weight = max(best_frame_weight, float(frame_prior_by_id.get(int(fid), 0.0)))
+                graph_seed[int(local_idx)] = float(best_frame_weight)
             if preferred_frame_ids is not None:
                 preferred_mask = np.isin(frame_block, preferred_frame_ids)
                 if np.any(preferred_mask):
                     desc_block = desc_block[preferred_mask]
                     frame_block = frame_block[preferred_mask]
+                    slot_block = slot_block[preferred_mask]
                     preferred_landmark_hits += 1
                     preferred_obs_kept += int(desc_block.shape[0])
                 else:
@@ -1445,15 +1615,18 @@ class PLMMapLocalizer:
             if desc_block.shape[0] > max_obs_per_landmark:
                 desc_block = desc_block[:max_obs_per_landmark]
                 frame_block = frame_block[:max_obs_per_landmark]
+                slot_block = slot_block[:max_obs_per_landmark]
             norms = np.linalg.norm(desc_block, axis=1)
             valid = norms > 1e-8
             if not np.any(valid):
                 continue
             desc_block = desc_block[valid]
             frame_block = frame_block[valid]
+            slot_block = slot_block[valid]
             obs_desc_blocks.append(desc_block)
             obs_to_local.extend([int(local_idx)] * int(desc_block.shape[0]))
             obs_to_frame.extend([int(fid) for fid in frame_block.tolist()])
+            obs_to_store_slot.extend([int(slot) for slot in slot_block.tolist()])
             landmarks_with_desc += 1
         if not obs_desc_blocks:
             debug['local_memory_reason'] = 'no_candidate_observation_descriptors'
@@ -1462,6 +1635,11 @@ class PLMMapLocalizer:
         obs_descs = np.concatenate(obs_desc_blocks, axis=0).astype(np.float32, copy=False)
         obs_to_local_arr = np.asarray(obs_to_local, dtype=np.int64)
         obs_to_frame_arr = np.asarray(obs_to_frame, dtype=np.int32)
+        obs_to_store_slot_arr = np.asarray(obs_to_store_slot, dtype=np.int64)
+        obs_prior_values = np.full((int(obs_to_frame_arr.shape[0]),), obs_prior_fallback, dtype=np.float32)
+        if obs_prior_enabled and obs_prior_weight != 0.0 and frame_prior_by_id:
+            for obs_i, frame_id in enumerate(obs_to_frame_arr.tolist()):
+                obs_prior_values[int(obs_i)] = float(frame_prior_by_id.get(int(frame_id), obs_prior_fallback))
         topk_obs_default = max(int(topk_landmarks) * 3, int(topk_landmarks))
         topk_obs = int(local_cfg.get('topk_observations_per_anchor', topk_obs_default))
         topk_obs = min(max(1, topk_obs), int(obs_descs.shape[0]))
@@ -1641,6 +1819,9 @@ class PLMMapLocalizer:
                 self.cfg.get('global_graph', {}).get('landmark_graph_weight', 0.0),
             )
         graph_support_weight = float(graph_support_weight_raw or 0.0)
+        track_len_weight = float(local_cfg.get('track_len_weight', local_cfg.get('obs_track_len_weight', 0.0)))
+        track_reproj_weight = float(local_cfg.get('track_reproj_weight', local_cfg.get('obs_track_reproj_weight', 0.0)))
+        track_parallax_weight = float(local_cfg.get('track_parallax_weight', local_cfg.get('obs_track_parallax_weight', 0.0)))
         ppca_cfg = local_cfg.get('ppca', {})
         if not isinstance(ppca_cfg, dict):
             ppca_cfg = {}
@@ -1661,6 +1842,65 @@ class PLMMapLocalizer:
                 raw_graph_support = np.asarray(raw_graph_support, dtype=np.float32)
                 if raw_graph_support.shape[0] == group_indices.shape[0]:
                     graph_support = raw_graph_support
+        graph_prior_values: np.ndarray | None = None
+        graph_prior_reason = 'disabled'
+        graph_prior_active = 0
+        graph_prior_seed_nonzero = int(np.count_nonzero(graph_seed))
+        graph_prior_edges_touched = 0
+        if graph_prior_enabled and graph_prior_weight != 0.0:
+            if not frame_prior_by_id:
+                graph_prior_reason = 'no_frame_weights'
+            elif graph_prior_seed_nonzero == 0:
+                graph_prior_reason = 'no_seed_landmarks'
+            elif not getattr(store, 'has_landmark_graph', False):
+                if graph_prior_fallback_to_seed:
+                    graph_prior_values = graph_seed.astype(np.float32, copy=True)
+                    graph_prior_reason = 'seed_only_no_graph'
+                    graph_prior_active = int(np.count_nonzero(graph_prior_values > graph_prior_min_prior))
+                else:
+                    graph_prior_reason = 'no_landmark_graph'
+            else:
+                prior = graph_seed.astype(np.float32, copy=True)
+                local_by_store_idx = {
+                    int(store_idx): int(local_idx)
+                    for local_idx, store_idx in enumerate(group_indices.astype(np.int64).tolist())
+                }
+                for _ in range(graph_prior_diffusion_steps):
+                    active = np.flatnonzero(prior > float(graph_prior_min_prior)).astype(np.int64, copy=False)
+                    if graph_prior_max_active > 0 and active.shape[0] > graph_prior_max_active:
+                        order = np.argsort(-prior[active], kind='stable')[:graph_prior_max_active]
+                        active = active[order]
+                    propagated = np.zeros_like(prior, dtype=np.float32)
+                    for local_pos in active.tolist():
+                        store_idx = int(group_indices[int(local_pos)])
+                        start = int(store.graph_offsets[store_idx])
+                        end = int(store.graph_offsets[store_idx + 1])
+                        if end <= start:
+                            continue
+                        nbrs = store.graph_indices[start:end]
+                        weights = store.graph_weights[start:end].astype(np.float32, copy=False)
+                        local_neighbors: list[tuple[int, float]] = []
+                        weight_sum = 0.0
+                        for nbr_raw, weight_raw in zip(np.asarray(nbrs).tolist(), np.asarray(weights).tolist()):
+                            nbr_local = local_by_store_idx.get(int(nbr_raw))
+                            if nbr_local is None:
+                                continue
+                            w = max(0.0, float(weight_raw))
+                            if w <= 0.0:
+                                continue
+                            local_neighbors.append((int(nbr_local), w))
+                            weight_sum += w
+                        if weight_sum <= 1e-8:
+                            continue
+                        val = float(prior[int(local_pos)])
+                        for nbr_local, w in local_neighbors:
+                            propagated[int(nbr_local)] += val * float(w / weight_sum)
+                        graph_prior_edges_touched += int(len(local_neighbors))
+                    prior = graph_seed + (float(graph_prior_diffusion_weight) * propagated)
+                    prior = np.clip(prior, 0.0, 1.0).astype(np.float32, copy=False)
+                graph_prior_values = prior.astype(np.float32, copy=False)
+                graph_prior_active = int(np.count_nonzero(graph_prior_values > graph_prior_min_prior))
+                graph_prior_reason = 'diffused' if graph_prior_diffusion_steps > 0 else 'seed_only'
 
         obs_coh_cfg = local_cfg.get('observation_coherence', {})
         if not isinstance(obs_coh_cfg, dict):
@@ -1839,6 +2079,9 @@ class PLMMapLocalizer:
             if not bool(valid_anchor[anchor_i]):
                 continue
             best_fine_by_local: dict[int, float] = {}
+            best_prior_by_local: dict[int, float] = {}
+            best_base_by_local: dict[int, float] = {}
+            best_obs_by_local: dict[int, int] = {}
             for obs_rank, (obs_j, fine_sim) in enumerate(zip(obs_top_idx[anchor_i].tolist(), obs_top_sim[anchor_i].tolist())):
                 if mutual_best_anchor is not None and mutual_nn_strict and int(obs_rank) > 0:
                     break
@@ -1850,14 +2093,24 @@ class PLMMapLocalizer:
                 if obs_coh_allowed_frames is not None and int(obs_to_frame_arr[int(obs_j)]) not in obs_coh_allowed_frames:
                     continue
                 local_idx = int(obs_to_local_arr[obs_j])
-                prev = best_fine_by_local.get(local_idx)
-                if prev is None or float(fine_sim) > prev:
+                prior_val = float(obs_prior_values[int(obs_j)]) if obs_prior_enabled else 0.0
+                base_score = (fine_weight * float(fine_sim)) + (obs_prior_weight * prior_val)
+                prev = best_base_by_local.get(local_idx)
+                if prev is None or base_score > prev:
+                    best_base_by_local[local_idx] = float(base_score)
                     best_fine_by_local[local_idx] = float(fine_sim)
+                    best_prior_by_local[local_idx] = float(prior_val)
+                    best_obs_by_local[local_idx] = int(obs_j)
             if not best_fine_by_local:
                 continue
             locals_arr = np.asarray(list(best_fine_by_local.keys()), dtype=np.int64)
             fine_sims = np.asarray([best_fine_by_local[int(x)] for x in locals_arr.tolist()], dtype=np.float32)
             scores = fine_weight * fine_sims
+            if obs_prior_enabled and obs_prior_weight != 0.0:
+                prior_vals = np.asarray([best_prior_by_local.get(int(x), obs_prior_fallback) for x in locals_arr.tolist()], dtype=np.float32)
+                scores = scores + (obs_prior_weight * prior_vals)
+            best_obs_arr = np.asarray([best_obs_by_local[int(x)] for x in locals_arr.tolist()], dtype=np.int64)
+            best_slots = obs_to_store_slot_arr[best_obs_arr]
             if eupe_weight != 0.0:
                 if int(anchor_descs.shape[1]) != int(mus.shape[1]):
                     debug['local_memory_eupe_prior_skipped'] = True
@@ -1900,6 +2153,21 @@ class PLMMapLocalizer:
                     graph_support_weight
                     * graph_support[locals_arr].astype(np.float32, copy=False)
                 )
+            if graph_prior_values is not None and graph_prior_weight != 0.0:
+                scores = scores + (
+                    graph_prior_weight
+                    * graph_prior_values[locals_arr].astype(np.float32, copy=False)
+                )
+            if track_len_weight != 0.0 and hasattr(store, 'obs_track_len'):
+                track_len = store.obs_track_len[best_slots].astype(np.float32, copy=False)
+                scores = scores + (track_len_weight * np.log1p(track_len))
+            if track_reproj_weight != 0.0 and hasattr(store, 'obs_track_reproj_error'):
+                track_reproj = store.obs_track_reproj_error[best_slots].astype(np.float32, copy=False)
+                scores = scores - (track_reproj_weight * track_reproj)
+            if track_parallax_weight != 0.0 and hasattr(store, 'obs_track_parallax'):
+                track_parallax = store.obs_track_parallax[best_slots].astype(np.float32, copy=False)
+                parallax_score = np.minimum(track_parallax / 10.0, 1.0).astype(np.float32, copy=False)
+                scores = scores + (track_parallax_weight * parallax_score)
             order = np.argsort(-scores)[:out_k]
             keep = int(order.shape[0])
             if keep > 0:
@@ -1927,12 +2195,307 @@ class PLMMapLocalizer:
             'local_memory_staticness_weight': float(staticness_weight),
             'local_memory_graph_support_weight': float(graph_support_weight),
             'local_memory_graph_support_enabled': bool(graph_support is not None),
+            'local_memory_graph_prior_enabled': bool(graph_prior_enabled),
+            'local_memory_graph_prior_weight': float(graph_prior_weight),
+            'local_memory_graph_prior_reason': str(graph_prior_reason),
+            'local_memory_graph_prior_diffusion_steps': int(graph_prior_diffusion_steps),
+            'local_memory_graph_prior_diffusion_weight': float(graph_prior_diffusion_weight),
+            'local_memory_graph_prior_frame_count': int(len(frame_prior_by_id)),
+            'local_memory_graph_prior_seed_nonzero': int(graph_prior_seed_nonzero),
+            'local_memory_graph_prior_active': int(graph_prior_active),
+            'local_memory_graph_prior_edges_touched': int(graph_prior_edges_touched),
+            'local_memory_graph_prior_mean': float(np.mean(graph_prior_values)) if graph_prior_values is not None and graph_prior_values.size else 0.0,
+            'local_memory_graph_prior_max': float(np.max(graph_prior_values)) if graph_prior_values is not None and graph_prior_values.size else 0.0,
+            'local_memory_graph_prior_store_has_graph': bool(getattr(store, 'has_landmark_graph', False)),
+            'local_memory_track_len_weight': float(track_len_weight),
+            'local_memory_track_reproj_weight': float(track_reproj_weight),
+            'local_memory_track_parallax_weight': float(track_parallax_weight),
+            'local_memory_observation_prior_enabled': bool(obs_prior_enabled),
+            'local_memory_observation_prior_weight': float(obs_prior_weight),
+            'local_memory_observation_prior_frame_count': int(len(frame_prior_by_id)),
+            'local_memory_observation_prior_nonzero_obs': int(np.count_nonzero(obs_prior_values)),
+            'local_memory_observation_prior_mean': float(np.mean(obs_prior_values)) if obs_prior_values.size else 0.0,
+            'local_memory_observation_prior_max': float(np.max(obs_prior_values)) if obs_prior_values.size else 0.0,
             'local_memory_ppca_enabled': bool(ppca_enabled),
             'local_memory_ppca_weight': float(ppca_weight),
             'local_memory_ppca_rank': int(store.fine_basis.shape[2]) if bool(ppca_enabled) else 0,
         })
         debug.update(vps_debug)
         debug.update(obs_coh_debug)
+        return top_idx, top_sim, debug
+
+    def _retrieve_in_memory_fine_obs_topk(
+        self,
+        anchors: Sequence,
+        anchor_descs: np.ndarray,
+        mus: np.ndarray,
+        landmarks: Sequence[Landmark],
+        *,
+        topk_landmarks: int,
+        retrieval_device: str,
+        retrieval_anchor_batch_size: int,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, object]]:
+        """Fine-observation retrieval for the small online RGB-D memory path."""
+        debug: dict[str, object] = {
+            'local_memory_enabled': True,
+            'local_memory_retrieval_mode': 'in_memory_flat_nn',
+        }
+        local_cfg = self.matching_cfg.get('local_memory', {})
+        if not isinstance(local_cfg, dict):
+            local_cfg = {}
+        if not anchors or not any(a.fine_desc is not None for a in anchors):
+            debug['local_memory_reason'] = 'no_query_fine_descriptors'
+            return None, None, debug
+
+        d_fine = 0
+        for a in anchors:
+            if a.fine_desc is not None:
+                d_fine = int(np.asarray(a.fine_desc).reshape(-1).shape[0])
+                break
+        if d_fine <= 0:
+            debug['local_memory_reason'] = 'no_query_fine_descriptors'
+            return None, None, debug
+
+        anchor_fine = np.stack([
+            np.asarray(a.fine_desc, dtype=np.float32).reshape(-1)
+            if (a.fine_desc is not None and np.asarray(a.fine_desc).reshape(-1).shape[0] == d_fine)
+            else np.zeros((d_fine,), dtype=np.float32)
+            for a in anchors
+        ], axis=0).astype(np.float32)
+        valid_anchor = np.linalg.norm(anchor_fine, axis=1) > 1e-8
+        if not np.any(valid_anchor):
+            debug['local_memory_reason'] = 'all_query_fine_descriptors_zero'
+            return None, None, debug
+
+        max_obs_per_landmark = int(local_cfg.get('max_obs_per_landmark', self.fine_cfg.get('max_obs_per_landmark', 4)))
+        if max_obs_per_landmark <= 0:
+            max_obs_per_landmark = 999999
+        obs_desc_blocks: list[np.ndarray] = []
+        obs_to_local: list[int] = []
+        landmarks_with_desc = 0
+        for local_idx, lm in enumerate(landmarks):
+            fine_descs = getattr(lm, 'fine_descs', None)
+            if fine_descs is None:
+                continue
+            desc_block = np.asarray(fine_descs, dtype=np.float32)
+            if desc_block.ndim != 2 or desc_block.shape[0] == 0 or int(desc_block.shape[1]) != d_fine:
+                continue
+            if desc_block.shape[0] > max_obs_per_landmark:
+                desc_block = desc_block[:max_obs_per_landmark]
+            norms = np.linalg.norm(desc_block, axis=1)
+            valid = norms > 1e-8
+            if not np.any(valid):
+                continue
+            desc_block = desc_block[valid]
+            obs_desc_blocks.append(desc_block.astype(np.float32, copy=False))
+            obs_to_local.extend([int(local_idx)] * int(desc_block.shape[0]))
+            landmarks_with_desc += 1
+        if not obs_desc_blocks:
+            debug['local_memory_reason'] = 'no_candidate_observation_descriptors'
+            return None, None, debug
+
+        obs_descs = np.concatenate(obs_desc_blocks, axis=0).astype(np.float32, copy=False)
+        obs_to_local_arr = np.asarray(obs_to_local, dtype=np.int64)
+        topk_obs_default = max(int(topk_landmarks) * 3, int(topk_landmarks))
+        topk_obs = int(local_cfg.get('topk_observations_per_anchor', topk_obs_default))
+        topk_obs = min(max(1, topk_obs), int(obs_descs.shape[0]))
+        vps_cfg = local_cfg.get('vps', {})
+        if not isinstance(vps_cfg, dict):
+            vps_cfg = {}
+        vps_enabled = bool(vps_cfg.get('enabled', False))
+        vps_debug: dict[str, object] = {
+            'local_memory_retrieval_mode': 'in_memory_vps' if vps_enabled else 'in_memory_flat_nn',
+            'local_memory_vps_enabled': bool(vps_enabled),
+        }
+        if vps_enabled:
+            vps_t0 = time.perf_counter()
+            vps_num_words = int(vps_cfg.get('num_words', 256))
+            vps_top_words = max(1, int(vps_cfg.get('top_words', 4)))
+            vps_topk_obs = int(vps_cfg.get('topk_observations_per_anchor', min(topk_obs, 128)))
+            vps_topk_obs = min(max(1, vps_topk_obs), int(obs_descs.shape[0]))
+            vps_target = int(vps_cfg.get('target_correspondences', 0))
+            vps_max_train = int(vps_cfg.get('max_train_descriptors', 16384))
+            vps_iterations = int(vps_cfg.get('iterations', 4))
+            vps_batch_size = int(vps_cfg.get('batch_size', max(4096, retrieval_anchor_batch_size)))
+            vps_max_bucket = int(vps_cfg.get('max_bucket_size', 4096))
+            vps_skip_large = bool(vps_cfg.get('skip_large_buckets', False))
+            vps_min_similarity = float(vps_cfg.get('min_similarity', -1.0))
+            vps_obs_descs = _normalize_rows(obs_descs.astype(np.float32, copy=False))
+            vps_anchor_fine = _normalize_rows(anchor_fine.astype(np.float32, copy=False))
+            centroids, train_count = _fit_descriptor_vocabulary(
+                vps_obs_descs,
+                num_words=vps_num_words,
+                max_train_descriptors=vps_max_train,
+                iterations=vps_iterations,
+                batch_size=vps_batch_size,
+                seed=int(vps_cfg.get('seed', 17)),
+            )
+            obs_words = _assign_descriptor_words(vps_obs_descs, centroids, batch_size=vps_batch_size)
+            num_words_eff = int(centroids.shape[0])
+            word_counts = np.bincount(obs_words, minlength=num_words_eff).astype(np.int32, copy=False)
+            word_order = np.argsort(obs_words, kind='stable')
+            sorted_words = obs_words[word_order]
+            word_offsets = np.searchsorted(sorted_words, np.arange(num_words_eff + 1), side='left')
+            anchor_word_sims = vps_anchor_fine @ centroids.T
+            top_words = min(vps_top_words, num_words_eff)
+            if top_words == 1:
+                anchor_words = np.argmax(anchor_word_sims, axis=1).reshape(-1, 1).astype(np.int32, copy=False)
+            else:
+                part = np.argpartition(-anchor_word_sims, top_words - 1, axis=1)[:, :top_words]
+                part_scores = np.take_along_axis(anchor_word_sims, part, axis=1)
+                order = np.argsort(-part_scores, axis=1)
+                anchor_words = np.take_along_axis(part, order, axis=1).astype(np.int32, copy=False)
+            anchor_cost = np.sum(word_counts[anchor_words], axis=1)
+            valid_anchor_indices = np.flatnonzero(valid_anchor & (anchor_cost > 0)).astype(np.int32, copy=False)
+            if valid_anchor_indices.size > 0:
+                sort_order = np.lexsort((valid_anchor_indices, anchor_cost[valid_anchor_indices]))
+                valid_anchor_indices = valid_anchor_indices[sort_order]
+            obs_top_idx = np.full((len(anchors), vps_topk_obs), -1, dtype=np.int64)
+            obs_top_sim = np.full((len(anchors), vps_topk_obs), -1e9, dtype=np.float32)
+            processed_anchors = 0
+            skipped_large = 0
+            scored_observations = 0
+            found_correspondences = 0
+            for anchor_i in valid_anchor_indices.tolist():
+                candidate_chunks = []
+                for word in anchor_words[int(anchor_i)].tolist():
+                    word = int(word)
+                    start = int(word_offsets[word])
+                    end = int(word_offsets[word + 1])
+                    if end > start:
+                        candidate_chunks.append(word_order[start:end])
+                if not candidate_chunks:
+                    continue
+                candidate_obs = (
+                    candidate_chunks[0]
+                    if len(candidate_chunks) == 1
+                    else np.unique(np.concatenate(candidate_chunks).astype(np.int64, copy=False))
+                )
+                if candidate_obs.size == 0:
+                    continue
+                if vps_max_bucket > 0 and candidate_obs.size > vps_max_bucket:
+                    if vps_skip_large:
+                        skipped_large += 1
+                        continue
+                    candidate_obs = candidate_obs[:vps_max_bucket]
+                sims = vps_obs_descs[candidate_obs].astype(np.float32, copy=False) @ vps_anchor_fine[int(anchor_i)]
+                scored_observations += int(candidate_obs.shape[0])
+                valid_sim = sims >= vps_min_similarity
+                if not np.any(valid_sim):
+                    continue
+                candidate_obs = candidate_obs[valid_sim]
+                sims = sims[valid_sim]
+                keep = min(vps_topk_obs, int(candidate_obs.shape[0]))
+                if keep <= 0:
+                    continue
+                if keep < int(candidate_obs.shape[0]):
+                    top_part = np.argpartition(-sims, keep - 1)[:keep]
+                    order = top_part[np.argsort(-sims[top_part])]
+                else:
+                    order = np.argsort(-sims)
+                obs_top_idx[int(anchor_i), :keep] = candidate_obs[order[:keep]].astype(np.int64, copy=False)
+                obs_top_sim[int(anchor_i), :keep] = sims[order[:keep]].astype(np.float32, copy=False)
+                processed_anchors += 1
+                found_correspondences += int(np.unique(obs_to_local_arr[candidate_obs[order[:keep]]]).shape[0])
+                if vps_target > 0 and found_correspondences >= vps_target:
+                    break
+            topk_obs = int(vps_topk_obs)
+            vps_debug.update({
+                'local_memory_vps_num_words': int(vps_num_words),
+                'local_memory_vps_num_words_effective': int(num_words_eff),
+                'local_memory_vps_top_words': int(top_words),
+                'local_memory_vps_target_correspondences': int(vps_target),
+                'local_memory_vps_found_correspondences': int(found_correspondences),
+                'local_memory_vps_processed_anchors': int(processed_anchors),
+                'local_memory_vps_valid_anchors': int(valid_anchor_indices.shape[0]),
+                'local_memory_vps_scored_observations': int(scored_observations),
+                'local_memory_vps_skipped_large_buckets': int(skipped_large),
+                'local_memory_vps_train_descriptors': int(train_count),
+                'local_memory_vps_word_count_min': int(np.min(word_counts)) if word_counts.size else 0,
+                'local_memory_vps_word_count_median': float(np.median(word_counts)) if word_counts.size else 0.0,
+                'local_memory_vps_word_count_max': int(np.max(word_counts)) if word_counts.size else 0,
+                'local_memory_vps_stop_reached': bool(vps_target > 0 and found_correspondences >= vps_target),
+                'local_memory_vps_time_s': float(time.perf_counter() - vps_t0),
+            })
+        else:
+            obs_top_idx, obs_top_sim = retrieve_topk_landmarks_batch(
+                anchor_fine,
+                obs_descs,
+                topk=topk_obs,
+                device=retrieval_device,
+                batch_size=retrieval_anchor_batch_size,
+            )
+
+        out_k = int(local_cfg.get('landmarks_per_anchor', topk_landmarks))
+        out_k = min(max(1, out_k), int(topk_landmarks))
+        top_idx = np.zeros((len(anchors), out_k), dtype=np.int64)
+        top_sim = np.full((len(anchors), out_k), -1e9, dtype=np.float32)
+        fine_weight = float(local_cfg.get('fine_weight', 1.0))
+        eupe_weight = float(local_cfg.get('eupe_prior_weight', local_cfg.get('eupe_weight', 0.0)))
+        support_weight = float(local_cfg.get('support_weight', 0.0))
+        staticness_weight = float(local_cfg.get('staticness_weight', 0.0))
+
+        support = (
+            np.log1p(np.asarray([int(getattr(lm, 'n_obs', 0)) for lm in landmarks], dtype=np.float32))
+            if support_weight != 0.0
+            else None
+        )
+        staticness = (
+            np.asarray([float(getattr(lm, 'staticness', 0.0)) for lm in landmarks], dtype=np.float32)
+            if staticness_weight != 0.0
+            else None
+        )
+
+        eupe_dim_ok = int(anchor_descs.shape[1]) == int(mus.shape[1])
+        for anchor_i in range(len(anchors)):
+            if not bool(valid_anchor[anchor_i]):
+                continue
+            best_fine_by_local: dict[int, float] = {}
+            for obs_j, fine_sim in zip(obs_top_idx[anchor_i].tolist(), obs_top_sim[anchor_i].tolist()):
+                obs_j = int(obs_j)
+                if obs_j < 0 or obs_j >= int(obs_to_local_arr.shape[0]):
+                    continue
+                local_idx = int(obs_to_local_arr[obs_j])
+                prev = best_fine_by_local.get(local_idx)
+                if prev is None or float(fine_sim) > prev:
+                    best_fine_by_local[local_idx] = float(fine_sim)
+            if not best_fine_by_local:
+                continue
+            locals_arr = np.asarray(list(best_fine_by_local.keys()), dtype=np.int64)
+            fine_sims = np.asarray([best_fine_by_local[int(x)] for x in locals_arr.tolist()], dtype=np.float32)
+            scores = fine_weight * fine_sims
+            if eupe_weight != 0.0:
+                if eupe_dim_ok:
+                    eupe_sims = (
+                        anchor_descs[anchor_i].astype(np.float32)
+                        @ mus[locals_arr].astype(np.float32, copy=False).T
+                    )
+                    scores = scores + (eupe_weight * eupe_sims.astype(np.float32))
+                else:
+                    debug['local_memory_eupe_prior_skipped'] = True
+                    debug['local_memory_eupe_prior_skip_reason'] = 'descriptor_dim_mismatch'
+            if support is not None:
+                scores = scores + (support_weight * support[locals_arr])
+            if staticness is not None:
+                scores = scores + (staticness_weight * staticness[locals_arr])
+            order = np.argsort(-scores)[:out_k]
+            keep = int(order.shape[0])
+            if keep > 0:
+                top_idx[anchor_i, :keep] = locals_arr[order]
+                top_sim[anchor_i, :keep] = scores[order].astype(np.float32, copy=False)
+
+        debug.update({
+            'local_memory_reason': 'ok',
+            'local_memory_num_observation_descs': int(obs_descs.shape[0]),
+            'local_memory_landmarks_with_desc': int(landmarks_with_desc),
+            'local_memory_topk_observations': int(topk_obs),
+            'local_memory_landmarks_per_anchor': int(out_k),
+            'local_memory_fine_weight': float(fine_weight),
+            'local_memory_eupe_prior_weight': float(eupe_weight),
+            'local_memory_support_weight': float(support_weight),
+            'local_memory_staticness_weight': float(staticness_weight),
+        })
+        debug.update(vps_debug)
         return top_idx, top_sim, debug
 
     def _match_anchors_to_candidates(
@@ -2065,6 +2628,13 @@ class PLMMapLocalizer:
             and getattr(lazy_context['store'], 'has_fine_observation_memory', False)
             and any(a.fine_desc is not None for a in anchors)
         )
+        use_in_memory_local_memory = (
+            bool(local_memory_cfg.get('enabled', False))
+            and lazy_context is None
+            and len(working_landmarks) > 0
+            and any(getattr(lm, 'fine_descs', None) is not None for lm in working_landmarks)
+            and any(a.fine_desc is not None for a in anchors)
+        )
         top_materialize_sim = None
         used_local_memory = False
         if use_local_memory:
@@ -2086,6 +2656,23 @@ class PLMMapLocalizer:
                 debug['retrieval_primary'] = 'local_memory'
             else:
                 use_local_memory = False
+        if not used_local_memory and use_in_memory_local_memory:
+            top_idx_local, top_sim_local, local_debug = self._retrieve_in_memory_fine_obs_topk(
+                anchors,
+                anchor_descs,
+                mus,
+                working_landmarks,
+                topk_landmarks=topk_landmarks,
+                retrieval_device=retrieval_device,
+                retrieval_anchor_batch_size=retrieval_anchor_batch_size,
+            )
+            debug.update(local_debug)
+            if top_idx_local is not None and top_sim_local is not None:
+                top_idx = top_idx_local
+                top_sim = top_sim_local
+                top_materialize_sim = top_sim
+                used_local_memory = True
+                debug['retrieval_primary'] = 'in_memory_local_memory'
         if not used_local_memory and use_fine_primary:
             store_fmu = lazy_context['store'].fine_mu
             d_fine = int(store_fmu.shape[1])
@@ -2301,9 +2888,7 @@ class PLMMapLocalizer:
                 for fid, uv in zip(obs_fids, obs_uvs_raw):
                     frame = lazy_context['dataset'].get_map_frames()[int(fid)]
                     frame_name = str(frame.meta.get('relative_path', frame.image_path.name))
-                    uses_h5_fine = str(getattr(self.fine_extractor, 'method', '')).lower() in (
-                        'superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'
-                    )
+                    uses_h5_fine = is_h5_local_feature_method(getattr(self.fine_extractor, 'method', ''))
                     gray = (
                         np.zeros((1, 1), dtype=np.uint8)
                         if uses_h5_fine
@@ -2675,6 +3260,38 @@ class PLMMapLocalizer:
             'local_memory_vps_word_count_median': 0.0,
             'local_memory_vps_word_count_max': 0,
             'local_memory_vps_time_s': 0.0,
+            'local_memory_observation_prior_enabled': bool(
+                isinstance(self.matching_cfg.get('local_memory', {}).get('observation_prior', {}), dict)
+                and self.matching_cfg.get('local_memory', {}).get('observation_prior', {}).get('enabled', False)
+            ),
+            'local_memory_observation_prior_weight': float(
+                self.matching_cfg.get('local_memory', {}).get('observation_prior', {}).get('weight', 0.0)
+                if isinstance(self.matching_cfg.get('local_memory', {}).get('observation_prior', {}), dict)
+                else 0.0
+            ),
+            'local_memory_observation_prior_frame_count': 0,
+            'local_memory_observation_prior_nonzero_obs': 0,
+            'local_memory_observation_prior_mean': 0.0,
+            'local_memory_observation_prior_max': 0.0,
+            'local_memory_graph_prior_enabled': bool(
+                isinstance(self.matching_cfg.get('local_memory', {}).get('graph_prior', {}), dict)
+                and self.matching_cfg.get('local_memory', {}).get('graph_prior', {}).get('enabled', False)
+            ),
+            'local_memory_graph_prior_weight': float(
+                self.matching_cfg.get('local_memory', {}).get('graph_prior', {}).get('score_weight', 0.0)
+                if isinstance(self.matching_cfg.get('local_memory', {}).get('graph_prior', {}), dict)
+                else 0.0
+            ),
+            'local_memory_graph_prior_reason': '',
+            'local_memory_graph_prior_diffusion_steps': 0,
+            'local_memory_graph_prior_diffusion_weight': 0.0,
+            'local_memory_graph_prior_frame_count': 0,
+            'local_memory_graph_prior_seed_nonzero': 0,
+            'local_memory_graph_prior_active': 0,
+            'local_memory_graph_prior_edges_touched': 0,
+            'local_memory_graph_prior_mean': 0.0,
+            'local_memory_graph_prior_max': 0.0,
+            'local_memory_graph_prior_store_has_graph': False,
         }
         for key, value in candidate_schedule.meta.items():
             aggregate_debug[f'candidate_{key}'] = value
@@ -2701,6 +3318,7 @@ class PLMMapLocalizer:
         accumulated_index_list: list[int] = []
         accumulated_seen: set[int] = set()
         accumulated_graph_score_by_idx: dict[int, float] = {}
+        accumulated_frame_weight_by_id: dict[int, float] = {}
         accumulated_image_names: list[str] = []
         accumulated_frame_ids: list[int] = []
 
@@ -2715,6 +3333,17 @@ class PLMMapLocalizer:
                 group = groups[groups_processed]
                 accumulated_image_names.extend(list(group.image_names))
                 accumulated_frame_ids.extend(list(group.frame_ids))
+                if isinstance(group.lazy_context, dict) and isinstance(group.lazy_context.get('preferred_frame_weights'), dict):
+                    for fid_raw, weight_raw in group.lazy_context.get('preferred_frame_weights', {}).items():
+                        try:
+                            fid = int(fid_raw)
+                            weight = float(weight_raw)
+                        except (TypeError, ValueError):
+                            continue
+                        accumulated_frame_weight_by_id[fid] = max(
+                            float(accumulated_frame_weight_by_id.get(fid, 0.0)),
+                            weight,
+                        )
                 group_indices_arr = np.asarray(group.landmark_indices, dtype=np.int64)
                 group_graph_scores = None
                 if isinstance(group.lazy_context, dict) and group.lazy_context.get('candidate_graph_scores') is not None:
@@ -2758,6 +3387,7 @@ class PLMMapLocalizer:
                     'feature_cache': base_lazy_context.get('feature_cache'),
                     'include_view_dirs': bool(base_lazy_context.get('include_view_dirs', True)),
                     'preferred_frame_ids': tuple(accumulated_frame_ids),
+                    'preferred_frame_weights': dict(accumulated_frame_weight_by_id),
                     'candidate_graph_scores': np.asarray(
                         [float(accumulated_graph_score_by_idx.get(int(idx), 0.0)) for idx in accumulated_index_list],
                         dtype=np.float32,
@@ -2802,6 +3432,13 @@ class PLMMapLocalizer:
                 'local_memory_vps_scored_observations',
                 'local_memory_vps_skipped_large_buckets',
                 'local_memory_vps_word_count_max',
+                'local_memory_observation_prior_frame_count',
+                'local_memory_observation_prior_nonzero_obs',
+                'local_memory_graph_prior_diffusion_steps',
+                'local_memory_graph_prior_frame_count',
+                'local_memory_graph_prior_seed_nonzero',
+                'local_memory_graph_prior_active',
+                'local_memory_graph_prior_edges_touched',
             ):
                 aggregate_debug[key] = int(stage_debug.get(key, aggregate_debug.get(key, 0)))
             if 'local_memory_retrieval_mode' in stage_debug:
@@ -2813,9 +3450,24 @@ class PLMMapLocalizer:
             for key in (
                 'local_memory_vps_word_count_median',
                 'local_memory_vps_time_s',
+                'local_memory_observation_prior_weight',
+                'local_memory_observation_prior_mean',
+                'local_memory_observation_prior_max',
+                'local_memory_graph_prior_weight',
+                'local_memory_graph_prior_diffusion_weight',
+                'local_memory_graph_prior_mean',
+                'local_memory_graph_prior_max',
             ):
                 if key in stage_debug:
                     aggregate_debug[key] = float(stage_debug.get(key, aggregate_debug.get(key, 0.0)))
+            if 'local_memory_observation_prior_enabled' in stage_debug:
+                aggregate_debug['local_memory_observation_prior_enabled'] = bool(stage_debug.get('local_memory_observation_prior_enabled', False))
+            if 'local_memory_graph_prior_enabled' in stage_debug:
+                aggregate_debug['local_memory_graph_prior_enabled'] = bool(stage_debug.get('local_memory_graph_prior_enabled', False))
+            if 'local_memory_graph_prior_store_has_graph' in stage_debug:
+                aggregate_debug['local_memory_graph_prior_store_has_graph'] = bool(stage_debug.get('local_memory_graph_prior_store_has_graph', False))
+            if 'local_memory_graph_prior_reason' in stage_debug:
+                aggregate_debug['local_memory_graph_prior_reason'] = str(stage_debug.get('local_memory_graph_prior_reason', ''))
             if 'observation_coherence_reason' in stage_debug:
                 aggregate_debug['observation_coherence_reason'] = str(stage_debug.get('observation_coherence_reason', ''))
             if 'observation_coherence_score' in stage_debug:
@@ -2878,6 +3530,13 @@ class PLMMapLocalizer:
                         'local_memory_vps_scored_observations',
                         'local_memory_vps_skipped_large_buckets',
                         'local_memory_vps_word_count_max',
+                        'local_memory_observation_prior_frame_count',
+                        'local_memory_observation_prior_nonzero_obs',
+                        'local_memory_graph_prior_diffusion_steps',
+                        'local_memory_graph_prior_frame_count',
+                        'local_memory_graph_prior_seed_nonzero',
+                        'local_memory_graph_prior_active',
+                        'local_memory_graph_prior_edges_touched',
                     ):
                         aggregate_debug[key] = int(geom_debug.get(key, aggregate_debug.get(key, 0)))
                     if 'local_memory_retrieval_mode' in geom_debug:
@@ -2889,9 +3548,24 @@ class PLMMapLocalizer:
                     for key in (
                         'local_memory_vps_word_count_median',
                         'local_memory_vps_time_s',
+                        'local_memory_observation_prior_weight',
+                        'local_memory_observation_prior_mean',
+                        'local_memory_observation_prior_max',
+                        'local_memory_graph_prior_weight',
+                        'local_memory_graph_prior_diffusion_weight',
+                        'local_memory_graph_prior_mean',
+                        'local_memory_graph_prior_max',
                     ):
                         if key in geom_debug:
                             aggregate_debug[key] = float(geom_debug.get(key, aggregate_debug.get(key, 0.0)))
+                    if 'local_memory_observation_prior_enabled' in geom_debug:
+                        aggregate_debug['local_memory_observation_prior_enabled'] = bool(geom_debug.get('local_memory_observation_prior_enabled', False))
+                    if 'local_memory_graph_prior_enabled' in geom_debug:
+                        aggregate_debug['local_memory_graph_prior_enabled'] = bool(geom_debug.get('local_memory_graph_prior_enabled', False))
+                    if 'local_memory_graph_prior_store_has_graph' in geom_debug:
+                        aggregate_debug['local_memory_graph_prior_store_has_graph'] = bool(geom_debug.get('local_memory_graph_prior_store_has_graph', False))
+                    if 'local_memory_graph_prior_reason' in geom_debug:
+                        aggregate_debug['local_memory_graph_prior_reason'] = str(geom_debug.get('local_memory_graph_prior_reason', ''))
                     if 'observation_coherence_reason' in geom_debug:
                         aggregate_debug['observation_coherence_reason'] = str(geom_debug.get('observation_coherence_reason', ''))
                     if 'observation_coherence_score' in geom_debug:
@@ -3031,6 +3705,44 @@ class PLMMapLocalizer:
         match_debug = dict(match_debug)
         match_debug['t_pnp_s'] = float(time.perf_counter() - pnp_t0)
         match_debug['t_localize_image_s'] = float(time.perf_counter() - localize_t0)
+        return {
+            'success': bool(pose_res.success),
+            'num_matches': int(pose_res.num_matches),
+            'num_inliers': int(pose_res.num_inliers),
+            'T_wc': pose_res.T_wc,
+            'pose_res': pose_res,
+            'match_debug': match_debug,
+        }
+
+    def localize_anchors(
+        self,
+        anchors: Sequence,
+        anchor_debug: dict,
+        intr: dict,
+        *,
+        pose_prior: Optional[np.ndarray] = None,
+        candidate_landmarks: Optional[Sequence[Landmark] | LandmarkCandidateSet] = None,
+        t_anchor_extract_s: float = 0.0,
+    ) -> dict:
+        localize_t0 = time.perf_counter()
+        matches, match_debug = self._match_anchors_to_candidates(
+            anchors,
+            anchor_debug,
+            intr,
+            pose_prior=pose_prior,
+            candidate_landmarks=candidate_landmarks,
+            t_anchor_extract_s=t_anchor_extract_s,
+        )
+        pnp_t0 = time.perf_counter()
+        pose_res = solve_pnp_ransac(
+            matches,
+            intr,
+            reproj_err=float(self.cfg['pnp'].get('reproj_error_px', 8.0)),
+            iterations=int(self.cfg['pnp'].get('iterations', 1000)),
+        )
+        match_debug = dict(match_debug)
+        match_debug['t_pnp_s'] = float(time.perf_counter() - pnp_t0)
+        match_debug['t_localize_image_s'] = float(time.perf_counter() - localize_t0) + float(t_anchor_extract_s)
         return {
             'success': bool(pose_res.success),
             'num_matches': int(pose_res.num_matches),

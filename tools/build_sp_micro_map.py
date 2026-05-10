@@ -168,7 +168,7 @@ def _load_frame_bundles(
 
     bundles: list[FrameBundle] = []
     missing = 0
-    for name in tqdm(image_names, desc='Loading SuperPoint DB frames', unit='image'):
+    for name in tqdm(image_names, desc='Loading local-feature DB frames', unit='image'):
         item = lookup.get(name)
         if item is None:
             missing += 1

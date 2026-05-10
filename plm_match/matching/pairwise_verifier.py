@@ -7,6 +7,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from plm_match.geometry import solve_pnp_ransac
+from plm_match.fine_features import is_h5_local_feature_method
 from plm_match.types import LandmarkCandidateSchedule, Match3D2D, PoseResult
 from plm_match.utils.io import read_image
 
@@ -48,7 +49,7 @@ class SuperPointPairwiseVerifier:
         self._image_size_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._image_size_cache_size = int(cfg.get("image_size_cache_size", 128))
         self._fine_method = str(getattr(fine_extractor, "method", "")).lower()
-        self._uses_h5_features = self._fine_method in ("superpoint_h5", "superpoint-h5", "sp_h5", "sp-h5")
+        self._uses_h5_features = is_h5_local_feature_method(self._fine_method)
 
     def close(self) -> None:
         if self._matches_file is not None:

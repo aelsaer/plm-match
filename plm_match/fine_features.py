@@ -46,6 +46,24 @@ class LRUGrayImageCache:
             self._data.popitem(last=False)
 
 
+H5_LOCAL_FEATURE_METHODS = (
+    'superpoint_h5',
+    'superpoint-h5',
+    'sp_h5',
+    'sp-h5',
+    'd2net_h5',
+    'd2net-h5',
+    'd2_h5',
+    'd2-h5',
+    'd2net',
+    'd2-net',
+)
+
+
+def is_h5_local_feature_method(method: str | None) -> bool:
+    return str(method or '').lower() in H5_LOCAL_FEATURE_METHODS
+
+
 class LocalPatchDescriptor:
     """Sparse local descriptor head for shortlist reranking."""
 
@@ -86,14 +104,14 @@ class LocalPatchDescriptor:
             self.impl = self._load_xfeat(repo_root=repo_root, top_k=self.top_k)
             self._dim = 64
             self._binary = False
-        elif self.method in ('superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'):
+        elif is_h5_local_feature_method(self.method):
             if not self._h5_paths:
                 raise ValueError(
-                    'SuperPoint H5 descriptor mode requires '
+                    'H5 local descriptor mode requires '
                     '`matching.fine_rerank.features_path`, `db_features_path`, or `query_features_path`.'
                 )
             self.impl = None
-            self._dim = 256
+            self._dim = 512 if self.method in ('d2net', 'd2-net', 'd2net_h5', 'd2net-h5', 'd2_h5', 'd2-h5') else 256
             self._binary = False
         elif self.method == 'orb':
             self.impl = cv2.ORB_create(nfeatures=0, patchSize=int(self.patch_size))
@@ -254,11 +272,11 @@ class LocalPatchDescriptor:
         if f is not None:
             return f
         if not path.exists():
-            raise FileNotFoundError(f'SuperPoint H5 feature file not found: {path}')
+            raise FileNotFoundError(f'H5 local feature file not found: {path}')
         try:
             import h5py
         except Exception as exc:
-            raise RuntimeError('SuperPoint H5 descriptor mode requires h5py.') from exc
+            raise RuntimeError('H5 local descriptor mode requires h5py.') from exc
         f = h5py.File(path, 'r')
         self._h5_files[path] = f
         return f
@@ -299,12 +317,21 @@ class LocalPatchDescriptor:
                 if key not in f:
                     continue
                 group = f[key]
-                keypoints = np.asarray(group['keypoints'], dtype=np.float32).reshape(-1, 2)
+                keypoints_raw = np.asarray(group['keypoints'], dtype=np.float32)
+                if keypoints_raw.ndim == 2 and keypoints_raw.shape[1] >= 2:
+                    keypoints = keypoints_raw[:, :2].astype(np.float32, copy=False)
+                else:
+                    keypoints = keypoints_raw.reshape(-1, 2).astype(np.float32, copy=False)
                 descriptors = np.asarray(group['descriptors'], dtype=np.float32)
-                if descriptors.ndim == 2 and descriptors.shape[0] == 256:
+                if (
+                    descriptors.ndim == 2
+                    and descriptors.shape[0] != keypoints.shape[0]
+                    and descriptors.shape[1] == keypoints.shape[0]
+                ):
                     descriptors = descriptors.T
                 descriptors = descriptors.reshape(descriptors.shape[0], -1).astype(np.float32, copy=False)
-                scores = np.asarray(group['scores'], dtype=np.float32).reshape(-1) if 'scores' in group else None
+                score_key = next((k for k in ('scores', 'score', 'responses', 'response') if k in group), None)
+                scores = np.asarray(group[score_key], dtype=np.float32).reshape(-1) if score_key is not None else None
                 n = min(keypoints.shape[0], descriptors.shape[0], scores.shape[0] if scores is not None else keypoints.shape[0])
                 keypoints = keypoints[:n]
                 descriptors = descriptors[:n]
@@ -336,7 +363,7 @@ class LocalPatchDescriptor:
         *,
         topk: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self.method not in ('superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'):
+        if not is_h5_local_feature_method(self.method):
             return (
                 np.zeros((0, 2), dtype=np.float32),
                 np.zeros((0,), dtype=np.float32),
@@ -401,7 +428,7 @@ class LocalPatchDescriptor:
             if scores is None:
                 scores = np.ones((entry.keypoints.shape[0],), dtype=np.float32)
             return self._sort_sparse_keypoints(entry.keypoints, scores, entry.descriptors, topk=topk)
-        if self.method in ('superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'):
+        if is_h5_local_feature_method(self.method):
             return (
                 np.zeros((0, 2), dtype=np.float32),
                 np.zeros((0,), dtype=np.float32),
@@ -511,7 +538,7 @@ class LocalPatchDescriptor:
     ) -> np.ndarray:
         if self.method == 'xfeat':
             return self._extract_xfeat(image_rgb, points)
-        if self.method in ('superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'):
+        if is_h5_local_feature_method(self.method):
             return self._extract_h5(image_name, points)
         gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
         return self.extract_from_gray(gray, points)
@@ -526,7 +553,7 @@ class LocalPatchDescriptor:
         if self.method == 'xfeat':
             image_rgb = np.repeat(gray[..., None], 3, axis=2)
             return self._extract_xfeat(image_rgb, points)
-        if self.method in ('superpoint_h5', 'superpoint-h5', 'sp_h5', 'sp-h5'):
+        if is_h5_local_feature_method(self.method):
             return self._extract_h5(image_name, points)
         descs = []
         for uv in points:
