@@ -1351,6 +1351,15 @@ class PLMMapLocalizer:
         max_obs_per_landmark = int(local_cfg.get('max_obs_per_landmark', self.fine_cfg.get('max_obs_per_landmark', 4)))
         if max_obs_per_landmark <= 0:
             max_obs_per_landmark = 999999
+        preferred_raw = lazy_context.get('preferred_frame_ids')
+        preferred_frame_ids = (
+            np.asarray(list(preferred_raw), dtype=np.int32)
+            if preferred_raw is not None and len(preferred_raw) > 0
+            else None
+        )
+        preferred_landmark_hits = 0
+        preferred_landmark_fallbacks = 0
+        preferred_obs_kept = 0
         obs_desc_blocks: list[np.ndarray] = []
         obs_to_local: list[int] = []
         obs_to_frame: list[int] = []
@@ -1362,6 +1371,15 @@ class PLMMapLocalizer:
                 continue
             desc_block = store.fine_obs_descs[start:end].astype(np.float32, copy=False)
             frame_block = store.obs_frame_ids[start:end].astype(np.int32, copy=False)
+            if preferred_frame_ids is not None:
+                preferred_mask = np.isin(frame_block, preferred_frame_ids)
+                if np.any(preferred_mask):
+                    desc_block = desc_block[preferred_mask]
+                    frame_block = frame_block[preferred_mask]
+                    preferred_landmark_hits += 1
+                    preferred_obs_kept += int(desc_block.shape[0])
+                else:
+                    preferred_landmark_fallbacks += 1
             if desc_block.shape[0] > max_obs_per_landmark:
                 desc_block = desc_block[:max_obs_per_landmark]
                 frame_block = frame_block[:max_obs_per_landmark]
@@ -1713,6 +1731,11 @@ class PLMMapLocalizer:
             'local_memory_landmarks_with_desc': int(landmarks_with_desc),
             'local_memory_topk_observations': int(topk_obs),
             'local_memory_landmarks_per_anchor': int(out_k),
+            'local_memory_preferred_frame_filter_enabled': bool(preferred_frame_ids is not None),
+            'local_memory_preferred_frame_count': int(preferred_frame_ids.shape[0]) if preferred_frame_ids is not None else 0,
+            'local_memory_preferred_landmark_hits': int(preferred_landmark_hits),
+            'local_memory_preferred_landmark_fallbacks': int(preferred_landmark_fallbacks),
+            'local_memory_preferred_observations_before_cap': int(preferred_obs_kept),
             'local_memory_mutual_nn_enabled': bool(mutual_nn_enabled),
             'local_memory_mutual_nn_strict': bool(mutual_nn_strict),
             'local_memory_mutual_nn_batch_size': int(mutual_nn_batch_size),
