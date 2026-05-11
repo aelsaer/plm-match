@@ -34,6 +34,14 @@ def _read_names(path: Path) -> list[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _read_split_map_names(path: Path) -> tuple[list[str], dict[str, object]]:
+    split = json.loads(Path(path).read_text(encoding="utf-8"))
+    names = [str(item["name"]) for item in split.get("map_images", []) if "name" in item]
+    if not names:
+        raise ValueError(f"No map_images were found in split file: {path}")
+    return names, split
+
+
 def _normalise_descriptors(descs: np.ndarray) -> np.ndarray:
     descs = np.asarray(descs, dtype=np.float32)
     if descs.ndim != 2 or descs.shape[0] == 0:
@@ -133,10 +141,18 @@ def _point_passes_filters(point, *, min_track_len: int, max_error: float | None)
 
 def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     cfg = load_config(args.config)
-    dataset_root = args.dataset_root or cfg.get("dataset_root")
+    split: dict[str, object] | None = None
+    split_map_names: list[str] | None = None
+    if args.split_json is not None:
+        split_map_names, split = _read_split_map_names(args.split_json)
+    dataset_root = args.dataset_root or (split.get("dataset_root") if split is not None else None) or cfg.get("dataset_root")
     if dataset_root is None:
         raise ValueError("dataset_root must be set either in the config or via --dataset_root")
-    dataset = build_dataset(str(dataset_root), cfg.get("dataset", {"type": "colmap_localization"}))
+    dataset_cfg = dict(cfg.get("dataset", {"type": "colmap_localization"}))
+    if split is not None:
+        dataset_cfg.pop("db_image_names_file", None)
+        dataset_cfg.pop("max_map_frames", None)
+    dataset = build_dataset(str(dataset_root), dataset_cfg)
     if not hasattr(dataset, "points3d"):
         raise ValueError("build_sp_colmap_attachment requires a COLMAP localization dataset")
 
@@ -146,7 +162,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     uses_named_h5 = is_h5_local_feature_method(getattr(fine_extractor, "method", ""))
     descriptor_dtype = np.float16 if str(args.descriptor_dtype).lower() == "float16" else np.float32
 
-    image_names = _read_names(args.image_names) if args.image_names is not None else None
+    image_names = split_map_names if split_map_names is not None else (_read_names(args.image_names) if args.image_names is not None else None)
     frames = _select_frames(dataset, image_names, int(args.max_images))
     radius = float(args.attach_radius_px)
     max_error = float(args.max_colmap_point_error) if args.max_colmap_point_error is not None else None
@@ -221,6 +237,21 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                         [np.asarray(dataset.points3d[int(pid)].xyz, dtype=np.float32) for pid in attached_pids],
                         axis=0,
                     )
+                    best_by_pid: dict[int, tuple[tuple[float, float], int]] = {}
+                    for local_i, pid in enumerate(attached_pids.tolist()):
+                        key = (float(attached_dists[local_i]), -float(attached_scores[local_i]))
+                        prev = best_by_pid.get(int(pid))
+                        if prev is None or key < prev[0]:
+                            best_by_pid[int(pid)] = (key, int(local_i))
+                    if len(best_by_pid) < int(attached_pids.shape[0]):
+                        keep_local = np.asarray([item[1] for item in best_by_pid.values()], dtype=np.int64)
+                        sp_indices = sp_indices[keep_local]
+                        attached_pids = attached_pids[keep_local]
+                        attached_uvs = attached_uvs[keep_local]
+                        attached_scores = attached_scores[keep_local]
+                        attached_descs = attached_descs[keep_local]
+                        attached_dists = attached_dists[keep_local]
+                        attached_xyz = attached_xyz[keep_local]
                     attached_count = int(attached_pids.shape[0])
                     obs_file = _safe_obs_filename(image_id, image_name)
                     np.savez(
@@ -293,6 +324,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     summary = {
         "out_dir": str(out_dir),
         "dataset_root": str(dataset_root),
+        "split_json": str(args.split_json) if args.split_json is not None else None,
         "num_db_images": int(len(frames)),
         "num_images_with_attached_obs": int(frames_with_obs),
         "num_attached_observations": int(total_obs),
@@ -313,6 +345,7 @@ def main() -> None:
     )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--dataset_root", type=str, default=None)
+    parser.add_argument("--split_json", type=Path, default=None)
     parser.add_argument("--out_dir", type=Path, default=Path("attached_sp_colmap"))
     parser.add_argument("--image_names", type=Path, default=None, help="Optional line-separated DB image names to process.")
     parser.add_argument("--max_images", type=int, default=0)
