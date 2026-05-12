@@ -493,10 +493,26 @@ class LocalPatchDescriptor:
         entry: XFeatImageCacheEntry,
         points: Sequence[np.ndarray],
     ) -> np.ndarray:
+        descs, _, _ = self._extract_sparse_nearest_with_metadata(entry, points)
+        return descs
+
+    def _extract_sparse_nearest_with_metadata(
+        self,
+        entry: XFeatImageCacheEntry,
+        points: Sequence[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not points:
-            return np.zeros((0, self.dim), dtype=np.float32)
+            return (
+                np.zeros((0, self.dim), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+            )
         if entry.keypoints.shape[0] == 0 or entry.descriptors.shape[0] == 0:
-            return np.zeros((len(points), self.dim), dtype=np.float32)
+            return (
+                np.zeros((len(points), self.dim), dtype=np.float32),
+                np.zeros((len(points),), dtype=np.float32),
+                np.zeros((len(points),), dtype=np.float32),
+            )
         pts = np.asarray([np.asarray(p, dtype=np.float32).reshape(2) for p in points], dtype=np.float32)
         kpts = entry.keypoints.astype(np.float32, copy=False)
         diff = pts[:, None, :] - kpts[None, :, :]
@@ -504,18 +520,42 @@ class LocalPatchDescriptor:
         best = np.argmin(d2, axis=1)
         best_d2 = d2[np.arange(d2.shape[0]), best]
         out = np.zeros((pts.shape[0], entry.descriptors.shape[1]), dtype=np.float32)
+        assoc_px = np.zeros((pts.shape[0],), dtype=np.float32)
+        sp_scores = np.zeros((pts.shape[0],), dtype=np.float32)
         valid = best_d2 <= float(self.match_radius_px * self.match_radius_px)
         if np.any(valid):
             out[valid] = entry.descriptors[best[valid]]
-        return out
+            assoc_px[valid] = np.sqrt(np.maximum(best_d2[valid], 0.0)).astype(np.float32, copy=False)
+            if entry.scores is not None and entry.scores.shape[0] > 0:
+                scores = entry.scores.astype(np.float32, copy=False)
+                sp_scores[valid] = scores[best[valid]]
+            else:
+                sp_scores[valid] = 1.0
+        return out, assoc_px, sp_scores
 
     def _extract_xfeat(self, image_rgb: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
         entry = self._run_xfeat(image_rgb)
         return self._extract_sparse_nearest(entry, points)
 
+    def _extract_xfeat_with_metadata(
+        self,
+        image_rgb: np.ndarray,
+        points: Sequence[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        entry = self._run_xfeat(image_rgb)
+        return self._extract_sparse_nearest_with_metadata(entry, points)
+
     def _extract_h5(self, image_name: str | None, points: Sequence[np.ndarray]) -> np.ndarray:
         entry = self._read_h5_entry(image_name)
         return self._extract_sparse_nearest(entry, points)
+
+    def _extract_h5_with_metadata(
+        self,
+        image_name: str | None,
+        points: Sequence[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        entry = self._read_h5_entry(image_name)
+        return self._extract_sparse_nearest_with_metadata(entry, points)
 
     def _compute_one(self, gray: np.ndarray, uv: np.ndarray) -> np.ndarray | None:
         x = float(uv[0])
@@ -542,6 +582,29 @@ class LocalPatchDescriptor:
             return self._extract_h5(image_name, points)
         gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
         return self.extract_from_gray(gray, points)
+
+    def extract_at_points_with_metadata(
+        self,
+        image_rgb: np.ndarray,
+        points: Sequence[np.ndarray],
+        *,
+        image_name: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return descriptors plus sparse-keypoint association distance/score.
+
+        For H5/XFeat features this records the nearest detected local feature
+        used for each requested point. Dense OpenCV descriptors are computed at
+        the requested point, so their association distance is zero.
+        """
+        if self.method == 'xfeat':
+            return self._extract_xfeat_with_metadata(image_rgb, points)
+        if is_h5_local_feature_method(self.method):
+            return self._extract_h5_with_metadata(image_name, points)
+        descs = self.extract_at_points(image_rgb, points, image_name=image_name)
+        valid = (np.linalg.norm(descs.astype(np.float32, copy=False), axis=1) > 1e-8) if descs.size else np.zeros((0,), dtype=bool)
+        assoc_px = np.zeros((descs.shape[0],), dtype=np.float32)
+        scores = valid.astype(np.float32, copy=False)
+        return descs, assoc_px, scores
 
     def extract_from_gray(
         self,

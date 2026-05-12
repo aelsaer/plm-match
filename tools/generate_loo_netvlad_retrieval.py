@@ -42,24 +42,47 @@ def _import_hloc(hloc_root: Path | None):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate fair NetVLAD retrieval pairs for an Aachen DB leave-one-out split."
+        description="Generate fair NetVLAD retrieval pairs for a split with disjoint map/query images."
     )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--split_json", required=True, type=Path)
     parser.add_argument("--out_dir", required=True, type=Path)
     parser.add_argument("--dataset_root", type=Path, default=None)
+    parser.add_argument("--image_root", type=Path, default=None, help="Shared image root for map and query lists.")
+    parser.add_argument("--map_image_root", type=Path, default=None, help="Image root for map image names.")
+    parser.add_argument("--query_image_root", type=Path, default=None, help="Image root for query image names.")
     parser.add_argument("--hloc_root", type=Path, default=None)
     parser.add_argument("--topk", type=int, default=50)
+    parser.add_argument("--output_name", type=str, default=None)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     split = load_split(args.split_json)
     dataset_root = args.dataset_root or Path(split.get("dataset_root") or cfg["dataset_root"])
-    image_root = Path(cfg.get("dataset", {}).get("image_root", "images_upright"))
-    image_dir = dataset_root / image_root
-    if not image_dir.exists():
-        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+    shared_root = (
+        args.image_root
+        or (Path(split["feature_image_root"]) if split.get("feature_image_root") else None)
+        or Path(cfg.get("dataset", {}).get("image_root", "images_upright"))
+    )
+    map_image_root = (
+        args.map_image_root
+        or (Path(split["feature_map_image_root"]) if split.get("feature_map_image_root") else None)
+        or shared_root
+    )
+    query_image_root = (
+        args.query_image_root
+        or (Path(split["feature_query_image_root"]) if split.get("feature_query_image_root") else None)
+        or shared_root
+    )
+    if not map_image_root.is_absolute():
+        map_image_root = dataset_root / map_image_root
+    if not query_image_root.is_absolute():
+        query_image_root = dataset_root / query_image_root
+    if not map_image_root.exists():
+        raise FileNotFoundError(f"Map image directory not found: {map_image_root}")
+    if not query_image_root.exists():
+        raise FileNotFoundError(f"Query image directory not found: {query_image_root}")
 
     query_names = split_query_names(split)
     map_names = split_map_names(split)
@@ -73,12 +96,12 @@ def main() -> None:
     conf = dict(extract_features.confs["netvlad"])
     query_desc = args.out_dir / f"{conf['output']}_queries.h5"
     db_desc = args.out_dir / f"{conf['output']}_db.h5"
-    pairs_path = args.out_dir / f"pairs-loo-netvlad{int(args.topk)}.txt"
+    pairs_path = args.out_dir / (args.output_name or f"pairs-loo-netvlad{int(args.topk)}.txt")
 
     with _single_process_dataloader(extract_features.torch):
         extract_features.main(
             conf,
-            image_dir,
+            query_image_root,
             export_dir=args.out_dir,
             image_list=query_names,
             feature_path=query_desc,
@@ -86,7 +109,7 @@ def main() -> None:
         )
         extract_features.main(
             conf,
-            image_dir,
+            map_image_root,
             export_dir=args.out_dir,
             image_list=map_names,
             feature_path=db_desc,
@@ -101,6 +124,7 @@ def main() -> None:
         db_list=map_names,
         db_descriptors=db_desc,
     )
+    (args.out_dir / "command.txt").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
     print(f"Wrote {pairs_path}")
     print(f"Wrote {query_desc}")
     print(f"Wrote {db_desc}")

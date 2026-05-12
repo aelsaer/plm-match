@@ -832,6 +832,23 @@ class PLMMapLocalizer:
             np.save(compact_cache_dir / 'fine_obs_descs.npy', self.landmark_store.fine_obs_descs)
         else:
             (compact_cache_dir / 'fine_obs_descs.npy').unlink(missing_ok=True)
+        obs_count = int(getattr(self.landmark_store, 'obs_frame_ids', np.zeros((0,), dtype=np.int32)).shape[0])
+        optional_obs_arrays = {
+            'obs_assoc_px.npy': getattr(self.landmark_store, 'obs_assoc_px', None),
+            'obs_sp_score.npy': getattr(self.landmark_store, 'obs_sp_score', None),
+            'obs_track_reproj_error.npy': getattr(self.landmark_store, 'obs_track_reproj_error', None),
+        }
+        for name, arr in optional_obs_arrays.items():
+            save_arr = False
+            if arr is not None and int(getattr(arr, 'shape', (0,))[0]) == obs_count:
+                arr_np = np.asarray(arr)
+                if arr_np.size > 0:
+                    finite = np.isfinite(arr_np.astype(np.float32, copy=False))
+                    save_arr = bool(np.any(finite & (arr_np != 0)))
+            if save_arr:
+                np.save(compact_cache_dir / name, arr)
+            else:
+                (compact_cache_dir / name).unlink(missing_ok=True)
 
     def _feature_cache_namespace(self) -> str:
         backbone_cfg = dict(self.cfg.get('backbone', {}))
@@ -1378,6 +1395,16 @@ class PLMMapLocalizer:
             if store_observation_descs
             else None
         )
+        obs_assoc_px = (
+            np.zeros((int(store.obs_frame_ids.shape[0]),), dtype=np.float16)
+            if store_observation_descs
+            else None
+        )
+        obs_sp_score = (
+            np.zeros((int(store.obs_frame_ids.shape[0]),), dtype=np.float16)
+            if store_observation_descs
+            else None
+        )
         fine_counts = np.zeros((N,), dtype=np.int32)
         unique_fids = np.unique(store.obs_frame_ids)
         for frame_id in tqdm(unique_fids, desc='Computing fine_mu', unit='frame'):
@@ -1408,12 +1435,25 @@ class PLMMapLocalizer:
                 else read_image(map_frames[frame_id].image_path)
             )
             image_name = str(map_frames[frame_id].meta.get('relative_path', map_frames[frame_id].image_path.name))
-            descs = self.fine_extractor.extract_at_points(image, uvs, image_name=image_name)
-            for lm_idx, obs_slot, desc in zip(lm_slots, obs_slots, descs):
+            if store_observation_descs and hasattr(self.fine_extractor, 'extract_at_points_with_metadata'):
+                descs, assoc_px, sp_scores = self.fine_extractor.extract_at_points_with_metadata(
+                    image,
+                    uvs,
+                    image_name=image_name,
+                )
+            else:
+                descs = self.fine_extractor.extract_at_points(image, uvs, image_name=image_name)
+                assoc_px = np.zeros((len(uvs),), dtype=np.float32)
+                sp_scores = np.zeros((len(uvs),), dtype=np.float32)
+            for lm_idx, obs_slot, desc, assoc, sp_score in zip(lm_slots, obs_slots, descs, assoc_px, sp_scores):
                 if float(np.linalg.norm(desc)) > 1e-8:
                     desc_f = desc.astype(np.float32, copy=False)
                     if fine_obs_descs is not None:
                         fine_obs_descs[int(obs_slot)] = desc_f.astype(np.float16)
+                    if obs_assoc_px is not None:
+                        obs_assoc_px[int(obs_slot)] = np.float16(float(assoc))
+                    if obs_sp_score is not None:
+                        obs_sp_score[int(obs_slot)] = np.float16(float(sp_score))
                     count = int(fine_counts[lm_idx])
                     if count <= 0:
                         fine_mu[lm_idx] = desc_f.astype(np.float16)
@@ -1436,6 +1476,8 @@ class PLMMapLocalizer:
                 fine_mu[start:end] = block.astype(np.float16)
         store.fine_mu = fine_mu
         store.fine_obs_descs = fine_obs_descs
+        store.obs_assoc_px = obs_assoc_px if obs_assoc_px is not None else getattr(store, 'obs_assoc_px', None)
+        store.obs_sp_score = obs_sp_score if obs_sp_score is not None else getattr(store, 'obs_sp_score', None)
         store.fine_basis = None
         store.fine_eigvals = None
         store.fine_sigma_perp2 = None
@@ -1820,8 +1862,20 @@ class PLMMapLocalizer:
             )
         graph_support_weight = float(graph_support_weight_raw or 0.0)
         track_len_weight = float(local_cfg.get('track_len_weight', local_cfg.get('obs_track_len_weight', 0.0)))
-        track_reproj_weight = float(local_cfg.get('track_reproj_weight', local_cfg.get('obs_track_reproj_weight', 0.0)))
+        track_reproj_weight = float(
+            local_cfg.get(
+                'track_reproj_weight',
+                local_cfg.get(
+                    'obs_track_reproj_weight',
+                    local_cfg.get('reprojection_weight', local_cfg.get('colmap_reproj_weight', 0.0)),
+                ),
+            )
+        )
         track_parallax_weight = float(local_cfg.get('track_parallax_weight', local_cfg.get('obs_track_parallax_weight', 0.0)))
+        attach_distance_weight = float(
+            local_cfg.get('attach_distance_weight', local_cfg.get('obs_assoc_px_weight', 0.0))
+        )
+        sp_score_weight = float(local_cfg.get('sp_score_weight', local_cfg.get('obs_sp_score_weight', 0.0)))
         ppca_cfg = local_cfg.get('ppca', {})
         if not isinstance(ppca_cfg, dict):
             ppca_cfg = {}
@@ -2158,12 +2212,24 @@ class PLMMapLocalizer:
                     graph_prior_weight
                     * graph_prior_values[locals_arr].astype(np.float32, copy=False)
                 )
+            if attach_distance_weight != 0.0 and hasattr(store, 'obs_assoc_px'):
+                assoc_px = store.obs_assoc_px[best_slots].astype(np.float32, copy=False)
+                assoc_px = np.where(np.isfinite(assoc_px), assoc_px, 0.0).astype(np.float32, copy=False)
+                scores = scores - (attach_distance_weight * assoc_px)
+            if sp_score_weight != 0.0 and hasattr(store, 'obs_sp_score'):
+                sp_scores = store.obs_sp_score[best_slots].astype(np.float32, copy=False)
+                sp_scores = np.where(np.isfinite(sp_scores), sp_scores, 0.0).astype(np.float32, copy=False)
+                scores = scores + (sp_score_weight * sp_scores)
             if track_len_weight != 0.0 and hasattr(store, 'obs_track_len'):
                 track_len = store.obs_track_len[best_slots].astype(np.float32, copy=False)
                 scores = scores + (track_len_weight * np.log1p(track_len))
             if track_reproj_weight != 0.0 and hasattr(store, 'obs_track_reproj_error'):
                 track_reproj = store.obs_track_reproj_error[best_slots].astype(np.float32, copy=False)
                 scores = scores - (track_reproj_weight * track_reproj)
+            elif track_reproj_weight != 0.0:
+                store_locals = group_indices[locals_arr]
+                lm_reproj = store.reproj_error_mean[store_locals].astype(np.float32, copy=False)
+                scores = scores - (track_reproj_weight * lm_reproj)
             if track_parallax_weight != 0.0 and hasattr(store, 'obs_track_parallax'):
                 track_parallax = store.obs_track_parallax[best_slots].astype(np.float32, copy=False)
                 parallax_score = np.minimum(track_parallax / 10.0, 1.0).astype(np.float32, copy=False)
@@ -2210,6 +2276,8 @@ class PLMMapLocalizer:
             'local_memory_track_len_weight': float(track_len_weight),
             'local_memory_track_reproj_weight': float(track_reproj_weight),
             'local_memory_track_parallax_weight': float(track_parallax_weight),
+            'local_memory_attach_distance_weight': float(attach_distance_weight),
+            'local_memory_sp_score_weight': float(sp_score_weight),
             'local_memory_observation_prior_enabled': bool(obs_prior_enabled),
             'local_memory_observation_prior_weight': float(obs_prior_weight),
             'local_memory_observation_prior_frame_count': int(len(frame_prior_by_id)),

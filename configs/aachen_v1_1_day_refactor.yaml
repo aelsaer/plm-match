@@ -197,8 +197,8 @@ matching:
   fine_rerank:
     enabled: true
     method: superpoint_h5
-    db_features_path: outputs/table_i/superpoint_superglue/aachen/artifacts/feats-superpoint-n4096-rmax1600_db.h5
-    query_features_path: outputs/table_i/superpoint_superglue/aachen/artifacts/feats-superpoint-n4096-rmax1600_queries.h5
+    db_features_path: outputs/loo_aachen_benchmark/loo_aachen_500/hloc_sp_sg/artifacts/feats-superpoint-n4096-rmax1600_db.h5
+    query_features_path: outputs/loo_aachen_benchmark/loo_aachen_500/hloc_sp_sg/artifacts/feats-superpoint-n4096-rmax1600_queries.h5
     patch_size: 24
     xfeat_topk: 4096
     match_radius_px: 8.0
@@ -223,7 +223,7 @@ matching:
     # file. Leave-one-out DB queries are not in the HLoc match file, so they
     # fall back to SuperPoint mutual-nearest matching unless fresh SuperGlue
     # pairs are generated for that split.
-    matches_path: outputs/table_i/superpoint_superglue/aachen/artifacts/feats-superpoint-n4096-rmax1600_matches-superglue_pairs-query-netvlad50_active_queries.h5
+    matches_path: outputs/loo_aachen_benchmark/loo_aachen_500/hloc_sp_sg/artifacts/feats-superpoint-n4096-rmax1600_matches-superglue_pairs-loo-netvlad50.h5
     allow_mutual_fallback: true
     max_keypoints: 2048
     match_score_thresh: 0.2

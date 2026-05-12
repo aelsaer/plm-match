@@ -8,7 +8,12 @@ import sys
 import time
 from pathlib import Path
 
+import h5py
 import numpy as np
+from scipy.spatial import cKDTree
+
+from extract_loo_local_features import _prepare_superpoint_shim
+from generate_loo_superglue_matches import _prepare_superglue_shim
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".JPG", ".JPEG", ".PNG"}
@@ -39,6 +44,13 @@ DATASET_PRESETS = {
         "query_list": "day_time_queries_with_intrinsics.txt",
         "retrieval_file": "pairs-query-netvlad50.txt",
         "db_prefix": "db/",
+    },
+    "cambridge": {
+        "image_dir": None,
+        "reference_sfm": None,
+        "query_list": None,
+        "retrieval_file": None,
+        "db_prefix": None,
     },
     "inloc": {
         "image_dir": "images",
@@ -92,10 +104,21 @@ def _list_db_images(image_dir: Path, db_prefix: str) -> list[str]:
 
 def _query_names(query_list: Path | None, parse_image_lists, parse_retrieval, retrieval_file: Path) -> list[str]:
     if query_list is not None and query_list.exists():
-        parsed = parse_image_lists(query_list, with_intrinsics=True)
-        return [name for name, _ in parsed]
+        try:
+            parsed = parse_image_lists(query_list, with_intrinsics=True)
+            return [name for name, _ in parsed]
+        except Exception:
+            with open(query_list, "r", encoding="utf-8") as f:
+                return [line.split()[0] for line in f if line.strip() and not line.lstrip().startswith("#")]
     retrievals = parse_retrieval(retrieval_file)
     return list(retrievals.keys())
+
+
+def _read_name_list(path: Path | None) -> list[str]:
+    if path is None:
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
 
 def _write_json(path: Path, obj: dict) -> None:
@@ -131,6 +154,225 @@ def _write_filtered_retrieval(
     return kept_pairs, len(kept_queries)
 
 
+def _frame_name(frame) -> str:
+    return str(frame.meta.get("relative_path", frame.image_path.name))
+
+
+def _feature_group_name(hfile: h5py.File, name: str) -> str | None:
+    candidates = [str(name)]
+    path = Path(str(name))
+    for item in (path.as_posix(), path.name, path.stem, str(name).replace("/", "-")):
+        if item and item not in candidates:
+            candidates.append(item)
+    for cand in candidates:
+        if cand in hfile:
+            group = hfile[cand]
+            if isinstance(group, h5py.Group) and "keypoints" in group:
+                return cand
+    return None
+
+
+def _h5_pair_path(hfile: h5py.File, name0: str, name1: str) -> tuple[str | None, bool]:
+    safe0 = name0.replace("/", "-")
+    safe1 = name1.replace("/", "-")
+    if safe0 in hfile and safe1 in hfile[safe0]:
+        return f"{safe0}/{safe1}", False
+    if safe1 in hfile and safe0 in hfile[safe1]:
+        return f"{safe1}/{safe0}", True
+    return None, False
+
+
+def _read_pair_matches(hfile: h5py.File, query_name: str, db_name: str) -> tuple[np.ndarray, np.ndarray]:
+    pair_path, reverse = _h5_pair_path(hfile, query_name, db_name)
+    if pair_path is None:
+        return np.zeros((0, 2), dtype=np.int64), np.zeros((0,), dtype=np.float32)
+    group = hfile[pair_path]
+    matches0 = np.asarray(group["matches0"], dtype=np.int64)
+    scores0 = np.asarray(group.get("matching_scores0", np.ones_like(matches0, dtype=np.float32)), dtype=np.float32)
+    idx0 = np.flatnonzero(matches0 >= 0).astype(np.int64, copy=False)
+    idx1 = matches0[idx0].astype(np.int64, copy=False)
+    if reverse:
+        matches = np.stack([idx1, idx0], axis=1)
+    else:
+        matches = np.stack([idx0, idx1], axis=1)
+    return matches, scores0[idx0]
+
+
+def _build_colmap_dataset(
+    *,
+    dataset_root: Path,
+    image_dir: Path,
+    reference_sfm: Path | None,
+    query_list: Path | None,
+    db_prefix: str | None,
+    db_image_list: Path | None,
+    query_gt_pose_dir: Path | None,
+    default_query_camera_from_first_map: bool,
+):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from plm_match.datasets import build_dataset
+
+    cfg = {
+        "type": "colmap_localization",
+        "image_root": _maybe_rel(image_dir, dataset_root),
+        "model_path": _maybe_rel(reference_sfm, dataset_root),
+        "default_query_camera_from_first_map": bool(default_query_camera_from_first_map),
+    }
+    if db_image_list is not None and db_image_list.exists():
+        cfg["db_image_names_file"] = _maybe_rel(db_image_list, dataset_root)
+    elif db_prefix:
+        cfg["db_image_prefixes"] = [db_prefix]
+    if query_list is not None and query_list.exists():
+        cfg["query_list"] = _maybe_rel(query_list, dataset_root)
+    if query_gt_pose_dir is not None and query_gt_pose_dir.exists():
+        cfg["query_gt_pose_dir"] = _maybe_rel(query_gt_pose_dir, dataset_root)
+    return build_dataset(str(dataset_root), cfg)
+
+
+def _build_colmap_lift_index(frame):
+    xys = np.asarray(frame.meta.get("xys", ()), dtype=np.float32)
+    point_ids = np.asarray(frame.meta.get("point3D_ids", ()), dtype=np.int64)
+    valid = point_ids >= 0
+    if not np.any(valid):
+        return None
+    return cKDTree(xys[valid]), point_ids[valid]
+
+
+def _run_nearest_lift_localization(
+    *,
+    dataset_root: Path,
+    image_dir: Path,
+    reference_sfm: Path | None,
+    query_list: Path | None,
+    db_prefix: str | None,
+    db_image_list: Path | None,
+    query_gt_pose_dir: Path | None,
+    default_query_camera_from_first_map: bool,
+    retrievals: dict[str, list[str]],
+    query_names: list[str],
+    query_features: Path,
+    db_features: Path,
+    matches_path: Path,
+    results_path: Path,
+    db_lift_thresh_px: float,
+    ransac_thresh: float,
+    pnp_iterations: int,
+    min_match_score: float,
+) -> dict[str, float | int]:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from plm_match.geometry import solve_pnp_ransac
+    from plm_match.pipelines.hloc_localize import write_hloc_results
+    from plm_match.types import Match3D2D
+
+    dataset = _build_colmap_dataset(
+        dataset_root=dataset_root,
+        image_dir=image_dir,
+        reference_sfm=reference_sfm,
+        query_list=query_list,
+        db_prefix=db_prefix,
+        db_image_list=db_image_list,
+        query_gt_pose_dir=query_gt_pose_dir,
+        default_query_camera_from_first_map=default_query_camera_from_first_map,
+    )
+    map_frames = list(dataset.get_map_frames())
+    query_frames = list(dataset.get_query_frames())
+    name_to_map_frame = {_frame_name(frame): frame for frame in map_frames}
+    name_to_query_frame = {_frame_name(frame): frame for frame in query_frames}
+
+    lift_cache: dict[str, tuple[cKDTree, np.ndarray] | None] = {}
+    db_keypoint_cache: dict[str, np.ndarray] = {}
+    rows: list[tuple[str, np.ndarray]] = []
+    total_matches = 0
+    total_lifted = 0
+    total_inliers = 0
+
+    with h5py.File(query_features, "r") as qh5, h5py.File(db_features, "r") as dbh5, h5py.File(matches_path, "r") as mh5:
+        for query_name in query_names:
+            qframe = name_to_query_frame.get(query_name)
+            if qframe is None or qframe.intrinsics is None:
+                continue
+            q_group_name = _feature_group_name(qh5, query_name)
+            if q_group_name is None:
+                continue
+            q_keypoints = np.asarray(qh5[q_group_name]["keypoints"], dtype=np.float32)
+            lifted: dict[tuple[int, int], Match3D2D] = {}
+
+            for db_name in retrievals.get(query_name, []):
+                db_frame = name_to_map_frame.get(db_name)
+                if db_frame is None:
+                    continue
+                db_group_name = _feature_group_name(dbh5, db_name)
+                if db_group_name is None:
+                    continue
+                if db_name not in lift_cache:
+                    lift_cache[db_name] = _build_colmap_lift_index(db_frame)
+                lift_index = lift_cache[db_name]
+                if lift_index is None:
+                    continue
+                tree, valid_point_ids = lift_index
+                if db_group_name not in db_keypoint_cache:
+                    db_keypoint_cache[db_group_name] = np.asarray(dbh5[db_group_name]["keypoints"], dtype=np.float32)
+                db_keypoints = db_keypoint_cache[db_group_name]
+                matches, scores = _read_pair_matches(mh5, query_name, db_name)
+                if matches.size == 0:
+                    continue
+                if float(min_match_score) > 0:
+                    keep = scores >= float(min_match_score)
+                    matches = matches[keep]
+                    scores = scores[keep]
+                    if matches.size == 0:
+                        continue
+                total_matches += int(matches.shape[0])
+                valid_idx = (
+                    (matches[:, 0] >= 0)
+                    & (matches[:, 0] < q_keypoints.shape[0])
+                    & (matches[:, 1] >= 0)
+                    & (matches[:, 1] < db_keypoints.shape[0])
+                )
+                if not np.any(valid_idx):
+                    continue
+                matches = matches[valid_idx]
+                scores = scores[valid_idx]
+                dists, nn = tree.query(db_keypoints[matches[:, 1]], k=1)
+                keep = np.isfinite(dists) & (dists <= float(db_lift_thresh_px))
+                for (qidx, _dbidx), point_id, score in zip(matches[keep], valid_point_ids[nn[keep]], scores[keep]):
+                    point = dataset.points3d.get(int(point_id))
+                    if point is None:
+                        continue
+                    key = (int(qidx), int(point_id))
+                    prev = lifted.get(key)
+                    if prev is not None and prev.score >= float(score):
+                        continue
+                    lifted[key] = Match3D2D(
+                        landmark_id=int(point_id),
+                        uv_query=q_keypoints[int(qidx)].astype(np.float64, copy=False),
+                        xyz_landmark=np.asarray(point.xyz, dtype=np.float64),
+                        score=float(score),
+                        anchor_idx=int(qidx),
+                    )
+
+            matches_3d2d = sorted(lifted.values(), key=lambda m: m.score, reverse=True)
+            total_lifted += len(matches_3d2d)
+            pose = solve_pnp_ransac(
+                matches_3d2d,
+                qframe.intrinsics,
+                reproj_err=float(ransac_thresh),
+                iterations=int(pnp_iterations),
+            )
+            if pose.success and pose.T_wc is not None:
+                rows.append((query_name, pose.T_wc))
+                total_inliers += int(pose.num_inliers)
+
+    write_hloc_results(results_path, rows)
+    return {
+        "nearest_lift_total_pair_matches": int(total_matches),
+        "nearest_lift_total_3d2d": int(total_lifted),
+        "nearest_lift_total_inliers": int(total_inliers),
+        "nearest_lift_mean_3d2d_per_query": float(total_lifted / max(1, len(query_names))),
+        "nearest_lift_mean_inliers_per_success": float(total_inliers / max(1, len(rows))),
+    }
+
+
 @contextlib.contextmanager
 def _single_process_dataloader(torch_module):
     original_dataloader = torch_module.utils.data.DataLoader
@@ -147,9 +389,40 @@ def _single_process_dataloader(torch_module):
         torch_module.utils.data.DataLoader = original_dataloader
 
 
+def _prepare_hloc_shims(
+    *,
+    extractor_conf_name: str | None,
+    matcher_conf_name: str | None,
+    args: argparse.Namespace,
+) -> None:
+    extractor_name = str(extractor_conf_name or "").lower()
+    matcher_name = str(matcher_conf_name or "").lower()
+    superglue_root = Path(args.superglue_root).expanduser().resolve() if args.superglue_root else None
+    superglue_weights_path = (
+        Path(args.superglue_weights_path).expanduser().resolve()
+        if args.superglue_weights_path is not None
+        else None
+    )
+
+    # SuperGlue's shim also exposes MagicLeap SuperPoint under HLoc's expected
+    # import path, so it covers the common SP+SG baseline in one step.
+    if "superglue" in matcher_name:
+        _prepare_superglue_shim(
+            weights=str(args.superglue_weights),
+            weights_path=superglue_weights_path,
+            download_weights=bool(args.download_superglue_weights),
+        )
+    elif "superpoint" in extractor_name:
+        _prepare_superpoint_shim(
+            source_root=superglue_root,
+            download_weights=bool(args.download_superpoint_weights),
+        )
+
+
 def run(args: argparse.Namespace) -> dict:
     preset = DATASET_PRESETS[args.dataset]
     method_preset = METHOD_PRESETS.get(args.method, {})
+    resolved_localizer = args.localizer or ("nearest_lift" if args.dataset in {"aachen", "cambridge"} else "hloc")
 
     dataset_root = Path(args.dataset_root)
     out_dir = Path(args.out_dir)
@@ -163,6 +436,8 @@ def run(args: argparse.Namespace) -> dict:
     retrieval_file = _resolve_path(dataset_root, args.retrieval_file or preset.get("retrieval_file"))
     query_list = _resolve_path(dataset_root, args.query_list or preset.get("query_list"))
     reference_sfm = _resolve_path(dataset_root, args.reference_sfm or preset.get("reference_sfm"))
+    db_image_list = _resolve_path(dataset_root, args.db_image_list)
+    query_gt_pose_dir = _resolve_path(dataset_root, args.query_gt_pose_dir)
     db_prefix = args.db_prefix or preset.get("db_prefix")
     extractor_conf_name = args.extractor_conf or method_preset.get("extractor_conf")
     matcher_conf_name = args.matcher_conf or method_preset.get("matcher_conf")
@@ -176,7 +451,7 @@ def run(args: argparse.Namespace) -> dict:
             f"No extractor/matcher config resolved for method {args.method}. "
             "Pass --extractor-conf and --matcher-conf explicitly."
         )
-    if args.dataset == "aachen" and (reference_sfm is None or not reference_sfm.exists()):
+    if args.dataset in {"aachen", "cambridge"} and (reference_sfm is None or not reference_sfm.exists()):
         raise FileNotFoundError(f"Reference SfM model not found: {reference_sfm}")
 
     extractor_conf = dict(extract_features.confs[extractor_conf_name])
@@ -190,13 +465,22 @@ def run(args: argparse.Namespace) -> dict:
     if args.match_threshold is not None:
         matcher_conf.setdefault("model", {})
         matcher_conf["model"]["match_threshold"] = float(args.match_threshold)
+    if "superglue" in str(matcher_conf_name).lower():
+        matcher_conf.setdefault("model", {})
+        matcher_conf["model"]["weights"] = str(args.superglue_weights)
+
+    _prepare_hloc_shims(
+        extractor_conf_name=extractor_conf_name,
+        matcher_conf_name=matcher_conf_name,
+        args=args,
+    )
 
     retrievals = parse_retrieval(retrieval_file)
     query_names = _query_names(query_list, parse_image_lists, parse_retrieval, retrieval_file)
-    db_names = _list_db_images(image_dir, db_prefix) if db_prefix else []
+    db_names = _read_name_list(db_image_list) if db_image_list is not None else (_list_db_images(image_dir, db_prefix) if db_prefix else [])
     if args.dataset == "inloc":
         db_names = sorted({name for names in retrievals.values() for name in names})
-    if args.dataset == "aachen" and not db_names:
+    if args.dataset in {"aachen", "cambridge"} and not db_names:
         raise RuntimeError(f"No database images found under {image_dir} with prefix {db_prefix!r}")
 
     query_features = artifacts_dir / f"{extractor_conf['output']}_queries.h5"
@@ -223,7 +507,7 @@ def run(args: argparse.Namespace) -> dict:
 
     # Database features are preprocessing and are kept separate from per-query runtime.
     t_db0 = time.perf_counter()
-    if args.dataset == "aachen":
+    if args.dataset in {"aachen", "cambridge"}:
         with _single_process_dataloader(extract_features.torch):
             extract_features.main(
                 extractor_conf,
@@ -246,7 +530,7 @@ def run(args: argparse.Namespace) -> dict:
     t_db = time.perf_counter() - t_db0
 
     t_query0 = time.perf_counter()
-    if args.dataset == "aachen":
+    if args.dataset in {"aachen", "cambridge"}:
         with _single_process_dataloader(extract_features.torch):
             extract_features.main(
                 extractor_conf,
@@ -266,23 +550,46 @@ def run(args: argparse.Namespace) -> dict:
             features=query_features,
             export_dir=artifacts_dir,
             matches=matches_path,
-            features_ref=(db_features if args.dataset == "aachen" else None),
+            features_ref=(db_features if args.dataset in {"aachen", "cambridge"} else None),
             overwrite=args.overwrite,
         )
     t_match = time.perf_counter() - t_match0
 
     t_loc0 = time.perf_counter()
-    if args.dataset == "aachen":
-        localize_sfm.main(
-            reference_sfm,
-            query_list,
-            filtered_retrieval_file,
-            query_features,
-            matches_path,
-            results_path,
-            ransac_thresh=float(args.ransac_thresh),
-            covisibility_clustering=bool(args.covisibility_clustering),
-        )
+    nearest_lift_summary: dict[str, float | int] = {}
+    if args.dataset in {"aachen", "cambridge"}:
+        if resolved_localizer == "hloc":
+            localize_sfm.main(
+                reference_sfm,
+                query_list,
+                filtered_retrieval_file,
+                query_features,
+                matches_path,
+                results_path,
+                ransac_thresh=float(args.ransac_thresh),
+                covisibility_clustering=bool(args.covisibility_clustering),
+            )
+        else:
+            nearest_lift_summary = _run_nearest_lift_localization(
+                dataset_root=dataset_root,
+                image_dir=image_dir,
+                reference_sfm=reference_sfm,
+                query_list=query_list,
+                db_prefix=db_prefix,
+                db_image_list=db_image_list,
+                query_gt_pose_dir=query_gt_pose_dir,
+                default_query_camera_from_first_map=bool(args.default_query_camera_from_first_map),
+                retrievals=retrievals,
+                query_names=query_names,
+                query_features=query_features,
+                db_features=db_features,
+                matches_path=matches_path,
+                results_path=results_path,
+                db_lift_thresh_px=float(args.db_lift_thresh_px),
+                ransac_thresh=float(args.ransac_thresh),
+                pnp_iterations=int(args.pnp_iterations),
+                min_match_score=float(args.min_match_score),
+            )
     else:
         localize_inloc.main(
             dataset_root,
@@ -296,8 +603,8 @@ def run(args: argparse.Namespace) -> dict:
     t_total = time.perf_counter() - t_total0
 
     num_queries = len(query_names)
-    db_feature_time_s = float(t_db if args.dataset == "aachen" else 0.0)
-    query_feature_time_s = float(t_query if args.dataset == "aachen" else t_db)
+    db_feature_time_s = float(t_db if args.dataset in {"aachen", "cambridge"} else 0.0)
+    query_feature_time_s = float(t_query if args.dataset in {"aachen", "cambridge"} else t_db)
     summary = {
         "runner": "hloc_baseline",
         "dataset": args.dataset,
@@ -318,13 +625,26 @@ def run(args: argparse.Namespace) -> dict:
         "mean_query_time_s": float((query_feature_time_s + t_match + t_loc) / max(1, num_queries)),
         "results_file": str(results_path),
         "query_features": str(query_features),
-        "db_features": (str(db_features) if args.dataset == "aachen" else None),
+        "db_features": (str(db_features) if args.dataset in {"aachen", "cambridge"} else None),
         "matches_file": str(matches_path),
+        "localizer": str(resolved_localizer),
     }
+    summary.update(nearest_lift_summary)
     _write_json(out_dir / "run_summary.json", summary)
 
-    if args.dataset == "aachen":
-        metrics = _evaluate_aachen(results_path, dataset_root, query_list, summary)
+    if args.dataset in {"aachen", "cambridge"}:
+        metrics = _evaluate_colmap_localization(
+            results_path=results_path,
+            dataset_root=dataset_root,
+            image_dir=image_dir,
+            reference_sfm=reference_sfm,
+            query_list=query_list,
+            db_prefix=db_prefix,
+            db_image_list=db_image_list,
+            query_gt_pose_dir=query_gt_pose_dir,
+            default_query_camera_from_first_map=bool(args.default_query_camera_from_first_map),
+            summary=summary,
+        )
         if metrics is not None:
             _write_json(out_dir / "metrics.json", metrics)
 
@@ -369,15 +689,32 @@ def _trans_err_m(T_est: np.ndarray, T_gt: np.ndarray) -> float:
     return float(np.linalg.norm(T_est[:3, 3] - T_gt[:3, 3]))
 
 
-def _evaluate_aachen(
+def _maybe_rel(path: Path | None, root: Path) -> str | None:
+    if path is None:
+        return None
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def _evaluate_colmap_localization(
+    *,
     results_path: Path,
     dataset_root: Path,
+    image_dir: Path,
+    reference_sfm: Path | None,
     query_list: Path | None,
+    db_prefix: str | None,
+    db_image_list: Path | None,
+    query_gt_pose_dir: Path | None,
+    default_query_camera_from_first_map: bool,
     summary: dict,
 ) -> dict | None:
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from plm_match.datasets import build_dataset
+        from plm_match.utils.io import read_pose_txt
         from plm_match.utils.pose import rotation_error_deg, translation_error
     except Exception:
         return None
@@ -393,12 +730,18 @@ def _evaluate_aachen(
     try:
         cfg = {
             "type": "colmap_localization",
-            "image_root": "images_upright",
-            "model_path": "3D-models/aachen_v_1_1",
-            "db_image_prefixes": ["db/"],
+            "image_root": _maybe_rel(image_dir, dataset_root),
+            "model_path": _maybe_rel(reference_sfm, dataset_root),
+            "default_query_camera_from_first_map": bool(default_query_camera_from_first_map),
         }
+        if db_image_list is not None and db_image_list.exists():
+            cfg["db_image_names_file"] = _maybe_rel(db_image_list, dataset_root)
+        elif db_prefix:
+            cfg["db_image_prefixes"] = [db_prefix]
         if query_list is not None and query_list.exists():
-            cfg["query_list"] = str(query_list.relative_to(dataset_root) if query_list.is_relative_to(dataset_root) else query_list)
+            cfg["query_list"] = _maybe_rel(query_list, dataset_root)
+        if query_gt_pose_dir is not None and query_gt_pose_dir.exists():
+            cfg["query_gt_pose_dir"] = _maybe_rel(query_gt_pose_dir, dataset_root)
         dataset = build_dataset(str(dataset_root), cfg)
         query_frames = dataset.get_query_frames()
     except Exception:
@@ -408,6 +751,11 @@ def _evaluate_aachen(
     for frame in query_frames:
         name = str(frame.meta.get("relative_path", frame.image_path.name))
         gt_pose = frame.pose
+        if gt_pose is None and getattr(frame, "pose_path", None) is not None and Path(frame.pose_path).exists():
+            try:
+                gt_pose = read_pose_txt(frame.pose_path)
+            except Exception:
+                gt_pose = None
         pred_pose = predicted.get(name)
         row: dict = {"query": name, "success": pred_pose is not None}
         if pred_pose is not None and gt_pose is not None:
@@ -447,15 +795,36 @@ def main() -> None:
     parser.add_argument("--query_list", type=str, default=None)
     parser.add_argument("--retrieval_file", type=str, default=None)
     parser.add_argument("--db_prefix", type=str, default=None)
+    parser.add_argument("--db_image_list", type=str, default=None)
+    parser.add_argument("--query_gt_pose_dir", type=str, default=None)
+    parser.add_argument("--default_query_camera_from_first_map", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--localizer",
+        choices=("nearest_lift", "hloc"),
+        default=None,
+        help=(
+            "Localization backend for external COLMAP models. "
+            "nearest_lift maps fresh DB keypoints back to nearest COLMAP observations before PnP; "
+            "hloc uses stock hloc.localize_sfm and only works when DB feature indices match the SfM."
+        ),
+    )
     parser.add_argument("--extractor_conf", type=str, default=None)
     parser.add_argument("--matcher_conf", type=str, default=None)
     parser.add_argument("--max_keypoints", type=int, default=None)
     parser.add_argument("--resize_max", type=int, default=None)
     parser.add_argument("--match_threshold", type=float, default=None)
     parser.add_argument("--ransac_thresh", type=float, default=12.0)
+    parser.add_argument("--db_lift_thresh_px", type=float, default=4.0)
+    parser.add_argument("--pnp_iterations", type=int, default=8000)
+    parser.add_argument("--min_match_score", type=float, default=0.0)
     parser.add_argument("--skip_matches", type=int, default=None)
     parser.add_argument("--covisibility_clustering", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--superglue_root", type=str, default=None)
+    parser.add_argument("--superglue_weights", choices=("outdoor", "indoor"), default="outdoor")
+    parser.add_argument("--superglue_weights_path", type=str, default=None)
+    parser.add_argument("--download_superglue_weights", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--download_superpoint_weights", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
     summary = run(args)
     print(json.dumps(summary, indent=2))

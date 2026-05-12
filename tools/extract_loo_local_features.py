@@ -99,15 +99,18 @@ def _prepare_superpoint_shim(*, source_root: Path | None, download_weights: bool
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Extract HLoc local features for an Aachen LOO split.")
+    parser = argparse.ArgumentParser(description="Extract HLoc local features for a split with disjoint map/query images.")
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--split_json", required=True, type=Path)
     parser.add_argument("--out_dir", required=True, type=Path)
     parser.add_argument("--dataset_root", type=Path, default=None)
+    parser.add_argument("--image_root", type=Path, default=None, help="Shared image root for map and query lists.")
+    parser.add_argument("--map_image_root", type=Path, default=None, help="Image root for map image names.")
+    parser.add_argument("--query_image_root", type=Path, default=None, help="Image root for query image names.")
     parser.add_argument("--hloc_root", type=Path, default=None)
-    parser.add_argument("--extractor_conf", type=str, default="d2net-ss")
+    parser.add_argument("--extractor_conf", type=str, default="superpoint_max")
     parser.add_argument("--resize_max", type=int, default=1600)
-    parser.add_argument("--max_keypoints", type=int, default=0)
+    parser.add_argument("--max_keypoints", type=int, default=4096)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--superglue_root", type=Path, default=None)
     parser.add_argument("--download_superpoint_weights", action=argparse.BooleanOptionalAction, default=True)
@@ -115,10 +118,37 @@ def main() -> None:
 
     cfg = load_config(args.config)
     split = load_split(args.split_json)
+    fine_method = str(cfg.get("matching", {}).get("fine_rerank", {}).get("method", "")).lower()
+    if "superpoint" in fine_method and "superpoint" not in str(args.extractor_conf).lower():
+        print(
+            "Warning: config requests superpoint_h5 descriptors but --extractor_conf is not SuperPoint "
+            f"({args.extractor_conf!r}). This can build a mismatched lifted-NN index.",
+            file=sys.stderr,
+        )
     dataset_root = args.dataset_root or Path(split.get("dataset_root") or cfg["dataset_root"])
-    image_dir = dataset_root / cfg.get("dataset", {}).get("image_root", "images_upright")
-    if not image_dir.exists():
-        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+    shared_root = (
+        args.image_root
+        or (Path(split["feature_image_root"]) if split.get("feature_image_root") else None)
+        or Path(cfg.get("dataset", {}).get("image_root", "images_upright"))
+    )
+    map_image_root = (
+        args.map_image_root
+        or (Path(split["feature_map_image_root"]) if split.get("feature_map_image_root") else None)
+        or shared_root
+    )
+    query_image_root = (
+        args.query_image_root
+        or (Path(split["feature_query_image_root"]) if split.get("feature_query_image_root") else None)
+        or shared_root
+    )
+    if not map_image_root.is_absolute():
+        map_image_root = dataset_root / map_image_root
+    if not query_image_root.is_absolute():
+        query_image_root = dataset_root / query_image_root
+    if not map_image_root.exists():
+        raise FileNotFoundError(f"Map image directory not found: {map_image_root}")
+    if not query_image_root.exists():
+        raise FileNotFoundError(f"Query image directory not found: {query_image_root}")
 
     if "superpoint" in str(args.extractor_conf).lower():
         _prepare_superpoint_shim(
@@ -147,7 +177,7 @@ def main() -> None:
         with _single_process_dataloader(extract_features.torch):
             extract_features.main(
                 extractor_conf,
-                image_dir,
+                map_image_root,
                 export_dir=args.out_dir,
                 image_list=map_names,
                 feature_path=db_features,
@@ -159,7 +189,7 @@ def main() -> None:
         with _single_process_dataloader(extract_features.torch):
             extract_features.main(
                 extractor_conf,
-                image_dir,
+                query_image_root,
                 export_dir=args.out_dir,
                 image_list=query_names,
                 feature_path=query_features,
@@ -171,11 +201,14 @@ def main() -> None:
         "resize_max": int(args.resize_max),
         "db_features_path": str(db_features),
         "query_features_path": str(query_features),
+        "map_image_root": str(map_image_root),
+        "query_image_root": str(query_image_root),
         "num_db_images": int(len(map_names)),
         "num_query_images": int(len(query_names)),
         "time_s": float(time.perf_counter() - t0),
     }
     write_json(args.out_dir / "local_features_summary.json", summary)
+    (args.out_dir / "command.txt").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
     print(summary)
 
 

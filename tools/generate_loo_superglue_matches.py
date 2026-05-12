@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
+import h5py
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -213,6 +214,48 @@ def _write_pairs_from_retrieval(
     return num_pairs
 
 
+def _read_feature_group_names(path: Path) -> set[str]:
+    names: set[str] = set()
+    with h5py.File(path, "r") as hfile:
+        def visitor(name: str, obj) -> None:
+            if isinstance(obj, h5py.Group) and "keypoints" in obj:
+                names.add(str(name))
+
+        hfile.visititems(visitor)
+    return names
+
+
+def _validate_pair_features(
+    *,
+    pairs_path: Path,
+    query_features: Path,
+    db_features: Path,
+    max_examples: int = 8,
+) -> None:
+    query_names = _read_feature_group_names(query_features)
+    db_names = _read_feature_group_names(db_features)
+    missing_q: list[str] = []
+    missing_db: list[str] = []
+    with open(pairs_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+            q, db = parts
+            if q not in query_names and len(missing_q) < max_examples:
+                missing_q.append(q)
+            if db not in db_names and len(missing_db) < max_examples:
+                missing_db.append(db)
+    if missing_q or missing_db:
+        msg = ["Feature H5 files do not cover the generated SuperGlue pairs."]
+        if missing_q:
+            msg.append(f"Missing query-side keys in {query_features}: {missing_q}")
+        if missing_db:
+            msg.append(f"Missing DB-side keys in {db_features}: {missing_db}")
+        msg.append("For LOO, held-out DB images must be read from query_features_path and references from db_features_path.")
+        raise KeyError("\n".join(msg))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser("Generate real SuperGlue matches for DB leave-one-out pairs.")
     parser.add_argument("--config", required=True, type=Path)
@@ -227,6 +270,7 @@ def main() -> None:
         help="Use this LOO retrieval file for SuperGlue pairs instead of oracle nearest-pose pairs.",
     )
     parser.add_argument("--db_features_path", type=Path, default=None)
+    parser.add_argument("--query_features_path", type=Path, default=None)
     parser.add_argument("--weights", choices=("outdoor", "indoor"), default="outdoor")
     parser.add_argument("--weights_path", type=Path, default=None)
     parser.add_argument("--download_weights", action="store_true")
@@ -248,6 +292,10 @@ def main() -> None:
     db_features = _resolve(ROOT, db_features)
     if not db_features.exists():
         raise FileNotFoundError(f"DB SuperPoint feature H5 not found: {db_features}")
+    query_features = args.query_features_path or fine_cfg.get("query_features_path") or db_features
+    query_features = _resolve(ROOT, query_features)
+    if not query_features.exists():
+        raise FileNotFoundError(f"Query SuperPoint feature H5 not found: {query_features}")
 
     pairs_path = args.pairs_path or (args.loo_dir / "superglue_loo_pairs.txt")
     matches_path = args.matches_path or (args.loo_dir / "superglue_loo_matches.h5")
@@ -261,6 +309,11 @@ def main() -> None:
     else:
         n_pairs = _write_pairs(cfg=cfg, split_path=split_path, pairs_path=pairs_path, topk=args.topk_db_images)
     print(f"Wrote {n_pairs} LOO SuperGlue pairs to {pairs_path}")
+    _validate_pair_features(
+        pairs_path=pairs_path,
+        query_features=query_features,
+        db_features=db_features,
+    )
     if args.write_pairs_only:
         return
 
@@ -283,7 +336,7 @@ def main() -> None:
     match_features.main(
         conf,
         pairs_path,
-        features=db_features,
+        features=query_features,
         features_ref=db_features,
         matches=matches_path,
         overwrite=bool(args.overwrite),

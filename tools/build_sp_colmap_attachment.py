@@ -336,6 +336,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         "max_colmap_point_error": float(max_error) if max_error is not None else None,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    (out_dir / "command.txt").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
     return summary
 
 

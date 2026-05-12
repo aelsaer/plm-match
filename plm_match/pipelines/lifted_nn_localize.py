@@ -5,6 +5,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Sequence
 
@@ -250,7 +251,13 @@ def _split_names(split: dict[str, object], key: str) -> list[str]:
     return [str(item["name"]) for item in values if isinstance(item, dict) and "name" in item]
 
 
-def _select_frames_by_names(frames: Sequence[object], names: Sequence[str], *, label: str) -> list[object]:
+def _select_frames_by_names(
+    frames: Sequence[object],
+    names: Sequence[str],
+    *,
+    label: str,
+    source_label: str = "frames",
+) -> list[object]:
     lookup: dict[str, object] = {}
     for frame in frames:
         name = _frame_name(frame)
@@ -269,8 +276,34 @@ def _select_frames_by_names(frames: Sequence[object], names: Sequence[str], *, l
             continue
         selected.append(item)
     if missing:
-        raise ValueError(f"{len(missing)} {label} were not found in the COLMAP map frames; first missing: {missing[0]}")
+        raise ValueError(f"{len(missing)} {label} were not found in {source_label}; first missing: {missing[0]}")
     return selected
+
+
+def _split_file_path(
+    split: dict[str, object],
+    key: str,
+    *,
+    split_json: Path | None,
+    dataset_root: str | Path | None,
+) -> Path | None:
+    value = split.get(key)
+    if not isinstance(value, str) or not value:
+        return None
+    raw = Path(value)
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append(raw)
+        if split_json is not None:
+            candidates.append(Path(split_json).resolve().parent / raw)
+        if dataset_root is not None:
+            candidates.append(Path(dataset_root) / raw)
+    for cand in candidates:
+        if cand.exists():
+            return cand.resolve()
+    return raw if raw.is_absolute() else (Path.cwd() / raw).resolve()
 
 
 def _query_candidates(frame) -> list[str]:
@@ -752,7 +785,36 @@ def _pose_guided_hypotheses(
     return out
 
 
-def _summarize_metrics(metrics: list[dict]) -> dict[str, object]:
+def _parse_metric_thresholds(value: object | None) -> tuple[tuple[float, float], ...]:
+    if value is None:
+        return ((0.25, 2.0), (0.5, 5.0), (5.0, 10.0))
+    if isinstance(value, str):
+        pairs = []
+        for item in value.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "/" in item:
+                t_s, r_s = item.split("/", 1)
+            elif ":" in item:
+                t_s, r_s = item.split(":", 1)
+            else:
+                raise ValueError(f"Metric threshold {item!r} must be formatted as '<meters>/<degrees>'")
+            pairs.append((float(t_s), float(r_s)))
+        return tuple(pairs) if pairs else ((0.25, 2.0), (0.5, 5.0), (5.0, 10.0))
+    if isinstance(value, (list, tuple)):
+        pairs = []
+        for item in value:
+            if isinstance(item, dict):
+                pairs.append((float(item["trans_m"]), float(item["rot_deg"])))
+            else:
+                t, r = item
+                pairs.append((float(t), float(r)))
+        return tuple(pairs) if pairs else ((0.25, 2.0), (0.5, 5.0), (5.0, 10.0))
+    raise ValueError(f"Unsupported metric threshold spec: {value!r}")
+
+
+def _summarize_metrics(metrics: list[dict], *, thresholds: object | None = None) -> dict[str, object]:
     num = len(metrics)
     succ = sum(1 for m in metrics if bool(m.get("success", False)))
     out: dict[str, object] = {
@@ -781,7 +843,7 @@ def _summarize_metrics(metrics: list[dict]) -> dict[str, object]:
     if trans:
         out["median_trans_err_m"] = float(np.median(np.asarray(trans, dtype=np.float64)))
         out["mean_trans_err_m"] = float(np.mean(np.asarray(trans, dtype=np.float64)))
-    for t_th, r_th in ((0.25, 2.0), (0.5, 5.0), (5.0, 10.0)):
+    for t_th, r_th in _parse_metric_thresholds(thresholds):
         ok = sum(
             1
             for m in metrics
@@ -1099,8 +1161,25 @@ def run(args: argparse.Namespace) -> dict:
     if split is not None:
         dataset_cfg.pop("db_image_names_file", None)
         dataset_cfg.pop("max_map_frames", None)
-        dataset_cfg.pop("query_list", None)
-        dataset_cfg.pop("query_gt_pose_dir", None)
+        dataset_type = str(dataset_cfg.get("type", "")).lower()
+        split_kind = str(split.get("kind", "")).lower()
+        if dataset_type in {"colmap_localization", "hloc_colmap", "colmap"} and split_kind != "aachen_db_leave_one_out":
+            query_list_path = (
+                _split_file_path(split, "hloc_query_list", split_json=args.split_json, dataset_root=dataset_root)
+                or _split_file_path(split, "query_list", split_json=args.split_json, dataset_root=dataset_root)
+            )
+            query_gt_dir = _split_file_path(split, "query_gt_pose_dir", split_json=args.split_json, dataset_root=dataset_root)
+            if query_list_path is not None:
+                dataset_cfg["query_list"] = str(query_list_path)
+            else:
+                dataset_cfg.pop("query_list", None)
+            if query_gt_dir is not None:
+                dataset_cfg["query_gt_pose_dir"] = str(query_gt_dir)
+            else:
+                dataset_cfg.pop("query_gt_pose_dir", None)
+        else:
+            dataset_cfg.pop("query_list", None)
+            dataset_cfg.pop("query_gt_pose_dir", None)
     dataset = build_dataset(str(dataset_root), dataset_cfg)
     lnn_cfg = cfg.get("lifted_nn", {})
     if not isinstance(lnn_cfg, dict):
@@ -1116,14 +1195,35 @@ def run(args: argparse.Namespace) -> dict:
     extractor = _make_fine_extractor(cfg, args)
     runtime_cfg = _runtime_cfg(cfg, args)
     all_map_frames = list(dataset.get_map_frames())
+    all_query_frames = list(dataset.get_query_frames())
     if split is not None:
         split_query_names = _split_names(split, "queries")
         split_map_names = _split_names(split, "map_images")
-        query_frames = _select_frames_by_names(all_map_frames, split_query_names, label="split queries")
-        map_frames = _select_frames_by_names(all_map_frames, split_map_names, label="split map images")
+        map_frames = _select_frames_by_names(
+            all_map_frames,
+            split_map_names,
+            label="split map images",
+            source_label="dataset map frames",
+        )
+        try:
+            query_frames = _select_frames_by_names(
+                all_query_frames,
+                split_query_names,
+                label="split queries",
+                source_label="dataset query frames",
+            )
+        except ValueError:
+            if getattr(dataset, "map_mode", "") != "colmap":
+                raise
+            query_frames = _select_frames_by_names(
+                all_map_frames,
+                split_query_names,
+                label="split queries",
+                source_label="dataset map frames",
+            )
         runtime_cfg["allowed_db_names"] = set(split_map_names)
     else:
-        query_frames = list(dataset.get_query_frames())
+        query_frames = all_query_frames
         map_frames = all_map_frames
     name_to_frame = _map_name_lookup(map_frames)
     max_queries = args.max_queries if args.max_queries is not None else cfg.get("map", {}).get("max_queries", None)
@@ -1151,7 +1251,10 @@ def run(args: argparse.Namespace) -> dict:
     finally:
         extractor.close()
 
-    summary = _summarize_metrics(metrics)
+    metric_thresholds = args.metric_thresholds
+    if metric_thresholds is None:
+        metric_thresholds = lnn_cfg.get("metric_thresholds")
+    summary = _summarize_metrics(metrics, thresholds=metric_thresholds)
     summary.update(
         {
             "attached_index": str(attached_path),
@@ -1166,11 +1269,13 @@ def run(args: argparse.Namespace) -> dict:
             "rank_weight": float(runtime_cfg["rank_weight"]),
             "mutual_nn": bool(runtime_cfg["mutual"]),
             "pose_guided": bool(runtime_cfg["pose_guided"]),
+            "metric_thresholds": [list(x) for x in _parse_metric_thresholds(metric_thresholds)],
         }
     )
     payload = {"dataset": dataset.describe(), "frames": metrics, "summary": summary}
     write_json(out_dir / "metrics.json", payload)
     write_json(out_dir / "run_summary.json", summary)
+    (out_dir / "command.txt").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
     _write_hloc_results(out_dir / "hloc_results.txt", pose_rows)
     _write_hloc_results(out_dir / "predictions_tcw.txt", pose_rows)
     return payload
@@ -1218,6 +1323,12 @@ def main() -> None:
     parser.add_argument("--patch_size", type=int, default=None)
     parser.add_argument("--index_cache_size", type=int, default=128)
     parser.add_argument("--max_queries", type=int, default=None)
+    parser.add_argument(
+        "--metric_thresholds",
+        type=str,
+        default=None,
+        help="Comma-separated '<meters>/<degrees>' thresholds, e.g. '0.05/5,0.1/5,0.25/10'.",
+    )
     args = parser.parse_args()
 
     payload = run(args)

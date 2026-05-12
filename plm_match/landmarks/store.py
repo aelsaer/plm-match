@@ -376,12 +376,14 @@ class CompactLandmarkStore:
             'obs_track_reproj_error.npy': getattr(self, 'obs_track_reproj_error', None),
             'obs_track_parallax.npy': getattr(self, 'obs_track_parallax', None),
         }
-        has_track_meta = bool(
-            getattr(self, 'obs_track_len', None) is not None
-            and np.any(np.asarray(self.obs_track_len) > 0)
-        )
         for name, arr in optional_obs_arrays.items():
-            if has_track_meta and arr is not None and int(getattr(arr, 'shape', (0,))[0]) == int(self.obs_frame_ids.shape[0]):
+            save_arr = False
+            if arr is not None and int(getattr(arr, 'shape', (0,))[0]) == int(self.obs_frame_ids.shape[0]):
+                arr_np = np.asarray(arr)
+                if arr_np.size > 0:
+                    finite = np.isfinite(arr_np.astype(np.float32, copy=False))
+                    save_arr = bool(np.any(finite & (arr_np != 0)))
+            if save_arr:
                 np.save(root / name, arr)
             else:
                 (root / name).unlink(missing_ok=True)
@@ -824,6 +826,7 @@ def build_compact_store_from_groups(
     obs_offsets = np.zeros((n_capacity + 1,), dtype=np.int64)
     obs_frame_ids = np.zeros((total_obs_capacity,), dtype=np.int32)
     obs_uvs = np.zeros((total_obs_capacity, 2), dtype=np.float16)
+    obs_reproj_errors = np.zeros((total_obs_capacity,), dtype=np.float16)
 
     lm_ptr = 0
     obs_ptr = 0
@@ -888,6 +891,7 @@ def build_compact_store_from_groups(
         for obs in observations:
             obs_frame_ids[obs_ptr] = int(obs.frame_id)
             obs_uvs[obs_ptr] = np.asarray(obs.uv, dtype=np.float16)
+            obs_reproj_errors[obs_ptr] = np.float16(float(obs.reproj_error))
             if fine_obs_descs_arr is not None and obs.fine_desc is not None:
                 fine_obs_descs_arr[obs_ptr] = np.asarray(obs.fine_desc, dtype=np.float16)
             obs_ptr += 1
@@ -918,6 +922,7 @@ def build_compact_store_from_groups(
         fine_basis=None,
         fine_eigvals=None,
         fine_sigma_perp2=None,
+        obs_track_reproj_error=obs_reproj_errors[:obs_ptr],
     )
     store.build_image_to_landmarks_index()
     return store
