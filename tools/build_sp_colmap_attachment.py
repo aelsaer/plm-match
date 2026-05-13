@@ -160,6 +160,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     image_obs_dir = ensure_dir(out_dir / "image_to_attached_obs")
     fine_extractor = _make_fine_extractor(cfg, args)
     uses_named_h5 = is_h5_local_feature_method(getattr(fine_extractor, "method", ""))
+    method_name = str(getattr(fine_extractor, "method", args.method or "local")).lower()
     descriptor_dtype = np.float16 if str(args.descriptor_dtype).lower() == "float16" else np.float32
 
     image_names = split_map_names if split_map_names is not None else (_read_names(args.image_names) if args.image_names is not None else None)
@@ -185,7 +186,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     descriptor_dim = int(getattr(fine_extractor, "dim", 0))
 
     try:
-        for frame_id, frame, image_name in tqdm(frames, desc="Attaching SP to COLMAP", unit="image"):
+        for frame_id, frame, image_name in tqdm(frames, desc=f"Attaching {method_name} to COLMAP", unit="image"):
             image_id = int(frame.meta.get("image_id", -1))
             sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints(image_name, topk=int(args.max_keypoints))
             if sp_kpts.shape[0] == 0 and not uses_named_h5:
@@ -324,6 +325,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     summary = {
         "out_dir": str(out_dir),
         "dataset_root": str(dataset_root),
+        "method": method_name,
         "split_json": str(args.split_json) if args.split_json is not None else None,
         "num_db_images": int(len(frames)),
         "num_images_with_attached_obs": int(frames_with_obs),
@@ -342,7 +344,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Attach SuperPoint keypoints to nearest valid COLMAP observations for each DB image."
+        description="Attach local feature keypoints to nearest valid COLMAP observations for each DB image."
     )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--dataset_root", type=str, default=None)

@@ -155,6 +155,7 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
     image_obs_dir = ensure_dir(out_dir / "image_to_attached_obs")
     fine_extractor = _make_fine_extractor(cfg, args)
     uses_named_h5 = is_h5_local_feature_method(getattr(fine_extractor, "method", ""))
+    method_name = str(getattr(fine_extractor, "method", args.method or "local")).lower()
     descriptor_dtype = np.float16 if str(args.descriptor_dtype).lower() == "float16" else np.float32
 
     merger = VoxelLandmarkMerger(float(args.merge_radius_m))
@@ -171,7 +172,7 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
         frames = list(dataset.get_map_frames())
         if int(args.max_images) > 0:
             frames = frames[: int(args.max_images)]
-        for frame_id, frame in tqdm(list(enumerate(frames)), desc="Building RGB-D SP memory", unit="image"):
+        for frame_id, frame in tqdm(list(enumerate(frames)), desc=f"Building RGB-D {method_name} memory", unit="image"):
             image_name = _frame_name(frame)
             sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints(image_name, topk=int(args.max_keypoints))
             if sp_kpts.shape[0] == 0 and not uses_named_h5:
@@ -332,6 +333,7 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
     summary = {
         "out_dir": str(out_dir),
         "dataset_root": str(dataset_root),
+        "method": method_name,
         "num_db_images": int(len(frame_records)),
         "num_images_with_attached_obs": int(frames_with_obs),
         "num_attached_observations": int(total_obs),
@@ -349,7 +351,7 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build an attached SuperPoint landmark memory from RGB-D map frames.")
+    parser = argparse.ArgumentParser(description="Build an attached local-feature landmark memory from RGB-D map frames.")
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--dataset_root", type=Path, default=None)
     parser.add_argument("--out_dir", required=True, type=Path)
