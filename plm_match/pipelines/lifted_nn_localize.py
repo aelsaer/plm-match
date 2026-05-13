@@ -59,6 +59,7 @@ class LiftedHypothesis:
     db_image: str
     rank_prior: float
     attach_dist: float = 0.0
+    support_images: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -102,12 +103,17 @@ class AttachedSPCOLMAPIndex:
         self.descriptor_dim = (
             int(np.asarray(entries["descriptor_dim"]).reshape(())) if "descriptor_dim" in entries.files else 0
         )
+        self.attach_radius_px = (
+            float(np.asarray(entries["attach_radius_px"]).reshape(())) if "attach_radius_px" in entries.files else 0.0
+        )
         self.image_obs_dir = self.root / "image_to_attached_obs"
         self.point_ids = self._load_array("point_ids.npy", dtype=np.int64)
         self.point_xyz = self._load_array("point_xyz.npy", dtype=np.float32)
         self.point_obs_offsets = self._load_array("point_obs_offsets.npy", dtype=np.int64)
         self.point_obs_descs = self._load_array("point_obs_descs.npy", dtype=np.float32)
+        self.point_obs_frame_ids = self._load_array("point_obs_frame_ids.npy", dtype=np.int32)
         self._point_id_to_global_idx = {int(pid): int(i) for i, pid in enumerate(self.point_ids.tolist())}
+        self._point_mean_descs: np.ndarray | None = None
         self.cache_size = max(1, int(cache_size))
         self._cache: OrderedDict[int, AttachedImageObservations] = OrderedDict()
         self._name_to_idx: dict[str, int] = {}
@@ -213,6 +219,98 @@ class AttachedSPCOLMAPIndex:
         q = np.asarray(q_desc, dtype=np.float32).reshape(-1)
         sims = descs @ q
         return float(np.max(sims)) if sims.size else 0.0
+
+    def candidate_point_ids_for_images(self, image_names: Sequence[str]) -> np.ndarray:
+        """Return unique point ids observed by attached observations of images."""
+        chunks: list[np.ndarray] = []
+        for image_name in image_names:
+            obs = self.get(str(image_name))
+            if obs.point_ids.shape[0] > 0:
+                chunks.append(obs.point_ids.astype(np.int64, copy=False))
+        if not chunks:
+            return np.zeros((0,), dtype=np.int64)
+        point_ids = np.concatenate(chunks, axis=0)
+        point_ids = point_ids[point_ids >= 0]
+        if point_ids.shape[0] == 0:
+            return np.zeros((0,), dtype=np.int64)
+        return np.unique(point_ids).astype(np.int64, copy=False)
+
+    def point_indices_for_ids(self, point_ids: np.ndarray) -> np.ndarray:
+        out = np.full((int(np.asarray(point_ids).reshape(-1).shape[0]),), -1, dtype=np.int64)
+        for i, pid in enumerate(np.asarray(point_ids, dtype=np.int64).reshape(-1).tolist()):
+            idx = self._point_id_to_global_idx.get(int(pid))
+            if idx is not None:
+                out[int(i)] = int(idx)
+        return out
+
+    def point_mean_descriptors(self) -> np.ndarray:
+        """Compute and cache one normalized mean descriptor per landmark."""
+        if self._point_mean_descs is not None:
+            return self._point_mean_descs
+        num_points = int(self.point_ids.shape[0])
+        dim = int(self.point_obs_descs.shape[1]) if self.point_obs_descs.ndim == 2 else int(self.descriptor_dim)
+        means = np.zeros((num_points, dim), dtype=np.float32)
+        offsets = np.asarray(self.point_obs_offsets, dtype=np.int64)
+        for idx in range(num_points):
+            if idx + 1 >= offsets.shape[0]:
+                break
+            start = int(offsets[idx])
+            end = int(offsets[idx + 1])
+            if end <= start:
+                continue
+            descs = np.asarray(self.point_obs_descs[start:end], dtype=np.float32)
+            mean = np.mean(descs, axis=0)
+            norm = float(np.linalg.norm(mean))
+            if norm > 1e-8:
+                means[idx] = mean / norm
+        self._point_mean_descs = means
+        return self._point_mean_descs
+
+    def point_support_for_images(
+        self,
+        image_names: Sequence[str],
+        *,
+        rank_by_name: dict[str, int] | None = None,
+        rank_tau: float = 10.0,
+    ) -> dict[int, dict[str, object]]:
+        """Return support count/images and best rank prior for points in images."""
+        support: dict[int, dict[str, object]] = {}
+        for order_rank, image_name in enumerate(image_names):
+            image_name = str(image_name)
+            obs = self.get(image_name)
+            if obs.point_ids.shape[0] == 0:
+                continue
+            rank = int(rank_by_name.get(image_name, order_rank)) if rank_by_name is not None else int(order_rank)
+            prior = _rank_prior(rank, float(rank_tau))
+            for pid in np.unique(obs.point_ids[obs.point_ids >= 0]).astype(np.int64, copy=False).tolist():
+                state = support.get(int(pid))
+                if state is None:
+                    state = {"support_count": 0, "best_rank_prior": 0.0, "support_images": []}
+                    support[int(pid)] = state
+                state["support_count"] = int(state["support_count"]) + 1
+                state["best_rank_prior"] = max(float(state["best_rank_prior"]), float(prior))
+                images = state["support_images"]
+                assert isinstance(images, list)
+                images.append(image_name)
+        for state in support.values():
+            images = state["support_images"]
+            assert isinstance(images, list)
+            state["support_images"] = tuple(images)
+        return support
+
+    def num_observations_for_points(self, point_ids: np.ndarray, *, max_obs: int = 0) -> int:
+        point_indices = self.point_indices_for_ids(point_ids)
+        total = 0
+        offsets = np.asarray(self.point_obs_offsets, dtype=np.int64)
+        for idx in point_indices.tolist():
+            idx = int(idx)
+            if idx < 0 or idx + 1 >= offsets.shape[0]:
+                continue
+            count = max(0, int(offsets[idx + 1]) - int(offsets[idx]))
+            if max_obs > 0:
+                count = min(count, int(max_obs))
+            total += count
+        return int(total)
 
 
 def _frame_name(frame) -> str:
@@ -463,6 +561,136 @@ def _lifted_nn_for_image(
     return out
 
 
+def _lifted_point_landmark_nn(
+    *,
+    q_kpts: np.ndarray,
+    q_descs: np.ndarray,
+    candidate_point_ids: np.ndarray,
+    index: AttachedSPCOLMAPIndex,
+    mode: str,
+    ratio_margin: float,
+    min_similarity: float,
+    point_memory_max_obs: int,
+    point_memory_batch_size: int,
+    support_info: dict[int, dict[str, object]] | None = None,
+) -> list[LiftedHypothesis]:
+    """Lift query descriptors by matching directly against point-level memory."""
+    mode = str(mode)
+    candidate_point_ids = np.asarray(candidate_point_ids, dtype=np.int64).reshape(-1)
+    candidate_point_ids = candidate_point_ids[candidate_point_ids >= 0]
+    if q_descs.shape[0] == 0 or candidate_point_ids.shape[0] == 0:
+        return []
+    point_indices = index.point_indices_for_ids(candidate_point_ids)
+    valid = point_indices >= 0
+    if not np.any(valid):
+        return []
+    candidate_point_ids = candidate_point_ids[valid]
+    point_indices = point_indices[valid]
+    xyz = np.asarray(index.point_xyz[point_indices], dtype=np.float64)
+    batch_size = max(1, int(point_memory_batch_size))
+
+    out: list[LiftedHypothesis] = []
+
+    def _make_hyp(q_idx: int, local_point_idx: int, score: float) -> LiftedHypothesis | None:
+        pid = int(candidate_point_ids[int(local_point_idx)])
+        info = support_info.get(pid, {}) if support_info is not None else {}
+        support_images = tuple(str(x) for x in info.get("support_images", ()))
+        return LiftedHypothesis(
+            q_idx=int(q_idx),
+            q_uv=q_kpts[int(q_idx)].astype(np.float64, copy=False),
+            point_id=pid,
+            xyz=xyz[int(local_point_idx)].astype(np.float64, copy=False),
+            desc_score=float(score),
+            db_rank=-1,
+            db_image=f"__{mode}__",
+            rank_prior=float(info.get("best_rank_prior", 0.0)),
+            attach_dist=0.0,
+            support_images=support_images,
+        )
+
+    if mode == "point_mean":
+        point_descs = index.point_mean_descriptors()[point_indices].astype(np.float32, copy=False)
+        if point_descs.shape[0] == 0 or point_descs.shape[1] != q_descs.shape[1]:
+            return []
+        for start in range(0, int(q_descs.shape[0]), batch_size):
+            end = min(int(q_descs.shape[0]), start + batch_size)
+            sims = q_descs[start:end].astype(np.float32, copy=False) @ point_descs.T
+            if sims.shape[1] == 1:
+                best = np.zeros((sims.shape[0],), dtype=np.int64)
+                best_score = sims[:, 0].astype(np.float32, copy=False)
+                second_score = np.full((sims.shape[0],), -np.inf, dtype=np.float32)
+            else:
+                top2 = np.argpartition(-sims, kth=1, axis=1)[:, :2]
+                vals = np.take_along_axis(sims, top2, axis=1)
+                order = np.argsort(-vals, axis=1)
+                top2 = np.take_along_axis(top2, order, axis=1)
+                vals = np.take_along_axis(vals, order, axis=1)
+                best = top2[:, 0].astype(np.int64, copy=False)
+                best_score = vals[:, 0].astype(np.float32, copy=False)
+                second_score = vals[:, 1].astype(np.float32, copy=False)
+            keep = (best_score >= float(min_similarity)) & ((best_score - second_score) > float(ratio_margin))
+            for local_q, local_point_idx in zip(np.flatnonzero(keep).tolist(), best[keep].tolist()):
+                hyp = _make_hyp(start + int(local_q), int(local_point_idx), float(best_score[int(local_q)]))
+                if hyp is not None:
+                    out.append(hyp)
+        return out
+
+    if mode not in {"point_memory", "point_memory_support"}:
+        raise ValueError(f"Unsupported landmark_match_mode for point matching: {mode}")
+
+    obs_desc_chunks: list[np.ndarray] = []
+    obs_point_local_chunks: list[np.ndarray] = []
+    offsets = np.asarray(index.point_obs_offsets, dtype=np.int64)
+    for local_idx, point_idx in enumerate(point_indices.tolist()):
+        point_idx = int(point_idx)
+        if point_idx < 0 or point_idx + 1 >= offsets.shape[0]:
+            continue
+        obs_start = int(offsets[point_idx])
+        obs_end = int(offsets[point_idx + 1])
+        if obs_end <= obs_start:
+            continue
+        if int(point_memory_max_obs) > 0:
+            obs_end = min(obs_end, obs_start + int(point_memory_max_obs))
+        descs = np.asarray(index.point_obs_descs[obs_start:obs_end], dtype=np.float32)
+        if descs.shape[0] == 0:
+            continue
+        obs_desc_chunks.append(descs)
+        obs_point_local_chunks.append(np.full((descs.shape[0],), int(local_idx), dtype=np.int64))
+    if not obs_desc_chunks:
+        return []
+    obs_descs = _normalise_descriptors(np.concatenate(obs_desc_chunks, axis=0).astype(np.float32, copy=False))
+    if obs_descs.shape[1] != q_descs.shape[1]:
+        return []
+    obs_point_local = np.concatenate(obs_point_local_chunks, axis=0).astype(np.int64, copy=False)
+    num_points = int(candidate_point_ids.shape[0])
+    for start in range(0, int(q_descs.shape[0]), batch_size):
+        end = min(int(q_descs.shape[0]), start + batch_size)
+        sims = q_descs[start:end].astype(np.float32, copy=False) @ obs_descs.T
+        for local_q in range(int(sims.shape[0])):
+            point_scores = np.full((num_points,), -np.inf, dtype=np.float32)
+            np.maximum.at(point_scores, obs_point_local, sims[int(local_q)])
+            finite = np.isfinite(point_scores)
+            if not np.any(finite):
+                continue
+            if num_points == 1:
+                best_idx = int(np.argmax(point_scores))
+                best_score = float(point_scores[best_idx])
+                second_score = float("-inf")
+            else:
+                top2 = np.argpartition(-point_scores, kth=1)[:2]
+                vals = point_scores[top2]
+                order = np.argsort(-vals)
+                best_idx = int(top2[order[0]])
+                best_score = float(vals[order[0]])
+                second_score = float(vals[order[1]])
+            if best_score < float(min_similarity) or (best_score - second_score) <= float(ratio_margin):
+                continue
+            hyp = _make_hyp(start + int(local_q), best_idx, best_score)
+            if hyp is not None:
+                out.append(hyp)
+    return out
+
+
 def _aggregate_hypotheses(
     hypotheses: Sequence[LiftedHypothesis],
     *,
@@ -481,6 +709,8 @@ def _aggregate_hypotheses(
     for hyp in hypotheses:
         if not str(hyp.db_image).startswith("__"):
             point_support.setdefault(int(hyp.point_id), set()).add(str(hyp.db_image))
+        if hyp.support_images:
+            point_support.setdefault(int(hyp.point_id), set()).update(str(name) for name in hyp.support_images)
         key = (int(hyp.q_idx), int(hyp.point_id))
         state = grouped.get(key)
         if state is None:
@@ -492,12 +722,20 @@ def _aggregate_hypotheses(
                 "min_attach_dist": float(hyp.attach_dist),
             }
             grouped[key] = state
+            if hyp.support_images:
+                support = state["support"]
+                assert isinstance(support, set)
+                support.update(str(name) for name in hyp.support_images)
         else:
             if float(hyp.desc_score) > float(state["max_desc"]):
                 state["best"] = hyp
                 state["max_desc"] = float(hyp.desc_score)
             state["max_rank_prior"] = max(float(state["max_rank_prior"]), float(hyp.rank_prior))
             state["min_attach_dist"] = min(float(state["min_attach_dist"]), float(hyp.attach_dist))
+            if hyp.support_images:
+                support = state["support"]
+                assert isinstance(support, set)
+                support.update(str(name) for name in hyp.support_images)
         if not str(hyp.db_image).startswith("__"):
             support = state["support"]
             assert isinstance(support, set)
@@ -826,6 +1064,8 @@ def _summarize_metrics(metrics: list[dict], *, thresholds: object | None = None)
     for key in (
         "num_query_keypoints",
         "num_lifted_hypotheses",
+        "num_candidate_points",
+        "num_candidate_observations",
         "num_cluster_matches",
         "num_inliers",
         "num_pose_guided_hypotheses",
@@ -908,15 +1148,26 @@ def _localize_one_query(
         allowed = set(str(name) for name in allowed_db_names)
         db_names = [name for name in db_names if str(name) in allowed]
     intr = frame.intrinsics
+    landmark_match_mode = str(cfg.get("landmark_match_mode", "image_obs"))
     if intr is None:
-        return {"query": query_name, "success": False, "reason": "missing_intrinsics"}, None, query_name
+        return {
+            "query": query_name,
+            "success": False,
+            "reason": "missing_intrinsics",
+            "landmark_match_mode": landmark_match_mode,
+            "num_candidate_points": 0,
+            "num_candidate_observations": 0,
+        }, None, query_name
     q_kpts, q_scores, q_descs = _extract_query_superpoint(frame, extractor, topk=int(cfg["query_topk"]))
     if q_kpts.shape[0] == 0 or q_descs.shape[0] == 0:
         row = {
             "query": query_name,
             "success": False,
             "reason": "no_query_superpoint",
+            "landmark_match_mode": landmark_match_mode,
             "num_query_keypoints": int(q_kpts.shape[0]),
+            "num_candidate_points": 0,
+            "num_candidate_observations": 0,
             "query_time_s": float(time.perf_counter() - t0),
         }
         return row, None, query_name
@@ -925,28 +1176,53 @@ def _localize_one_query(
             "query": query_name,
             "success": False,
             "reason": "no_retrievals",
+            "landmark_match_mode": landmark_match_mode,
             "num_query_keypoints": int(q_kpts.shape[0]),
+            "num_candidate_points": 0,
+            "num_candidate_observations": 0,
             "query_time_s": float(time.perf_counter() - t0),
         }
         return row, None, query_name
 
+    if landmark_match_mode not in {"image_obs", "point_mean", "point_memory", "point_memory_support"}:
+        raise ValueError(f"Unsupported landmark_match_mode: {landmark_match_mode}")
+    rank_by_name = {str(name): int(rank) for rank, name in enumerate(db_names)}
+    if landmark_match_mode == "image_obs":
+        candidate_point_chunks: list[np.ndarray] = []
+        num_candidate_points = 0
+        num_candidate_observations = 0
+    else:
+        candidate_point_ids_all = index.candidate_point_ids_for_images(db_names)
+        num_candidate_points = int(candidate_point_ids_all.shape[0])
+        num_candidate_observations = int(
+            index.num_observations_for_points(candidate_point_ids_all, max_obs=int(cfg["point_memory_max_obs"]))
+        )
+
     hypotheses_by_image: dict[str, list[LiftedHypothesis]] = {}
     total_hypotheses = 0
-    for rank, db_image in enumerate(db_names):
-        db_obs = index.get(db_image)
-        hyps = _lifted_nn_for_image(
-            q_kpts=q_kpts,
-            q_descs=q_descs,
-            db_obs=db_obs,
-            db_rank=int(rank),
-            db_image=str(db_image),
-            ratio_margin=float(cfg["ratio_margin"]),
-            min_similarity=float(cfg["min_similarity"]),
-            mutual=bool(cfg["mutual"]),
-            rank_tau=float(cfg["rank_tau"]),
-        )
-        hypotheses_by_image[str(db_image)] = hyps
-        total_hypotheses += int(len(hyps))
+    if landmark_match_mode == "image_obs":
+        for rank, db_image in enumerate(db_names):
+            db_obs = index.get(db_image)
+            num_candidate_observations += int(db_obs.point_ids.shape[0])
+            if db_obs.point_ids.shape[0] > 0:
+                candidate_point_chunks.append(db_obs.point_ids.astype(np.int64, copy=False))
+            hyps = _lifted_nn_for_image(
+                q_kpts=q_kpts,
+                q_descs=q_descs,
+                db_obs=db_obs,
+                db_rank=int(rank),
+                db_image=str(db_image),
+                ratio_margin=float(cfg["ratio_margin"]),
+                min_similarity=float(cfg["min_similarity"]),
+                mutual=bool(cfg["mutual"]),
+                rank_tau=float(cfg["rank_tau"]),
+            )
+            hypotheses_by_image[str(db_image)] = hyps
+            total_hypotheses += int(len(hyps))
+        if candidate_point_chunks:
+            point_ids = np.concatenate(candidate_point_chunks, axis=0)
+            point_ids = point_ids[point_ids >= 0]
+            num_candidate_points = int(np.unique(point_ids).shape[0]) if point_ids.shape[0] > 0 else 0
 
     clusters = _build_covisibility_clusters(
         db_names,
@@ -960,8 +1236,29 @@ def _localize_one_query(
     clusters_tested = 0
     for cluster_rank, cluster in enumerate(clusters):
         cluster_hyps: list[LiftedHypothesis] = []
-        for image_name in cluster:
-            cluster_hyps.extend(hypotheses_by_image.get(str(image_name), ()))
+        if landmark_match_mode == "image_obs":
+            for image_name in cluster:
+                cluster_hyps.extend(hypotheses_by_image.get(str(image_name), ()))
+        else:
+            candidate_point_ids = index.candidate_point_ids_for_images(cluster)
+            support_info = (
+                index.point_support_for_images(cluster, rank_by_name=rank_by_name, rank_tau=float(cfg["rank_tau"]))
+                if landmark_match_mode == "point_memory_support"
+                else None
+            )
+            cluster_hyps = _lifted_point_landmark_nn(
+                q_kpts=q_kpts,
+                q_descs=q_descs,
+                candidate_point_ids=candidate_point_ids,
+                index=index,
+                mode=landmark_match_mode,
+                ratio_margin=float(cfg["ratio_margin"]),
+                min_similarity=float(cfg["min_similarity"]),
+                point_memory_max_obs=int(cfg["point_memory_max_obs"]),
+                point_memory_batch_size=int(cfg["point_memory_batch_size"]),
+                support_info=support_info,
+            )
+            total_hypotheses += int(len(cluster_hyps))
         if not cluster_hyps:
             continue
         matches, aggregated = _aggregate_hypotheses(
@@ -1061,11 +1358,14 @@ def _localize_one_query(
             "query": query_name,
             "success": False,
             "reason": "no_cluster_pose",
+            "landmark_match_mode": landmark_match_mode,
             "num_query_keypoints": int(q_kpts.shape[0]),
             "num_db_images": int(len(db_names)),
             "num_clusters": int(len(clusters)),
             "num_clusters_tested": int(clusters_tested),
             "num_lifted_hypotheses": int(total_hypotheses),
+            "num_candidate_points": int(num_candidate_points),
+            "num_candidate_observations": int(num_candidate_observations),
             "num_pose_guided_hypotheses": int(pose_guided_count),
             "query_time_s": float(time.perf_counter() - t0),
         }
@@ -1075,12 +1375,15 @@ def _localize_one_query(
     row = {
         "query": query_name,
         "success": bool(pose.success),
+        "landmark_match_mode": landmark_match_mode,
         "stage": str(best.stage),
         "num_query_keypoints": int(q_kpts.shape[0]),
         "num_db_images": int(len(db_names)),
         "num_clusters": int(len(clusters)),
         "num_clusters_tested": int(clusters_tested),
         "num_lifted_hypotheses": int(total_hypotheses),
+        "num_candidate_points": int(num_candidate_points),
+        "num_candidate_observations": int(num_candidate_observations),
         "num_pose_guided_hypotheses": int(pose_guided_count),
         "num_cluster_matches": int(len(best.matches)),
         "num_inliers": int(pose.num_inliers),
@@ -1127,7 +1430,17 @@ def _runtime_cfg(cfg: dict, args: argparse.Namespace) -> dict[str, object]:
             args.point_support_weight if args.point_support_weight is not None else lnn_cfg.get("point_support_weight", 0.02)
         ),
         "memory_score_weight": float(args.memory_score_weight if args.memory_score_weight is not None else lnn_cfg.get("memory_score_weight", 0.0)),
+        "landmark_match_mode": str(
+            getattr(args, "landmark_match_mode", None)
+            if getattr(args, "landmark_match_mode", None) is not None
+            else lnn_cfg.get("landmark_match_mode", "image_obs")
+        ),
         "point_memory_max_obs": int(args.point_memory_max_obs if args.point_memory_max_obs is not None else lnn_cfg.get("point_memory_max_obs", 0)),
+        "point_memory_batch_size": int(
+            getattr(args, "point_memory_batch_size", None)
+            if getattr(args, "point_memory_batch_size", None) is not None
+            else lnn_cfg.get("point_memory_batch_size", 256)
+        ),
         "rank_tau": float(args.rank_tau if args.rank_tau is not None else lnn_cfg.get("rank_tau", 10.0)),
         "min_shared_points": int(args.min_shared_points if args.min_shared_points is not None else lnn_cfg.get("min_shared_points", 20)),
         "max_cluster_images": int(args.max_cluster_images if args.max_cluster_images is not None else lnn_cfg.get("max_cluster_images", 0)),
@@ -1272,6 +1585,11 @@ def run(args: argparse.Namespace) -> dict:
         add_cambridge_report_fields(summary, scene=scene)
     summary.update(
         {
+            "runner": "lifted_nn_localize",
+            "method": str(getattr(extractor, "method", args.method or "local")),
+            "local_feature": str(getattr(extractor, "method", args.method or "local")),
+            "pairwise_matcher": "none",
+            "map_source": "rgbd" if getattr(dataset, "map_mode", "") == "rgbd" else "colmap",
             "attached_index": str(attached_path),
             "retrieval_file": str(retrieval_path),
             "split_json": str(args.split_json) if args.split_json is not None else None,
@@ -1282,6 +1600,10 @@ def run(args: argparse.Namespace) -> dict:
             "attach_dist_weight": float(runtime_cfg["attach_dist_weight"]),
             "memory_score_weight": float(runtime_cfg["memory_score_weight"]),
             "rank_weight": float(runtime_cfg["rank_weight"]),
+            "landmark_match_mode": str(runtime_cfg["landmark_match_mode"]),
+            "point_memory_batch_size": int(runtime_cfg["point_memory_batch_size"]),
+            "point_memory_max_obs": int(runtime_cfg["point_memory_max_obs"]),
+            "point_mean_cache_built": bool(getattr(index, "_point_mean_descs", None) is not None),
             "mutual_nn": bool(runtime_cfg["mutual"]),
             "pose_guided": bool(runtime_cfg["pose_guided"]),
             "metric_thresholds": [list(x) for x in _parse_metric_thresholds(metric_thresholds)],
@@ -1314,7 +1636,14 @@ def main() -> None:
     parser.add_argument("--attach_dist_weight", type=float, default=None)
     parser.add_argument("--point_support_weight", type=float, default=None)
     parser.add_argument("--memory_score_weight", type=float, default=None)
+    parser.add_argument(
+        "--landmark_match_mode",
+        choices=("image_obs", "point_mean", "point_memory", "point_memory_support"),
+        default=None,
+        help="Ablation mode: current image observation matching or explicit point-level landmark memory matching.",
+    )
     parser.add_argument("--point_memory_max_obs", type=int, default=None)
+    parser.add_argument("--point_memory_batch_size", type=int, default=None)
     parser.add_argument("--rank_tau", type=float, default=None)
     parser.add_argument("--min_shared_points", type=int, default=None)
     parser.add_argument("--max_cluster_images", type=int, default=None)

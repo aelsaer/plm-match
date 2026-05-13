@@ -186,7 +186,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     descriptor_dim = int(getattr(fine_extractor, "dim", 0))
 
     try:
-        for frame_id, frame, image_name in tqdm(frames, desc=f"Attaching {method_name} to COLMAP", unit="image"):
+        for frame_id, frame, image_name in tqdm(frames, desc="Attaching local features to COLMAP", unit="image"):
             image_id = int(frame.meta.get("image_id", -1))
             sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints(image_name, topk=int(args.max_keypoints))
             if sp_kpts.shape[0] == 0 and not uses_named_h5:
@@ -297,6 +297,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         descriptor_dim=np.asarray(int(descriptor_dim), dtype=np.int32),
     )
 
+    num_landmarks = 0
     if total_obs > 0:
         all_pids = np.concatenate(global_pids, axis=0).astype(np.int64, copy=False)
         all_xyz_per_obs = np.concatenate(global_xyz, axis=0).astype(np.float32, copy=False)
@@ -314,6 +315,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         np.save(out_dir / "point_obs_uvs.npy", all_uvs[order])
         np.save(out_dir / "point_ids.npy", unique_pids.astype(np.int64, copy=False))
         np.save(out_dir / "point_xyz.npy", point_xyz)
+        num_landmarks = int(unique_pids.shape[0])
     else:
         np.save(out_dir / "point_obs_offsets.npy", np.zeros((1,), dtype=np.int64))
         np.save(out_dir / "point_obs_descs.npy", np.zeros((0, descriptor_dim), dtype=descriptor_dtype))
@@ -330,6 +332,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         "num_db_images": int(len(frames)),
         "num_images_with_attached_obs": int(frames_with_obs),
         "num_attached_observations": int(total_obs),
+        "num_landmarks": int(num_landmarks),
         "attach_radius_px": float(radius),
         "max_keypoints": int(args.max_keypoints),
         "descriptor_dim": int(descriptor_dim),

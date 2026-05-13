@@ -172,7 +172,7 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
         frames = list(dataset.get_map_frames())
         if int(args.max_images) > 0:
             frames = frames[: int(args.max_images)]
-        for frame_id, frame in tqdm(list(enumerate(frames)), desc=f"Building RGB-D {method_name} memory", unit="image"):
+        for frame_id, frame in tqdm(list(enumerate(frames)), desc="Building RGB-D local-feature memory", unit="image"):
             image_name = _frame_name(frame)
             sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints(image_name, topk=int(args.max_keypoints))
             if sp_kpts.shape[0] == 0 and not uses_named_h5:
