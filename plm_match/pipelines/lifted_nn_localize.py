@@ -13,6 +13,7 @@ import numpy as np
 from tqdm import tqdm
 
 from plm_match.datasets import build_dataset
+from plm_match.eval.cambridge import add_cambridge_report_fields
 from plm_match.fine_features import LocalPatchDescriptor, is_h5_local_feature_method
 from plm_match.geometry import solve_pnp_ransac
 from plm_match.hloc import parse_retrieval_file
@@ -857,6 +858,16 @@ def _summarize_metrics(metrics: list[dict], *, thresholds: object | None = None)
     return out
 
 
+def _is_cambridge_report(cfg: dict, dataset) -> bool:
+    reporting = cfg.get("reporting", {})
+    if isinstance(reporting, dict) and str(reporting.get("benchmark", "")).lower() == "cambridge_landmarks":
+        return True
+    dataset_cfg = cfg.get("dataset", {})
+    if isinstance(dataset_cfg, dict) and str(dataset_cfg.get("type", "")).lower() in {"cambridge", "cambridge_landmarks"}:
+        return True
+    return dataset.__class__.__name__ == "CambridgeLandmarksDataset"
+
+
 def _write_hloc_results(path: str | Path, rows: list[tuple[str, np.ndarray]]) -> None:
     path = Path(path)
     with open(path, "w", encoding="utf-8") as f:
@@ -1255,6 +1266,10 @@ def run(args: argparse.Namespace) -> dict:
     if metric_thresholds is None:
         metric_thresholds = lnn_cfg.get("metric_thresholds")
     summary = _summarize_metrics(metrics, thresholds=metric_thresholds)
+    if _is_cambridge_report(cfg, dataset):
+        dataset_cfg_for_report = cfg.get("dataset", {})
+        scene = dataset_cfg_for_report.get("scene") if isinstance(dataset_cfg_for_report, dict) else None
+        add_cambridge_report_fields(summary, scene=scene)
     summary.update(
         {
             "attached_index": str(attached_path),

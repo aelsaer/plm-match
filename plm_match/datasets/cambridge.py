@@ -139,3 +139,15 @@ class CambridgeLandmarksDataset(BaseDatasetAdapter):
 
     def get_default_intrinsics(self) -> Optional[Dict[str, float]]:
         return self._map_frames[0].intrinsics if self._map_frames else None
+
+    def describe(self) -> Dict[str, object]:
+        data = super().describe()
+        scene = self.cfg.get("scene") or self.sfm_dir.name
+        data.update(
+            {
+                "benchmark": "cambridge_landmarks",
+                "scene": str(scene),
+                "sfm_dir": str(self.sfm_dir),
+            }
+        )
+        return data

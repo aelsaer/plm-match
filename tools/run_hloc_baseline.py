@@ -12,8 +12,13 @@ import h5py
 import numpy as np
 from scipy.spatial import cKDTree
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from extract_loo_local_features import _prepare_superpoint_shim
 from generate_loo_superglue_matches import _prepare_superglue_shim
+from plm_match.eval.cambridge import add_cambridge_report_fields
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".JPG", ".JPEG", ".PNG"}
@@ -629,6 +634,14 @@ def run(args: argparse.Namespace) -> dict:
         "matches_file": str(matches_path),
         "localizer": str(resolved_localizer),
     }
+    if args.dataset == "cambridge":
+        scene = None
+        if reference_sfm is not None:
+            scene = reference_sfm.parent.name if reference_sfm.name in {"model_train", "empty_all"} else reference_sfm.name
+        elif image_dir is not None:
+            scene = image_dir.name
+        if scene:
+            summary["scene"] = scene
     summary.update(nearest_lift_summary)
     _write_json(out_dir / "run_summary.json", summary)
 
@@ -647,6 +660,7 @@ def run(args: argparse.Namespace) -> dict:
         )
         if metrics is not None:
             _write_json(out_dir / "metrics.json", metrics)
+            _write_json(out_dir / "run_summary.json", summary)
 
     return summary
 
@@ -780,6 +794,11 @@ def _evaluate_colmap_localization(
     if trans:
         eval_summary["median_trans_err_m"] = float(np.median(trans))
         eval_summary["mean_trans_err_m"] = float(np.mean(trans))
+    if str(summary.get("dataset", "")).lower() == "cambridge":
+        add_cambridge_report_fields(eval_summary, scene=summary.get("scene"))
+        for key in ("report_metric", "median_trans_err_cm", "report_trans_cm", "report_rot_deg", "report_text"):
+            if key in eval_summary:
+                summary[key] = eval_summary[key]
     return {"summary": eval_summary, "frames": frames_out}
 
 

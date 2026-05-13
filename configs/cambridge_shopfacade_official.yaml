@@ -10,6 +10,9 @@ dataset:
   db_list: list_db.txt
   query_list: list_query.txt
 
+reporting:
+  benchmark: cambridge_landmarks
+
 hloc:
   retrieval_file: outputs/cambridge_shopfacade_official/retrieval/pairs-loo-netvlad10.txt
   topk_db_images: 10

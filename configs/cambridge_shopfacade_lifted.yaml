@@ -2,12 +2,16 @@ dataset_root: .
 
 dataset:
   type: colmap_localization
+  scene: ShopFacade
   image_root: datasets/cambridge_landmarks/ShopFacade
   model_path: outputs/cambridge_shopfacade_lifted/colmap_model
   db_image_names_file: outputs/cambridge_shopfacade_lifted/split/map_images.txt
   query_list: outputs/cambridge_shopfacade_lifted/split/query_list.txt
   query_gt_pose_dir: outputs/cambridge_shopfacade_lifted/split/query_gt_pose_dir
   default_query_camera_from_first_map: true
+
+reporting:
+  benchmark: cambridge_landmarks
 
 hloc:
   retrieval_file: outputs/cambridge_shopfacade_lifted/retrieval/pairs-loo-netvlad20.txt
