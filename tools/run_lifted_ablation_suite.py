@@ -100,6 +100,25 @@ def _base_lifted_cmd(
     if method != "sift":
         _path_arg(cmd, "--db_features_path", args.db_features_path)
         _path_arg(cmd, "--query_features_path", args.query_features_path)
+    else:
+        cmd.extend(
+            [
+                "--sift_match_test",
+                str(args.sift_match_test),
+                "--sift_ratio",
+                f"{float(args.sift_ratio):g}",
+                "--sift_nfeatures",
+                str(int(args.sift_nfeatures)),
+                "--sift_n_octave_layers",
+                str(int(args.sift_n_octave_layers)),
+                "--sift_contrast_threshold",
+                f"{float(args.sift_contrast_threshold):g}",
+                "--sift_edge_threshold",
+                f"{float(args.sift_edge_threshold):g}",
+                "--sift_sigma",
+                f"{float(args.sift_sigma):g}",
+            ]
+        )
     if args.metric_thresholds is not None:
         cmd.extend(["--metric_thresholds", str(args.metric_thresholds)])
     if point_memory:
@@ -399,6 +418,13 @@ def main() -> None:
     parser.add_argument("--min_similarity", type=float, default=0.65)
     parser.add_argument("--sift_ratio_margin", type=float, default=0.05)
     parser.add_argument("--sift_min_similarity", type=float, default=0.45)
+    parser.add_argument("--sift_match_test", choices=("cosine_margin", "l2_ratio"), default="l2_ratio")
+    parser.add_argument("--sift_ratio", type=float, default=0.80)
+    parser.add_argument("--sift_nfeatures", type=int, default=0)
+    parser.add_argument("--sift_n_octave_layers", type=int, default=3)
+    parser.add_argument("--sift_contrast_threshold", type=float, default=0.04)
+    parser.add_argument("--sift_edge_threshold", type=float, default=10.0)
+    parser.add_argument("--sift_sigma", type=float, default=1.6)
     parser.add_argument("--support_weight", type=float, default=0.03)
     parser.add_argument("--point_support_weight", type=float, default=0.02)
     parser.add_argument("--rank_weight", type=float, default=0.02)

@@ -440,6 +440,27 @@ def _make_fine_extractor(cfg: dict, args: argparse.Namespace | None = None) -> L
         top_k=int(fine_cfg.get("xfeat_topk", 4096)),
         match_radius_px=float(fine_cfg.get("match_radius_px", fine_cfg.get("patch_size", 24))),
         image_cache_size=int(fine_cfg.get("image_cache_size", 8)),
+        sift_nfeatures=int(getattr(args, "sift_nfeatures", None) if getattr(args, "sift_nfeatures", None) is not None else fine_cfg.get("sift_nfeatures", 0)),
+        sift_n_octave_layers=int(
+            getattr(args, "sift_n_octave_layers", None)
+            if getattr(args, "sift_n_octave_layers", None) is not None
+            else fine_cfg.get("sift_n_octave_layers", 3)
+        ),
+        sift_contrast_threshold=float(
+            getattr(args, "sift_contrast_threshold", None)
+            if getattr(args, "sift_contrast_threshold", None) is not None
+            else fine_cfg.get("sift_contrast_threshold", 0.04)
+        ),
+        sift_edge_threshold=float(
+            getattr(args, "sift_edge_threshold", None)
+            if getattr(args, "sift_edge_threshold", None) is not None
+            else fine_cfg.get("sift_edge_threshold", 10.0)
+        ),
+        sift_sigma=float(
+            getattr(args, "sift_sigma", None)
+            if getattr(args, "sift_sigma", None) is not None
+            else fine_cfg.get("sift_sigma", 1.6)
+        ),
     )
 
 
@@ -496,6 +517,23 @@ def _best_observation_indices_by_point(db_obs: AttachedImageObservations) -> np.
     return np.asarray([item[1] for item in best_by_pid.values()], dtype=np.int64)
 
 
+def _accept_descriptor_matches(
+    *,
+    best_score: np.ndarray,
+    second_score: np.ndarray,
+    ratio_margin: float,
+    min_similarity: float,
+    match_test: str,
+    sift_ratio: float,
+) -> np.ndarray:
+    if str(match_test) == "l2_ratio":
+        d_best = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * best_score.astype(np.float32, copy=False)))
+        d_second = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * second_score.astype(np.float32, copy=False)))
+        return np.isfinite(second_score) & ((d_best / np.maximum(d_second, 1e-8)) < float(sift_ratio))
+    margin = best_score - second_score
+    return (best_score >= float(min_similarity)) & (margin > float(ratio_margin))
+
+
 def _lifted_nn_for_image(
     *,
     q_kpts: np.ndarray,
@@ -507,6 +545,8 @@ def _lifted_nn_for_image(
     min_similarity: float,
     mutual: bool,
     rank_tau: float,
+    sift_match_test: str = "cosine_margin",
+    sift_ratio: float = 0.80,
 ) -> list[LiftedHypothesis]:
     if q_descs.shape[0] == 0 or db_obs.descs.shape[0] == 0:
         return []
@@ -532,8 +572,14 @@ def _lifted_nn_for_image(
         best = top2[:, 0].astype(np.int64, copy=False)
         best_score = vals[:, 0].astype(np.float32, copy=False)
         second_score = vals[:, 1].astype(np.float32, copy=False)
-    margin = best_score - second_score
-    keep = (best_score >= float(min_similarity)) & (margin > float(ratio_margin))
+    keep = _accept_descriptor_matches(
+        best_score=best_score,
+        second_score=second_score,
+        ratio_margin=float(ratio_margin),
+        min_similarity=float(min_similarity),
+        match_test=str(sift_match_test),
+        sift_ratio=float(sift_ratio),
+    )
     if mutual:
         db_best_q = np.argmax(sims, axis=0).astype(np.int64, copy=False)
         keep &= db_best_q[best] == rows
@@ -572,6 +618,8 @@ def _lifted_point_landmark_nn(
     min_similarity: float,
     point_memory_max_obs: int,
     point_memory_batch_size: int,
+    sift_match_test: str = "cosine_margin",
+    sift_ratio: float = 0.80,
     support_info: dict[int, dict[str, object]] | None = None,
 ) -> list[LiftedHypothesis]:
     """Lift query descriptors by matching directly against point-level memory."""
@@ -628,7 +676,14 @@ def _lifted_point_landmark_nn(
                 best = top2[:, 0].astype(np.int64, copy=False)
                 best_score = vals[:, 0].astype(np.float32, copy=False)
                 second_score = vals[:, 1].astype(np.float32, copy=False)
-            keep = (best_score >= float(min_similarity)) & ((best_score - second_score) > float(ratio_margin))
+            keep = _accept_descriptor_matches(
+                best_score=best_score,
+                second_score=second_score,
+                ratio_margin=float(ratio_margin),
+                min_similarity=float(min_similarity),
+                match_test=str(sift_match_test),
+                sift_ratio=float(sift_ratio),
+            )
             for local_q, local_point_idx in zip(np.flatnonzero(keep).tolist(), best[keep].tolist()):
                 hyp = _make_hyp(start + int(local_q), int(local_point_idx), float(best_score[int(local_q)]))
                 if hyp is not None:
@@ -683,7 +738,15 @@ def _lifted_point_landmark_nn(
                 best_idx = int(top2[order[0]])
                 best_score = float(vals[order[0]])
                 second_score = float(vals[order[1]])
-            if best_score < float(min_similarity) or (best_score - second_score) <= float(ratio_margin):
+            keep = _accept_descriptor_matches(
+                best_score=np.asarray([best_score], dtype=np.float32),
+                second_score=np.asarray([second_score], dtype=np.float32),
+                ratio_margin=float(ratio_margin),
+                min_similarity=float(min_similarity),
+                match_test=str(sift_match_test),
+                sift_ratio=float(sift_ratio),
+            )
+            if not bool(keep[0]):
                 continue
             hyp = _make_hyp(start + int(local_q), best_idx, best_score)
             if hyp is not None:
@@ -1216,6 +1279,8 @@ def _localize_one_query(
                 min_similarity=float(cfg["min_similarity"]),
                 mutual=bool(cfg["mutual"]),
                 rank_tau=float(cfg["rank_tau"]),
+                sift_match_test=str(cfg["sift_match_test"]),
+                sift_ratio=float(cfg["sift_ratio"]),
             )
             hypotheses_by_image[str(db_image)] = hyps
             total_hypotheses += int(len(hyps))
@@ -1256,6 +1321,8 @@ def _localize_one_query(
                 min_similarity=float(cfg["min_similarity"]),
                 point_memory_max_obs=int(cfg["point_memory_max_obs"]),
                 point_memory_batch_size=int(cfg["point_memory_batch_size"]),
+                sift_match_test=str(cfg["sift_match_test"]),
+                sift_ratio=float(cfg["sift_ratio"]),
                 support_info=support_info,
             )
             total_hypotheses += int(len(cluster_hyps))
@@ -1422,6 +1489,8 @@ def _runtime_cfg(cfg: dict, args: argparse.Namespace) -> dict[str, object]:
             args.ratio_margin if args.ratio_margin is not None else lnn_cfg.get("ratio_margin", matching_cfg.get("ratio_margin", 0.08))
         ),
         "min_similarity": float(args.min_similarity if args.min_similarity is not None else lnn_cfg.get("min_similarity", -1.0)),
+        "sift_match_test": str(args.sift_match_test if getattr(args, "sift_match_test", None) is not None else lnn_cfg.get("sift_match_test", "cosine_margin")),
+        "sift_ratio": float(args.sift_ratio if getattr(args, "sift_ratio", None) is not None else lnn_cfg.get("sift_ratio", 0.80)),
         "mutual": bool(args.mutual if args.mutual is not None else lnn_cfg.get("mutual_nn", False)),
         "support_weight": float(args.support_weight if args.support_weight is not None else lnn_cfg.get("support_weight", 0.0)),
         "rank_weight": float(args.rank_weight if args.rank_weight is not None else lnn_cfg.get("rank_weight", 0.0)),
@@ -1512,6 +1581,13 @@ def run(args: argparse.Namespace) -> dict:
     if attached_path is None:
         raise ValueError("--attached_index is required")
     index = AttachedSPCOLMAPIndex(attached_path, cache_size=int(args.index_cache_size))
+    attached_summary_path = Path(attached_path) / "summary.json"
+    attached_summary: dict[str, object] = {}
+    if attached_summary_path.exists():
+        try:
+            attached_summary = json.loads(attached_summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            attached_summary = {}
     retrieval_path = _resolve_path(args.retrieval_file or cfg.get("hloc", {}).get("retrieval_file"), dataset_root=dataset_root)
     if retrieval_path is None or not retrieval_path.exists():
         raise FileNotFoundError(f"Retrieval file not found: {retrieval_path}")
@@ -1595,6 +1671,14 @@ def run(args: argparse.Namespace) -> dict:
             "split_json": str(args.split_json) if args.split_json is not None else None,
             "topk": int(runtime_cfg["topk"]),
             "ratio_margin": float(runtime_cfg["ratio_margin"]),
+            "sift_match_test": str(runtime_cfg["sift_match_test"]),
+            "sift_ratio": float(runtime_cfg["sift_ratio"]),
+            "sift_attach_mode": str(attached_summary.get("sift_attach_mode", "detected_nearest")),
+            "sift_nfeatures": int(getattr(extractor, "sift_nfeatures", 0)),
+            "sift_n_octave_layers": int(getattr(extractor, "sift_n_octave_layers", 3)),
+            "sift_contrast_threshold": float(getattr(extractor, "sift_contrast_threshold", 0.04)),
+            "sift_edge_threshold": float(getattr(extractor, "sift_edge_threshold", 10.0)),
+            "sift_sigma": float(getattr(extractor, "sift_sigma", 1.6)),
             "support_weight": float(runtime_cfg["support_weight"]),
             "point_support_weight": float(runtime_cfg["point_support_weight"]),
             "attach_dist_weight": float(runtime_cfg["attach_dist_weight"]),
@@ -1630,6 +1714,8 @@ def main() -> None:
     parser.add_argument("--query_topk", type=int, default=None)
     parser.add_argument("--ratio_margin", type=float, default=None)
     parser.add_argument("--min_similarity", type=float, default=None)
+    parser.add_argument("--sift_match_test", choices=("cosine_margin", "l2_ratio"), default=None)
+    parser.add_argument("--sift_ratio", type=float, default=None)
     parser.add_argument("--mutual", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--support_weight", type=float, default=None)
     parser.add_argument("--rank_weight", type=float, default=None)
@@ -1665,6 +1751,11 @@ def main() -> None:
     parser.add_argument("--query_features_path", type=Path, default=None)
     parser.add_argument("--repo_root", type=str, default=None)
     parser.add_argument("--patch_size", type=int, default=None)
+    parser.add_argument("--sift_nfeatures", type=int, default=None)
+    parser.add_argument("--sift_n_octave_layers", type=int, default=None)
+    parser.add_argument("--sift_contrast_threshold", type=float, default=None)
+    parser.add_argument("--sift_edge_threshold", type=float, default=None)
+    parser.add_argument("--sift_sigma", type=float, default=None)
     parser.add_argument("--index_cache_size", type=int, default=128)
     parser.add_argument("--max_queries", type=int, default=None)
     parser.add_argument(

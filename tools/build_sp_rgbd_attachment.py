@@ -57,6 +57,11 @@ def _make_fine_extractor(cfg: dict, args: argparse.Namespace) -> LocalPatchDescr
         top_k=int(args.max_keypoints),
         match_radius_px=float(fine_cfg.get("match_radius_px", fine_cfg.get("patch_size", 24))),
         image_cache_size=int(fine_cfg.get("image_cache_size", 8)),
+        sift_nfeatures=int(args.sift_nfeatures),
+        sift_n_octave_layers=int(args.sift_n_octave_layers),
+        sift_contrast_threshold=float(args.sift_contrast_threshold),
+        sift_edge_threshold=float(args.sift_edge_threshold),
+        sift_sigma=float(args.sift_sigma),
     )
 
 
@@ -156,6 +161,8 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
     fine_extractor = _make_fine_extractor(cfg, args)
     uses_named_h5 = is_h5_local_feature_method(getattr(fine_extractor, "method", ""))
     method_name = str(getattr(fine_extractor, "method", args.method or "local")).lower()
+    if method_name == "sift" and str(args.sift_attach_mode) == "colmap_uv_compute":
+        raise ValueError("sift_attach_mode=colmap_uv_compute is only valid for COLMAP attachment.")
     descriptor_dtype = np.float16 if str(args.descriptor_dtype).lower() == "float16" else np.float32
 
     merger = VoxelLandmarkMerger(float(args.merge_radius_m))
@@ -338,6 +345,14 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
         "num_images_with_attached_obs": int(frames_with_obs),
         "num_attached_observations": int(total_obs),
         "num_landmarks": int(point_xyz.shape[0]),
+        "sift_attach_mode": str(args.sift_attach_mode),
+        "sift_match_test": str(args.sift_match_test),
+        "sift_ratio": float(args.sift_ratio),
+        "sift_nfeatures": int(args.sift_nfeatures),
+        "sift_n_octave_layers": int(args.sift_n_octave_layers),
+        "sift_contrast_threshold": float(args.sift_contrast_threshold),
+        "sift_edge_threshold": float(args.sift_edge_threshold),
+        "sift_sigma": float(args.sift_sigma),
         "merge_radius_m": float(args.merge_radius_m),
         "min_depth_m": float(args.min_depth_m),
         "max_depth_m": float(args.max_depth_m),
@@ -356,6 +371,14 @@ def main() -> None:
     parser.add_argument("--dataset_root", type=Path, default=None)
     parser.add_argument("--out_dir", required=True, type=Path)
     parser.add_argument("--method", type=str, default=None)
+    parser.add_argument("--sift_attach_mode", choices=("detected_nearest", "colmap_uv_compute"), default="detected_nearest")
+    parser.add_argument("--sift_match_test", choices=("cosine_margin", "l2_ratio"), default="cosine_margin")
+    parser.add_argument("--sift_ratio", type=float, default=0.80)
+    parser.add_argument("--sift_nfeatures", type=int, default=0)
+    parser.add_argument("--sift_n_octave_layers", type=int, default=3)
+    parser.add_argument("--sift_contrast_threshold", type=float, default=0.04)
+    parser.add_argument("--sift_edge_threshold", type=float, default=10.0)
+    parser.add_argument("--sift_sigma", type=float, default=1.6)
     parser.add_argument("--features_path", type=Path, default=None)
     parser.add_argument("--db_features_path", type=Path, default=None)
     parser.add_argument("--query_features_path", type=Path, default=None)

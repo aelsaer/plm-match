@@ -100,6 +100,11 @@ def _make_fine_extractor(cfg: dict, args: argparse.Namespace) -> LocalPatchDescr
         top_k=int(args.max_keypoints),
         match_radius_px=float(fine_cfg.get("match_radius_px", fine_cfg.get("patch_size", 24))),
         image_cache_size=int(fine_cfg.get("image_cache_size", 8)),
+        sift_nfeatures=int(args.sift_nfeatures),
+        sift_n_octave_layers=int(args.sift_n_octave_layers),
+        sift_contrast_threshold=float(args.sift_contrast_threshold),
+        sift_edge_threshold=float(args.sift_edge_threshold),
+        sift_sigma=float(args.sift_sigma),
     )
 
 
@@ -161,6 +166,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     fine_extractor = _make_fine_extractor(cfg, args)
     uses_named_h5 = is_h5_local_feature_method(getattr(fine_extractor, "method", ""))
     method_name = str(getattr(fine_extractor, "method", args.method or "local")).lower()
+    sift_attach_mode = str(args.sift_attach_mode)
     descriptor_dtype = np.float16 if str(args.descriptor_dtype).lower() == "float16" else np.float32
 
     image_names = split_map_names if split_map_names is not None else (_read_names(args.image_names) if args.image_names is not None else None)
@@ -188,18 +194,6 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     try:
         for frame_id, frame, image_name in tqdm(frames, desc="Attaching local features to COLMAP", unit="image"):
             image_id = int(frame.meta.get("image_id", -1))
-            sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints(image_name, topk=int(args.max_keypoints))
-            if sp_kpts.shape[0] == 0 and not uses_named_h5:
-                image = read_image(frame.image_path)
-                sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints_from_image(
-                    image,
-                    topk=int(args.max_keypoints),
-                )
-            sp_kpts = np.asarray(sp_kpts, dtype=np.float32).reshape(-1, 2)
-            sp_scores = np.asarray(sp_scores, dtype=np.float32).reshape(-1)
-            sp_descs = _normalise_descriptors(sp_descs)
-            descriptor_dim = max(descriptor_dim, int(sp_descs.shape[1]) if sp_descs.ndim == 2 else 0)
-
             colmap_xys = np.asarray(frame.meta.get("xys", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
             colmap_pids = np.asarray(frame.meta.get("point3D_ids", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
             n_colmap = min(colmap_xys.shape[0], colmap_pids.shape[0])
@@ -222,37 +216,28 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
             attached_count = 0
             obs_file = ""
             entry_obs_offsets.append(int(total_obs))
-            if sp_kpts.shape[0] > 0 and valid_positions.shape[0] > 0 and sp_descs.shape[0] > 0:
+            if method_name == "sift" and sift_attach_mode == "colmap_uv_compute" and valid_positions.shape[0] > 0:
                 valid_xys = colmap_xys[valid_positions].astype(np.float32, copy=False)
                 valid_pids = colmap_pids[valid_positions].astype(np.int64, copy=False)
-                dists, nn = _nearest_points(sp_kpts, valid_xys)
-                keep = np.isfinite(dists) & (dists <= radius) & (nn >= 0)
-                if np.any(keep):
-                    sp_indices = np.flatnonzero(keep).astype(np.int32, copy=False)
-                    attached_pids = valid_pids[nn[keep]].astype(np.int64, copy=False)
-                    attached_uvs = sp_kpts[sp_indices].astype(np.float32, copy=False)
-                    attached_scores = sp_scores[sp_indices].astype(np.float32, copy=False)
-                    attached_descs = sp_descs[sp_indices].astype(descriptor_dtype, copy=False)
-                    attached_dists = dists[keep].astype(np.float32, copy=False)
+                image = read_image(frame.image_path)
+                computed_descs = _normalise_descriptors(fine_extractor.extract_at_points(image, valid_xys, image_name=image_name))
+                descriptor_dim = max(descriptor_dim, int(computed_descs.shape[1]) if computed_descs.ndim == 2 else 0)
+                valid_desc = (
+                    np.linalg.norm(computed_descs.astype(np.float32, copy=False), axis=1) > 1e-8
+                    if computed_descs.shape[0] > 0
+                    else np.zeros((0,), dtype=bool)
+                )
+                if np.any(valid_desc):
+                    sp_indices = valid_positions[valid_desc].astype(np.int32, copy=False)
+                    attached_pids = valid_pids[valid_desc].astype(np.int64, copy=False)
+                    attached_uvs = valid_xys[valid_desc].astype(np.float32, copy=False)
+                    attached_scores = np.ones((attached_pids.shape[0],), dtype=np.float32)
+                    attached_descs = computed_descs[valid_desc].astype(descriptor_dtype, copy=False)
+                    attached_dists = np.zeros((attached_pids.shape[0],), dtype=np.float32)
                     attached_xyz = np.stack(
                         [np.asarray(dataset.points3d[int(pid)].xyz, dtype=np.float32) for pid in attached_pids],
                         axis=0,
                     )
-                    best_by_pid: dict[int, tuple[tuple[float, float], int]] = {}
-                    for local_i, pid in enumerate(attached_pids.tolist()):
-                        key = (float(attached_dists[local_i]), -float(attached_scores[local_i]))
-                        prev = best_by_pid.get(int(pid))
-                        if prev is None or key < prev[0]:
-                            best_by_pid[int(pid)] = (key, int(local_i))
-                    if len(best_by_pid) < int(attached_pids.shape[0]):
-                        keep_local = np.asarray([item[1] for item in best_by_pid.values()], dtype=np.int64)
-                        sp_indices = sp_indices[keep_local]
-                        attached_pids = attached_pids[keep_local]
-                        attached_uvs = attached_uvs[keep_local]
-                        attached_scores = attached_scores[keep_local]
-                        attached_descs = attached_descs[keep_local]
-                        attached_dists = attached_dists[keep_local]
-                        attached_xyz = attached_xyz[keep_local]
                     attached_count = int(attached_pids.shape[0])
                     obs_file = _safe_obs_filename(image_id, image_name)
                     np.savez(
@@ -275,6 +260,71 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                     global_descs.append(attached_descs)
                     total_obs += attached_count
                     frames_with_obs += 1
+            else:
+                sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints(image_name, topk=int(args.max_keypoints))
+                if sp_kpts.shape[0] == 0 and not uses_named_h5:
+                    image = read_image(frame.image_path)
+                    sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints_from_image(
+                        image,
+                        topk=int(args.max_keypoints),
+                    )
+                sp_kpts = np.asarray(sp_kpts, dtype=np.float32).reshape(-1, 2)
+                sp_scores = np.asarray(sp_scores, dtype=np.float32).reshape(-1)
+                sp_descs = _normalise_descriptors(sp_descs)
+                descriptor_dim = max(descriptor_dim, int(sp_descs.shape[1]) if sp_descs.ndim == 2 else 0)
+                if sp_kpts.shape[0] > 0 and valid_positions.shape[0] > 0 and sp_descs.shape[0] > 0:
+                    valid_xys = colmap_xys[valid_positions].astype(np.float32, copy=False)
+                    valid_pids = colmap_pids[valid_positions].astype(np.int64, copy=False)
+                    dists, nn = _nearest_points(sp_kpts, valid_xys)
+                    keep = np.isfinite(dists) & (dists <= radius) & (nn >= 0)
+                    if np.any(keep):
+                        sp_indices = np.flatnonzero(keep).astype(np.int32, copy=False)
+                        attached_pids = valid_pids[nn[keep]].astype(np.int64, copy=False)
+                        attached_uvs = sp_kpts[sp_indices].astype(np.float32, copy=False)
+                        attached_scores = sp_scores[sp_indices].astype(np.float32, copy=False)
+                        attached_descs = sp_descs[sp_indices].astype(descriptor_dtype, copy=False)
+                        attached_dists = dists[keep].astype(np.float32, copy=False)
+                        attached_xyz = np.stack(
+                            [np.asarray(dataset.points3d[int(pid)].xyz, dtype=np.float32) for pid in attached_pids],
+                            axis=0,
+                        )
+                        best_by_pid: dict[int, tuple[tuple[float, float], int]] = {}
+                        for local_i, pid in enumerate(attached_pids.tolist()):
+                            key = (float(attached_dists[local_i]), -float(attached_scores[local_i]))
+                            prev = best_by_pid.get(int(pid))
+                            if prev is None or key < prev[0]:
+                                best_by_pid[int(pid)] = (key, int(local_i))
+                        if len(best_by_pid) < int(attached_pids.shape[0]):
+                            keep_local = np.asarray([item[1] for item in best_by_pid.values()], dtype=np.int64)
+                            sp_indices = sp_indices[keep_local]
+                            attached_pids = attached_pids[keep_local]
+                            attached_uvs = attached_uvs[keep_local]
+                            attached_scores = attached_scores[keep_local]
+                            attached_descs = attached_descs[keep_local]
+                            attached_dists = attached_dists[keep_local]
+                            attached_xyz = attached_xyz[keep_local]
+                        attached_count = int(attached_pids.shape[0])
+                        obs_file = _safe_obs_filename(image_id, image_name)
+                        np.savez(
+                            image_obs_dir / obs_file,
+                            image_name=np.asarray(image_name),
+                            image_id=np.asarray(image_id, dtype=np.int64),
+                            frame_id=np.asarray(frame_id, dtype=np.int32),
+                            sp_indices=sp_indices,
+                            uvs=attached_uvs,
+                            scores=attached_scores,
+                            descs=attached_descs,
+                            point_ids=attached_pids,
+                            xyz=attached_xyz,
+                            attach_dist=attached_dists,
+                        )
+                        global_pids.append(attached_pids)
+                        global_xyz.append(attached_xyz)
+                        global_frame_ids.append(np.full((attached_count,), int(frame_id), dtype=np.int32))
+                        global_uvs.append(attached_uvs)
+                        global_descs.append(attached_descs)
+                        total_obs += attached_count
+                        frames_with_obs += 1
 
             entry_names.append(image_name)
             entry_image_ids.append(image_id)
@@ -334,6 +384,14 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         "num_attached_observations": int(total_obs),
         "num_landmarks": int(num_landmarks),
         "attach_radius_px": float(radius),
+        "sift_attach_mode": str(sift_attach_mode),
+        "sift_match_test": str(args.sift_match_test),
+        "sift_ratio": float(args.sift_ratio),
+        "sift_nfeatures": int(args.sift_nfeatures),
+        "sift_n_octave_layers": int(args.sift_n_octave_layers),
+        "sift_contrast_threshold": float(args.sift_contrast_threshold),
+        "sift_edge_threshold": float(args.sift_edge_threshold),
+        "sift_sigma": float(args.sift_sigma),
         "max_keypoints": int(args.max_keypoints),
         "descriptor_dim": int(descriptor_dim),
         "descriptor_dtype": str(np.dtype(descriptor_dtype)),
@@ -358,6 +416,14 @@ def main() -> None:
     parser.add_argument("--max_keypoints", type=int, default=4096)
     parser.add_argument("--attach_radius_px", type=float, default=5.0)
     parser.add_argument("--method", type=str, default=None)
+    parser.add_argument("--sift_attach_mode", choices=("detected_nearest", "colmap_uv_compute"), default="detected_nearest")
+    parser.add_argument("--sift_match_test", choices=("cosine_margin", "l2_ratio"), default="cosine_margin")
+    parser.add_argument("--sift_ratio", type=float, default=0.80)
+    parser.add_argument("--sift_nfeatures", type=int, default=0)
+    parser.add_argument("--sift_n_octave_layers", type=int, default=3)
+    parser.add_argument("--sift_contrast_threshold", type=float, default=0.04)
+    parser.add_argument("--sift_edge_threshold", type=float, default=10.0)
+    parser.add_argument("--sift_sigma", type=float, default=1.6)
     parser.add_argument("--features_path", type=Path, default=None)
     parser.add_argument("--db_features_path", type=Path, default=None)
     parser.add_argument("--query_features_path", type=Path, default=None)

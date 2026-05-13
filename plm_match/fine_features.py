@@ -79,12 +79,22 @@ class LocalPatchDescriptor:
         top_k: int = 4096,
         match_radius_px: float | None = None,
         image_cache_size: int = 8,
+        sift_nfeatures: int = 0,
+        sift_n_octave_layers: int = 3,
+        sift_contrast_threshold: float = 0.04,
+        sift_edge_threshold: float = 10.0,
+        sift_sigma: float = 1.6,
     ):
         self.method = str(method).lower()
         self.patch_size = float(max(8, int(patch_size)))
         self.top_k = int(max(0, top_k))
         self.match_radius_px = float(match_radius_px) if match_radius_px is not None else float(max(6.0, self.patch_size))
         self.repo_root = repo_root
+        self.sift_nfeatures = int(sift_nfeatures)
+        self.sift_n_octave_layers = int(sift_n_octave_layers)
+        self.sift_contrast_threshold = float(sift_contrast_threshold)
+        self.sift_edge_threshold = float(sift_edge_threshold)
+        self.sift_sigma = float(sift_sigma)
         h5_paths = []
         for p in (features_path, db_features_path, query_features_path):
             if p:
@@ -97,7 +107,13 @@ class LocalPatchDescriptor:
         if self.method == 'sift':
             if not hasattr(cv2, 'SIFT_create'):
                 raise RuntimeError('OpenCV SIFT is unavailable in this environment.')
-            self.impl = cv2.SIFT_create(nfeatures=0)
+            self.impl = cv2.SIFT_create(
+                nfeatures=int(self.sift_nfeatures),
+                nOctaveLayers=int(self.sift_n_octave_layers),
+                contrastThreshold=float(self.sift_contrast_threshold),
+                edgeThreshold=float(self.sift_edge_threshold),
+                sigma=float(self.sift_sigma),
+            )
             self._dim = 128
             self._binary = False
         elif self.method == 'xfeat':
@@ -569,6 +585,47 @@ class LocalPatchDescriptor:
             return None
         return self._normalize(desc[0])
 
+    def _compute_many_sift(self, gray: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
+        pts = np.asarray([np.asarray(p, dtype=np.float32).reshape(2) for p in points], dtype=np.float32)
+        if pts.shape[0] == 0:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        h, w = gray.shape[:2]
+        valid = (
+            (pts[:, 0] >= 0.0)
+            & (pts[:, 0] < float(w))
+            & (pts[:, 1] >= 0.0)
+            & (pts[:, 1] < float(h))
+        )
+        out = np.zeros((pts.shape[0], self.dim), dtype=np.float32)
+        valid_indices = np.flatnonzero(valid).astype(np.int64, copy=False)
+        if valid_indices.shape[0] == 0:
+            return out
+        keypoints = [cv2.KeyPoint(float(pts[i, 0]), float(pts[i, 1]), self.patch_size) for i in valid_indices.tolist()]
+        computed_keypoints, desc = self.impl.compute(gray, keypoints)
+        if desc is None or desc.shape[0] == 0:
+            return out
+        desc = np.asarray(desc, dtype=np.float32).reshape(desc.shape[0], -1)
+        self._dim = int(desc.shape[1])
+        if out.shape[1] != self._dim:
+            new_out = np.zeros((pts.shape[0], self._dim), dtype=np.float32)
+            cols = min(out.shape[1], new_out.shape[1])
+            if cols > 0:
+                new_out[:, :cols] = out[:, :cols]
+            out = new_out
+        normed = np.stack([self._normalize(d) for d in desc], axis=0).astype(np.float32)
+        if normed.shape[0] == valid_indices.shape[0]:
+            out[valid_indices] = normed
+            return out
+        returned = np.asarray([kp.pt for kp in computed_keypoints], dtype=np.float32).reshape(-1, 2)
+        for local_idx, ret_uv in enumerate(returned):
+            if local_idx >= normed.shape[0]:
+                break
+            d2 = np.sum((pts[valid_indices] - ret_uv[None, :]) ** 2, axis=1)
+            nearest = int(np.argmin(d2)) if d2.shape[0] else -1
+            if nearest >= 0 and float(d2[nearest]) <= 1e-4:
+                out[int(valid_indices[nearest])] = normed[int(local_idx)]
+        return out
+
     def extract_at_points(
         self,
         image_rgb: np.ndarray,
@@ -618,6 +675,8 @@ class LocalPatchDescriptor:
             return self._extract_xfeat(image_rgb, points)
         if is_h5_local_feature_method(self.method):
             return self._extract_h5(image_name, points)
+        if self.method == 'sift':
+            return self._compute_many_sift(gray, points)
         descs = []
         for uv in points:
             desc = self._compute_one(gray, np.asarray(uv, dtype=np.float32))
