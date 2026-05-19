@@ -1,0 +1,58 @@
+Cambridge Landmarks final MixVPR runs
+====================================
+
+Final winner: PLM ALIKED native SfM + MixVPR top10 + HLocNN
+
+Setup
+-----
+Local feature: ALIKED H5
+Map/memory: native ALIKED SfM, index-aligned PLM memory
+Retrieval: MixVPR top10
+PLM mode: image_obs_hloc_nn
+Query-time matcher: PLM HLocNN / NN inside PLM, no SuperGlue/LightGlue
+PnP: first/refine thresholds 12px / 12px
+Priors: support/rank/point-support/memory-score/attach-distance weights all 0.0
+
+Cambridge table row
+-------------------
+
+| Method | Memory | Court | King's | Hospital | Shop | St. Mary's | Average |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| PLM ALIKED native SfM + MixVPR + HLocNN | ~857 MB | 14.8/0.1 | 12.1/0.2 | 14.8/0.3 | 3.8/0.2 | 6.7/0.2 | 10.4/0.2 |
+
+Exact winning values
+--------------------
+
+| Scene | Median cm / deg | Strict 25cm/2deg | Runtime/query | Memory |
+|---|---:|---:|---:|---:|
+| GreatCourt | 14.7896 / 0.0960 | 73.2% | 1.134 s | 1020.3 MB |
+| King'sCollege | 12.0992 / 0.2118 | 75.8% | 2.981 s | 1159.8 MB |
+| OldHospital | 14.8488 / 0.3075 | 65.9% | 1.601 s | 852.1 MB |
+| ShopFacade | 3.8032 / 0.2010 | 94.2% | 0.913 s | 176.1 MB |
+| StMarysChurch | 6.6635 / 0.1943 | 95.8% | 0.974 s | 1075.5 MB |
+| Average | 10.4409 / 0.2021 | 81.0% | 1.521 s | 856.8 MB |
+
+Runner-up for comparison: PLM SP+SG SfM + MixVPR top10 + HLocNN
+----------------------------------------------------------------
+
+| Method | Memory | Court | King's | Hospital | Shop | St. Mary's | Average |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| PLM SP+SG SfM + MixVPR + HLocNN | ~1138 MB | 16.0/0.1 | 11.2/0.2 | 14.2/0.3 | 4.2/0.2 | 6.9/0.2 | 10.5/0.2 |
+
+Winning run summaries
+---------------------
+
+GreatCourt:
+outputs/cambridge_greatcourt_lifted/aliked_plm_best_hloc_nn_pnp12_mixvpr10/run_summary.json
+
+King'sCollege:
+outputs/cambridge_kingscollege_lifted/aliked_plm_best_hloc_nn_pnp12_mixvpr10/run_summary.json
+
+OldHospital:
+outputs/cambridge_oldhospital_lifted/aliked_plm_best_hloc_nn_pnp12_mixvpr10/run_summary.json
+
+ShopFacade:
+outputs/cambridge_shopfacade_official/aliked_plm_ablate/image_obs_hloc_nn_full_db_top10_pnp12_mixvpr/run_summary.json
+
+StMarysChurch:
+outputs/cambridge_stmaryschurch_lifted/aliked_plm_best_hloc_nn_pnp12_mixvpr10/run_summary.json

@@ -1,0 +1,120 @@
+Cambridge Landmarks Winning Run Parameters: SP PLM HLoc-NN with NetVLAD
+Generated: 2026-05-19
+
+Core method:
+  method: superpoint_h5
+  local_feature: superpoint_h5
+  landmark_match_mode: image_obs_hloc_nn
+  map_source: colmap
+  SfM map: SuperPoint + SuperGlue HLoc COLMAP reconstruction
+  retrieval: NetVLAD top-10
+  pairwise matcher inside PLM: HLoc-style nearest-neighbor descriptor matching
+  final geometry: existing PLM PnP path, unchanged
+
+Fixed localization parameters:
+  topk: 10
+  query_topk: 4096
+  pnp_first_thresh: 12.0
+  pnp_refine_thresh: 12.0
+  pnp_iterations: 8000
+  min_final_inliers: 12
+  metric_thresholds: 0.05/5,0.25/2,0.5/5
+
+Disabled score priors / rerank terms:
+  support_weight: 0.0
+  point_support_weight: 0.0
+  rank_weight: 0.0
+  attach_dist_weight: 0.0
+  memory_score_weight: 0.0
+  prototype_support_weight: 0.0
+  landmark_reliability_weight: 0.0
+  rerank_method: none
+  pairwise_matcher: none
+  pose_guided: false
+  preverify_geometry: off
+  sequence_activation: off
+
+Memory / backend:
+  memory_search_backend: exact
+  memory_search_backend_effective: exact
+  memory_score_mode: point_memory
+  memory_rerank_vectorized: true
+  point_memory_max_obs: 0
+  point_memory_batch_size: 256
+  point_search_exact: true
+  descriptor_context: none
+
+Scene-specific inputs:
+
+GreatCourt:
+  config: configs/cambridge_greatcourt_lifted.yaml
+  dataset_root: /mnt/d/private/pairs/cambridge_landmarks/GreatCourt
+  split_json: outputs/cambridge_greatcourt_lifted/split/split.json
+  attached_index: outputs/cambridge_greatcourt_lifted/sp_colmap_attach_hloc_index
+  retrieval_file: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/pairs-query-netvlad10.txt
+  db_features_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/feats-superpoint-n4096-r1024.h5
+  query_features_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/feats-superpoint-n4096-r1024.h5
+  out_dir: outputs/cambridge_greatcourt_lifted/sp_hloc_nn_plm_pnp12
+
+KingsCollege:
+  config: configs/cambridge_kingscollege_lifted.yaml
+  dataset_root: /mnt/d/private/pairs/cambridge_landmarks/KingsCollege
+  split_json: outputs/cambridge_kingscollege_lifted/split/split.json
+  attached_index: outputs/cambridge_kingscollege_lifted/sp_colmap_attach_hloc_index
+  retrieval_file: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/KingsCollege/pairs-query-netvlad10.txt
+  db_features_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/KingsCollege/feats-superpoint-n4096-r1024.h5
+  query_features_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/KingsCollege/feats-superpoint-n4096-r1024.h5
+  out_dir: outputs/cambridge_kingscollege_lifted/sp_hloc_nn_plm_pnp12
+
+OldHospital:
+  config: configs/cambridge_oldhospital_lifted.yaml
+  dataset_root: /mnt/d/private/pairs/cambridge_landmarks/OldHospital
+  split_json: outputs/cambridge_oldhospital_lifted/split/split.json
+  attached_index: outputs/cambridge_oldhospital_lifted/sp_colmap_attach_hloc_index
+  retrieval_file: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/pairs-query-netvlad10.txt
+  db_features_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/feats-superpoint-n4096-r1024.h5
+  query_features_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/feats-superpoint-n4096-r1024.h5
+  out_dir: outputs/cambridge_oldhospital_lifted/sp_hloc_nn_plm_pnp12
+
+ShopFacade:
+  config: configs/cambridge_shopfacade_hloc_sp_sg.yaml
+  dataset_root: /mnt/d/private/pairs/cambridge_landmarks/ShopFacade
+  split_json: outputs/cambridge_shopfacade_official/split/split.json
+  attached_index: outputs/cambridge_shopfacade_official/sp_colmap_attach_hloc_sp_sg_index
+  retrieval_file: outputs/cambridge_shopfacade_official/retrieval/pairs-loo-netvlad10.txt
+  db_features_path: outputs/hloc_cambridge_sp_sg/ShopFacade/feats-superpoint-n4096-r1024.h5
+  query_features_path: outputs/hloc_cambridge_sp_sg/ShopFacade/feats-superpoint-n4096-r1024.h5
+  out_dir: outputs/cambridge_shopfacade_official/sp_hloc_nn_plm_pnp12
+
+StMarysChurch:
+  config: configs/cambridge_stmaryschurch_lifted.yaml
+  dataset_root: /mnt/d/private/pairs/cambridge_landmarks/StMarysChurch
+  split_json: outputs/cambridge_stmaryschurch_lifted/split/split.json
+  attached_index: outputs/cambridge_stmaryschurch_lifted/sp_colmap_attach_hloc_index
+  retrieval_file: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/pairs-query-netvlad10.txt
+  db_features_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/feats-superpoint-n4096-r1024.h5
+  query_features_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/feats-superpoint-n4096-r1024.h5
+  out_dir: outputs/cambridge_stmaryschurch_lifted/sp_hloc_nn_plm_pnp12
+
+Command template:
+  python -m plm_match.pipelines.lifted_nn_localize \
+    --config <scene_config> \
+    --dataset_root <scene_dataset_root> \
+    --split_json <scene_split_json> \
+    --attached_index <scene_attached_index> \
+    --retrieval_file <scene_netvlad_top10_pairs> \
+    --out_dir <scene_out_dir> \
+    --method superpoint_h5 \
+    --db_features_path <scene_superpoint_h5> \
+    --query_features_path <scene_superpoint_h5> \
+    --landmark_match_mode image_obs_hloc_nn \
+    --topk 10 \
+    --query_topk 4096 \
+    --pnp_first_thresh 12.0 \
+    --pnp_refine_thresh 12.0 \
+    --min_final_inliers 12 \
+    --metric_thresholds 0.05/5,0.25/2,0.5/5 \
+    --support_weight 0.0 \
+    --point_support_weight 0.0 \
+    --rank_weight 0.0 \
+    --attach_dist_weight 0.0

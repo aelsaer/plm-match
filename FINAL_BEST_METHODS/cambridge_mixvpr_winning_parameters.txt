@@ -1,0 +1,103 @@
+Winning Cambridge MixVPR PLM run parameters
+==========================================
+
+Winning version
+---------------
+
+PLM ALIKED native SfM + MixVPR top10 + HLocNN.
+
+This is the best complete Cambridge MixVPR row found so far:
+Average = 10.4 cm / 0.2 deg.
+
+Core parameters
+---------------
+
+method: aliked_h5
+map/memory: native ALIKED SfM, index-aligned PLM memory
+attached_index: outputs/<scene_tag>/aliked_native_netvlad_index_aligned
+retrieval: MixVPR top10
+retrieval_file: outputs/<scene_tag>/retrieval_mixvpr/pairs-loo-mixvpr10.txt
+landmark_match_mode: image_obs_hloc_nn
+pairwise_matcher: none
+topk: 10
+query_topk: 4096
+pnp_first_thresh: 12.0
+pnp_refine_thresh: 12.0
+memory_score_weight: 0.0
+support_weight: 0.0
+point_support_weight: 0.0
+rank_weight: 0.0
+attach_dist_weight: 0.0
+oracle_candidate_diagnostic: enabled for diagnostics only
+
+Command template
+----------------
+
+PY=/home/andreas/anaconda3/envs/sam3/bin/python
+
+while IFS='|' read -r TAG CFG ROOT SPLIT QRET; do
+  BASE=outputs/${TAG}
+
+  $PY -m plm_match.pipelines.lifted_nn_localize \
+    --config "${BASE}/aliked_native_netvlad_sfm/config_aliked_native.yaml" \
+    --dataset_root "$ROOT" \
+    --split_json "$SPLIT" \
+    --attached_index "${BASE}/aliked_native_netvlad_index_aligned" \
+    --retrieval_file "$QRET" \
+    --out_dir "${BASE}/aliked_plm_best_hloc_nn_pnp12_mixvpr10" \
+    --method aliked_h5 \
+    --db_features_path "${BASE}/aliked_features/db.h5" \
+    --query_features_path "${BASE}/aliked_features/query.h5" \
+    --landmark_match_mode image_obs_hloc_nn \
+    --memory_score_weight 0.0 \
+    --topk 10 \
+    --query_topk 4096 \
+    --pnp_first_thresh 12.0 \
+    --pnp_refine_thresh 12.0 \
+    --oracle_candidate_diagnostic \
+    --support_weight 0.0 \
+    --point_support_weight 0.0 \
+    --rank_weight 0.0 \
+    --attach_dist_weight 0.0
+done <<'EOF'
+cambridge_greatcourt_lifted|configs/cambridge_greatcourt_lifted.yaml|/mnt/d/private/pairs/cambridge_landmarks/GreatCourt|outputs/cambridge_greatcourt_lifted/split/split.json|outputs/cambridge_greatcourt_lifted/retrieval_mixvpr/pairs-loo-mixvpr10.txt
+cambridge_kingscollege_lifted|configs/cambridge_kingscollege_lifted.yaml|/mnt/d/private/pairs/cambridge_landmarks/KingsCollege|outputs/cambridge_kingscollege_lifted/split/split.json|outputs/cambridge_kingscollege_lifted/retrieval_mixvpr/pairs-loo-mixvpr10.txt
+cambridge_oldhospital_lifted|configs/cambridge_oldhospital_lifted.yaml|/mnt/d/private/pairs/cambridge_landmarks/OldHospital|outputs/cambridge_oldhospital_lifted/split/split.json|outputs/cambridge_oldhospital_lifted/retrieval_mixvpr/pairs-loo-mixvpr10.txt
+cambridge_stmaryschurch_lifted|configs/cambridge_stmaryschurch_lifted.yaml|/mnt/d/private/pairs/cambridge_landmarks/StMarysChurch|outputs/cambridge_stmaryschurch_lifted/split/split.json|outputs/cambridge_stmaryschurch_lifted/retrieval_mixvpr/pairs-loo-mixvpr10.txt
+EOF
+
+ShopFacade winning command
+--------------------------
+
+ShopFacade used the matching setup below because its best ALIKED MixVPR HLocNN run is stored under the ablation folder:
+
+PY=/home/andreas/anaconda3/envs/sam3/bin/python
+
+$PY -m plm_match.pipelines.lifted_nn_localize \
+  --config outputs/cambridge_shopfacade_official/aliked_native_netvlad_sfm/config_aliked_native.yaml \
+  --dataset_root /mnt/d/private/pairs/cambridge_landmarks/ShopFacade \
+  --split_json outputs/cambridge_shopfacade_official/split/split.json \
+  --attached_index outputs/cambridge_shopfacade_official/aliked_native_netvlad_index_aligned \
+  --retrieval_file outputs/cambridge_shopfacade_official/retrieval_mixvpr/pairs-loo-mixvpr10.txt \
+  --out_dir outputs/cambridge_shopfacade_official/aliked_plm_ablate/image_obs_hloc_nn_full_db_top10_pnp12_mixvpr \
+  --method aliked_h5 \
+  --db_features_path outputs/cambridge_shopfacade_official/aliked_features/db.h5 \
+  --query_features_path outputs/cambridge_shopfacade_official/aliked_features/query.h5 \
+  --landmark_match_mode image_obs_hloc_nn \
+  --memory_score_weight 0.0 \
+  --topk 10 \
+  --query_topk 4096 \
+  --pnp_first_thresh 12.0 \
+  --pnp_refine_thresh 12.0 \
+  --oracle_candidate_diagnostic \
+  --support_weight 0.0 \
+  --point_support_weight 0.0 \
+  --rank_weight 0.0 \
+  --attach_dist_weight 0.0
+
+Notes
+-----
+
+The command above uses NN/HLocNN inside PLM before PnP.
+It does not run SuperGlue or LightGlue at query time.
+MixVPR is used only as the image retrieval frontend.

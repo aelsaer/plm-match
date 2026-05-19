@@ -2859,6 +2859,125 @@ def _lifted_point_landmark_nn_exact(
     return out
 
 
+def _lifted_point_landmark_hloc_nn(
+    *,
+    q_kpts: np.ndarray,
+    q_descs: np.ndarray,
+    candidate_point_ids: np.ndarray,
+    index: AttachedSPCOLMAPIndex,
+    mode: str,
+    point_memory_max_obs: int,
+    point_memory_batch_size: int,
+    point_memory_obs_select: str = "first",
+    support_info: dict[int, dict[str, object]] | None = None,
+) -> list[LiftedHypothesis]:
+    """Point-level memory matching with HLoc mutual-NN semantics."""
+    mode = str(mode)
+    base_mode = mode.removesuffix("_hloc_nn")
+    if base_mode not in {"point_mean", "point_memory"}:
+        raise ValueError(f"Unsupported HLoc-NN point mode: {mode}")
+    candidate_point_ids = np.asarray(candidate_point_ids, dtype=np.int64).reshape(-1)
+    candidate_point_ids = candidate_point_ids[candidate_point_ids >= 0]
+    if q_descs.shape[0] == 0 or candidate_point_ids.shape[0] == 0:
+        return []
+    point_indices = index.point_indices_for_ids(candidate_point_ids)
+    valid = point_indices >= 0
+    if not np.any(valid):
+        return []
+    candidate_point_ids = candidate_point_ids[valid].astype(np.int64, copy=False)
+    point_indices = point_indices[valid].astype(np.int64, copy=False)
+    xyz = np.asarray(index.point_xyz[point_indices], dtype=np.float64)
+
+    item_desc_chunks: list[np.ndarray] = []
+    item_point_local_chunks: list[np.ndarray] = []
+    if base_mode == "point_mean":
+        descs = index.point_mean_descriptors()[point_indices].astype(np.float32, copy=False)
+        if descs.ndim != 2 or descs.shape[0] == 0:
+            return []
+        item_descs = _normalise_descriptors(descs)
+        item_point_local = np.arange(int(descs.shape[0]), dtype=np.int64)
+    else:
+        offsets = np.asarray(index.point_obs_offsets, dtype=np.int64)
+        memory_descs = index.contextual_point_obs_descs()
+        for local_idx, point_idx in enumerate(point_indices.tolist()):
+            point_idx = int(point_idx)
+            if point_idx < 0 or point_idx + 1 >= offsets.shape[0]:
+                continue
+            obs_start = int(offsets[point_idx])
+            obs_end = int(offsets[point_idx + 1])
+            if obs_end <= obs_start:
+                continue
+            selected = _select_point_observation_indices(
+                memory_descs,
+                obs_start,
+                obs_end,
+                max_obs=int(point_memory_max_obs),
+                obs_select=str(point_memory_obs_select),
+            )
+            if selected.shape[0] == 0:
+                continue
+            descs = index.point_obs_descriptors(selected)
+            if descs.shape[0] == 0:
+                continue
+            item_desc_chunks.append(descs)
+            item_point_local_chunks.append(np.full((descs.shape[0],), int(local_idx), dtype=np.int64))
+        if not item_desc_chunks:
+            return []
+        item_descs = _normalise_descriptors(np.concatenate(item_desc_chunks, axis=0).astype(np.float32, copy=False))
+        item_point_local = np.concatenate(item_point_local_chunks, axis=0).astype(np.int64, copy=False)
+
+    if item_descs.ndim != 2 or item_descs.shape[0] == 0 or item_descs.shape[1] != q_descs.shape[1]:
+        return []
+    q_descs = q_descs.astype(np.float32, copy=False)
+    batch_size = max(1, int(point_memory_batch_size))
+    best_item = np.full((int(q_descs.shape[0]),), -1, dtype=np.int64)
+    best_score = np.full((int(q_descs.shape[0]),), -np.inf, dtype=np.float32)
+    best_q_for_item = np.full((int(item_descs.shape[0]),), -1, dtype=np.int64)
+    best_item_score = np.full((int(item_descs.shape[0]),), -np.inf, dtype=np.float32)
+
+    for start in range(0, int(q_descs.shape[0]), batch_size):
+        end = min(int(q_descs.shape[0]), start + batch_size)
+        sims = q_descs[start:end] @ item_descs.T
+        local_best = np.argmax(sims, axis=1).astype(np.int64, copy=False)
+        local_scores = sims[np.arange(int(sims.shape[0]), dtype=np.int64), local_best].astype(np.float32, copy=False)
+        best_item[start:end] = local_best
+        best_score[start:end] = local_scores
+        local_item_best_q = np.argmax(sims, axis=0).astype(np.int64, copy=False) + int(start)
+        local_item_scores = np.max(sims, axis=0).astype(np.float32, copy=False)
+        improve = local_item_scores > best_item_score
+        if np.any(improve):
+            best_item_score[improve] = local_item_scores[improve]
+            best_q_for_item[improve] = local_item_best_q[improve]
+
+    out: list[LiftedHypothesis] = []
+    rows = np.arange(int(q_descs.shape[0]), dtype=np.int64)
+    keep = (best_item >= 0) & (best_q_for_item[best_item] == rows)
+    for q_idx in np.flatnonzero(keep).tolist():
+        item_idx = int(best_item[int(q_idx)])
+        local_point_idx = int(item_point_local[item_idx])
+        if local_point_idx < 0 or local_point_idx >= int(candidate_point_ids.shape[0]):
+            continue
+        pid = int(candidate_point_ids[local_point_idx])
+        info = support_info.get(pid, {}) if support_info is not None else {}
+        support_images = tuple(str(x) for x in info.get("support_images", ()))
+        hloc_score = 0.5 * (float(best_score[int(q_idx)]) + 1.0)
+        out.append(
+            LiftedHypothesis(
+                q_idx=int(q_idx),
+                q_uv=(q_kpts[int(q_idx)].astype(np.float64, copy=False) + 0.5),
+                point_id=pid,
+                xyz=xyz[local_point_idx].astype(np.float64, copy=False),
+                desc_score=float(hloc_score),
+                db_rank=-1,
+                db_image=f"__{mode}__",
+                rank_prior=float(info.get("best_rank_prior", 0.0)),
+                attach_dist=0.0,
+                support_images=support_images,
+            )
+        )
+    return out
+
+
 def _lifted_point_landmark_nn_vocab(
     *,
     q_kpts: np.ndarray,
@@ -3179,6 +3298,21 @@ def _lifted_point_landmark_nn(
     vocab_compare_exact: bool = False,
     search_stats: dict[str, object] | None = None,
 ) -> list[LiftedHypothesis]:
+    mode = str(mode)
+    if mode in {"point_mean_hloc_nn", "point_memory_hloc_nn"}:
+        if str(memory_search_backend) != "exact" or bool(vocab_compare_exact):
+            raise ValueError("Point-level HLoc-NN modes currently support only exact memory search.")
+        return _lifted_point_landmark_hloc_nn(
+            q_kpts=q_kpts,
+            q_descs=q_descs,
+            candidate_point_ids=candidate_point_ids,
+            index=index,
+            mode=mode,
+            point_memory_max_obs=point_memory_max_obs,
+            point_memory_batch_size=point_memory_batch_size,
+            point_memory_obs_select=point_memory_obs_select,
+            support_info=support_info,
+        )
     backend = str(memory_search_backend)
     if backend not in {"exact", "vocab"}:
         raise ValueError(f"Unsupported memory_search_backend: {backend}")
@@ -4486,7 +4620,7 @@ def _localize_one_query(
         rank_prior_by_name = {}
     use_joint_obs = landmark_match_mode == "image_obs_joint"
     use_c2f = landmark_match_mode == "image_obs_c2f"
-    use_hloc_nn = landmark_match_mode == "image_obs_hloc_nn"
+    use_hloc_nn = landmark_match_mode in {"image_obs_hloc_nn", "point_mean_hloc_nn", "point_memory_hloc_nn"}
     use_viewproto = landmark_match_mode in {"point_viewproto", "point_viewproto_support"}
     memory_score_mode = str(cfg.get("memory_score_mode", "point_memory"))
     memory_search_backend = str(cfg.get("memory_search_backend", "exact"))
@@ -4803,7 +4937,9 @@ def _localize_one_query(
         "image_obs_hloc_nn",
         "image_obs_joint",
         "point_mean",
+        "point_mean_hloc_nn",
         "point_memory",
+        "point_memory_hloc_nn",
         "point_memory_support",
         "point_viewproto",
         "point_viewproto_support",
@@ -6305,7 +6441,9 @@ def main() -> None:
             "image_obs_hloc_nn",
             "image_obs_joint",
             "point_mean",
+            "point_mean_hloc_nn",
             "point_memory",
+            "point_memory_hloc_nn",
             "point_memory_support",
             "point_viewproto",
             "point_viewproto_support",

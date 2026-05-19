@@ -1,0 +1,38 @@
+Cambridge Landmarks Final Run: SP PLM HLoc-NN with NetVLAD
+Generated: 2026-05-19
+
+Method:
+  PLM landmark localization with SuperPoint local features, SP+SG SfM maps,
+  HLoc-style nearest-neighbor query-to-retrieved-DB matching, and NetVLAD top-10 retrieval.
+
+Main aggregate to report:
+  Scene-macro average median pose: 11.23 cm / 0.210 deg
+  Scene-macro 5cm/5deg: 25.4%
+  Scene-macro 25cm/2deg: 78.1%
+  Scene-macro 50cm/5deg: 91.6%
+  Scene-macro mean inliers: 2131.6
+  Scene-macro FPS: 1.15
+
+Query-weighted aggregate across 1918 queries:
+  Query-weighted average of scene medians: 13.01 cm / 0.184 deg
+  Query-weighted 5cm/5deg: 19.9%
+  Query-weighted 25cm/2deg: 74.9%
+  Query-weighted 50cm/5deg: 89.2%
+  Query-weighted mean inliers: 2004.5
+  Query-weighted runtime FPS: 1.08
+
+Per-scene results:
+
+Scene            Queries  Median pose          5cm/5deg  25cm/2deg  50cm/5deg  Mean inliers  FPS
+GreatCourt       760      18.22 cm / 0.111 deg  11.7%      60.5%      80.0%       1314.9        1.72
+KingsCollege     343      11.78 cm / 0.203 deg  15.7%      74.9%      91.0%       3254.4        0.88
+OldHospital      182      14.34 cm / 0.302 deg   8.8%      65.4%      88.5%       1813.3        0.59
+ShopFacade       103       4.25 cm / 0.204 deg  60.2%      95.1%      99.0%       2030.3        1.63
+StMarysChurch    530       7.57 cm / 0.229 deg  30.4%      94.7%      99.4%       2244.9        0.93
+
+Run summaries:
+  outputs/cambridge_greatcourt_lifted/sp_hloc_nn_plm_pnp12/run_summary.json
+  outputs/cambridge_kingscollege_lifted/sp_hloc_nn_plm_pnp12/run_summary.json
+  outputs/cambridge_oldhospital_lifted/sp_hloc_nn_plm_pnp12/run_summary.json
+  outputs/cambridge_shopfacade_official/sp_hloc_nn_plm_pnp12/run_summary.json
+  outputs/cambridge_stmaryschurch_lifted/sp_hloc_nn_plm_pnp12/run_summary.json
