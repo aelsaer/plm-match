@@ -33,6 +33,16 @@ def _bool_arg(cmd: list[str], flag: str, enabled: bool | None) -> None:
         cmd.append(flag if enabled else f"--no-{flag.lstrip('-')}")
 
 
+def _matcher_run_name(matcher_conf: str) -> str:
+    normalized = str(matcher_conf).strip().lower()
+    if normalized == "superglue":
+        return "matcher_sg_lifted"
+    if normalized == "superpoint+lightglue":
+        return "matcher_lg_lifted"
+    safe = "".join(ch if ch.isalnum() else "_" for ch in normalized).strip("_")
+    return f"matcher_{safe}_lifted"
+
+
 def _base_lifted_cmd(
     *,
     args: argparse.Namespace,
@@ -50,6 +60,8 @@ def _base_lifted_cmd(
     attach_dist_weight: float,
     pose_guided: bool | None = None,
     point_memory: bool = False,
+    sift_descriptor_norm: str | None = None,
+    sift_ratio: float | None = None,
 ) -> list[str]:
     cmd = [
         args.python,
@@ -83,6 +95,8 @@ def _base_lifted_cmd(
         f"{float(point_support_weight):g}",
         "--rank_weight",
         f"{float(rank_weight):g}",
+        "--prototype_support_weight",
+        f"{float(args.prototype_support_weight):g}",
         "--attach_dist_weight",
         f"{float(attach_dist_weight):g}",
         "--max_cluster_images",
@@ -106,7 +120,7 @@ def _base_lifted_cmd(
                 "--sift_match_test",
                 str(args.sift_match_test),
                 "--sift_ratio",
-                f"{float(args.sift_ratio):g}",
+                f"{float(sift_ratio if sift_ratio is not None else args.sift_ratio):g}",
                 "--sift_nfeatures",
                 str(int(args.sift_nfeatures)),
                 "--sift_n_octave_layers",
@@ -117,17 +131,25 @@ def _base_lifted_cmd(
                 f"{float(args.sift_edge_threshold):g}",
                 "--sift_sigma",
                 f"{float(args.sift_sigma):g}",
+                "--sift_descriptor_norm",
+                str(sift_descriptor_norm if sift_descriptor_norm is not None else args.sift_descriptor_norm),
             ]
         )
     if args.metric_thresholds is not None:
         cmd.extend(["--metric_thresholds", str(args.metric_thresholds)])
-    if point_memory:
+    if point_memory or str(mode).startswith("point_viewproto"):
         cmd.extend(
             [
                 "--point_memory_max_obs",
                 str(int(args.point_memory_max_obs)),
                 "--point_memory_batch_size",
                 str(int(args.point_memory_batch_size)),
+                "--point_viewproto_k",
+                str(int(args.point_viewproto_k)),
+                "--point_viewproto_min_obs",
+                str(int(args.point_viewproto_min_obs)),
+                "--point_viewproto_method",
+                str(args.point_viewproto_method),
             ]
         )
     _bool_arg(cmd, "--pose_guided", pose_guided)
@@ -153,7 +175,7 @@ def _infer_map_source(args: argparse.Namespace) -> str:
     return "colmap"
 
 
-def _sg_lifted_cmd(args: argparse.Namespace, out_dir: Path, map_source: str) -> list[str]:
+def _matcher_lifted_cmd(args: argparse.Namespace, out_dir: Path, map_source: str, matcher_conf: str) -> list[str]:
     weights = args.superglue_weights
     if weights == "auto":
         weights = "indoor" if map_source == "rgbd" else "outdoor"
@@ -175,9 +197,9 @@ def _sg_lifted_cmd(args: argparse.Namespace, out_dir: Path, map_source: str) -> 
             str(args.query_features_path),
             "--skip_feature_extraction",
             "--matcher_conf",
-            "superglue",
-            "--superglue_weights",
-            str(weights),
+            str(matcher_conf),
+            "--method_name",
+            f"HLoc {matcher_conf} RGB-D",
             "--topk",
             str(int(args.topk)),
             "--ransac_thresh",
@@ -202,17 +224,21 @@ def _sg_lifted_cmd(args: argparse.Namespace, out_dir: Path, map_source: str) -> 
             "--query_features_path",
             str(args.query_features_path),
             "--matcher_conf",
-            "superglue",
-            "--superglue_weights",
-            str(weights),
+            str(matcher_conf),
             "--topk",
             str(int(args.topk)),
             "--ransac_thresh",
             f"{float(args.pnp_first_thresh):g}",
         ]
+    if "superglue" in str(matcher_conf).lower():
+        cmd.extend(["--superglue_weights", str(weights)])
+        if args.superglue_weights_path is not None:
+            cmd.extend(["--superglue_weights_path", str(args.superglue_weights_path)])
     _path_arg(cmd, "--dataset_root", args.dataset_root)
     if args.metric_thresholds is not None:
         cmd.extend(["--metric_thresholds", str(args.metric_thresholds)])
+    if args.max_queries is not None:
+        cmd.extend(["--max_queries", str(int(args.max_queries))])
     if args.overwrite:
         cmd.append("--overwrite")
     return cmd
@@ -234,6 +260,7 @@ def _planned_runs(args: argparse.Namespace) -> list[RunSpec]:
     results = suite_root / "results"
     sp = Path(args.attached_index_sp)
     sift = Path(args.attached_index_sift) if args.attached_index_sift is not None else None
+    rootsift = Path(args.attached_index_rootsift) if args.attached_index_rootsift is not None else None
     radius5 = Path(args.attached_index_radius5) if args.attached_index_radius5 is not None else _derive_radius5_index(sp)
     map_source = _infer_map_source(args)
 
@@ -254,6 +281,8 @@ def _planned_runs(args: argparse.Namespace) -> list[RunSpec]:
         rank_weight: float | None = None,
         pose_guided: bool | None = None,
         point_memory: bool = False,
+        sift_descriptor_norm: str | None = None,
+        sift_ratio: float | None = None,
     ) -> None:
         out_dir = results / name
         cmd = _base_lifted_cmd(
@@ -272,6 +301,8 @@ def _planned_runs(args: argparse.Namespace) -> list[RunSpec]:
             attach_dist_weight=float(args.attach_dist_weight),
             pose_guided=pose_guided,
             point_memory=point_memory,
+            sift_descriptor_norm=sift_descriptor_norm,
+            sift_ratio=sift_ratio,
         )
         runs.append(RunSpec(name=name, command=cmd, attached_index=attached_index, out_dir=out_dir, group=group))
 
@@ -305,27 +336,44 @@ def _planned_runs(args: argparse.Namespace) -> list[RunSpec]:
             point_memory=True,
         )
     if "matcher" in groups:
-        out_dir = results / "matcher_sg_lifted"
-        runs.append(
-            RunSpec(
-                name="matcher_sg_lifted",
-                command=_sg_lifted_cmd(args, out_dir, map_source),
-                attached_index=sp,
-                out_dir=out_dir,
-                group="matcher",
+        matcher_confs = [item.strip() for item in str(args.matcher_confs).split(",") if item.strip()]
+        for matcher_conf in matcher_confs:
+            name = _matcher_run_name(matcher_conf)
+            out_dir = results / name
+            runs.append(
+                RunSpec(
+                    name=name,
+                    command=_matcher_lifted_cmd(args, out_dir, map_source, matcher_conf),
+                    attached_index=sp,
+                    out_dir=out_dir,
+                    group="matcher",
+                )
             )
-        )
     if "feature" in groups:
-        if sift is None:
-            raise ValueError("--attached_index_sift is required for mode_groups including feature")
-        add_lifted(
-            name="feature_sift_image_obs",
-            group="feature",
-            attached_index=sift,
-            method="sift",
-            ratio_margin=float(args.sift_ratio_margin),
-            min_similarity=float(args.sift_min_similarity),
-        )
+        if sift is None and rootsift is None:
+            raise ValueError("--attached_index_sift or --attached_index_rootsift is required for mode_groups including feature")
+        if sift is not None:
+            add_lifted(
+                name="feature_sift_image_obs",
+                group="feature",
+                attached_index=sift,
+                method="sift",
+                ratio_margin=float(args.sift_ratio_margin),
+                min_similarity=float(args.sift_min_similarity),
+                sift_descriptor_norm="l2",
+                sift_ratio=float(args.sift_ratio),
+            )
+        if rootsift is not None:
+            add_lifted(
+                name="feature_rootsift_image_obs",
+                group="feature",
+                attached_index=rootsift,
+                method="sift",
+                ratio_margin=float(args.sift_ratio_margin),
+                min_similarity=float(args.sift_min_similarity),
+                sift_descriptor_norm="rootsift",
+                sift_ratio=float(args.rootsift_ratio),
+            )
     if "sensitivity" in groups:
         add_lifted(name="sensitivity_topk10", group="sensitivity", attached_index=sp, topk=10)
         add_lifted(name="sensitivity_topk30", group="sensitivity", attached_index=sp, topk=30)
@@ -368,6 +416,37 @@ def _run_checked(command: list[str]) -> None:
     subprocess.run(command, cwd=str(ROOT), check=True)
 
 
+def _split_query_count(split_json: Path) -> int | None:
+    try:
+        split = json.loads(Path(split_json).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    queries = split.get("queries")
+    if isinstance(queries, list):
+        return len(queries)
+    query_images = split.get("query_images")
+    if isinstance(query_images, list):
+        return len(query_images)
+    return None
+
+
+def _existing_num_queries(metrics_path: Path) -> int | None:
+    candidates = [Path(metrics_path), Path(metrics_path).with_name("run_summary.json")]
+    for path in candidates:
+        try:
+            metrics = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        value = metrics.get("num_queries")
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _write_plan(suite_root: Path, runs: list[RunSpec]) -> None:
     plan = [
         {
@@ -392,14 +471,52 @@ def _summarize(args: argparse.Namespace, results_dir: Path, summary_dir: Path) -
     _run_checked(command)
 
 
+def _hloc_eval_cmd(args: argparse.Namespace, run: RunSpec) -> list[str] | None:
+    if args.hloc_eval_model is None:
+        return None
+    results_file = run.out_dir / "hloc_results.txt"
+    if not results_file.exists():
+        return None
+    cmd = [
+        args.python,
+        "tools/evaluate_hloc_style_results.py",
+        "--model",
+        str(args.hloc_eval_model),
+        "--results",
+        str(results_file),
+        "--out",
+        str(run.out_dir / "hloc_eval.json"),
+    ]
+    if args.hloc_eval_list is not None:
+        cmd.extend(["--list_file", str(args.hloc_eval_list)])
+    if args.hloc_eval_thresholds is not None:
+        cmd.extend(["--thresholds", str(args.hloc_eval_thresholds)])
+    elif args.metric_thresholds is not None:
+        cmd.extend(["--thresholds", str(args.metric_thresholds)])
+    if args.hloc_eval_only_localized:
+        cmd.append("--only_localized")
+    return cmd
+
+
+def _run_hloc_eval_if_needed(args: argparse.Namespace, run: RunSpec) -> None:
+    cmd = _hloc_eval_cmd(args, run)
+    if cmd is None:
+        return
+    out = run.out_dir / "hloc_eval.json"
+    if out.exists() and not args.overwrite:
+        return
+    _run_checked(cmd)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plan and run the PLM-LiftedNN ablation suite.")
+    parser = argparse.ArgumentParser(description="Plan and run the PLMLoc ablation suite.")
     parser.add_argument("--dataset_name", required=True)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--split_json", required=True, type=Path)
     parser.add_argument("--base_dir", required=True, type=Path)
     parser.add_argument("--attached_index_sp", required=True, type=Path)
     parser.add_argument("--attached_index_sift", type=Path, default=None)
+    parser.add_argument("--attached_index_rootsift", type=Path, default=None)
     parser.add_argument("--attached_index_radius5", type=Path, default=None)
     parser.add_argument("--retrieval_file", required=True, type=Path)
     parser.add_argument("--db_features_path", type=Path, default=None)
@@ -420,14 +537,17 @@ def main() -> None:
     parser.add_argument("--sift_min_similarity", type=float, default=0.45)
     parser.add_argument("--sift_match_test", choices=("cosine_margin", "l2_ratio"), default="l2_ratio")
     parser.add_argument("--sift_ratio", type=float, default=0.80)
+    parser.add_argument("--rootsift_ratio", type=float, default=0.80)
     parser.add_argument("--sift_nfeatures", type=int, default=0)
     parser.add_argument("--sift_n_octave_layers", type=int, default=3)
     parser.add_argument("--sift_contrast_threshold", type=float, default=0.04)
     parser.add_argument("--sift_edge_threshold", type=float, default=10.0)
     parser.add_argument("--sift_sigma", type=float, default=1.6)
+    parser.add_argument("--sift_descriptor_norm", choices=("l2", "rootsift"), default="l2")
     parser.add_argument("--support_weight", type=float, default=0.03)
     parser.add_argument("--point_support_weight", type=float, default=0.02)
     parser.add_argument("--rank_weight", type=float, default=0.02)
+    parser.add_argument("--prototype_support_weight", type=float, default=0.0)
     parser.add_argument("--attach_dist_weight", type=float, default=0.0)
     parser.add_argument("--max_cluster_images", type=int, default=5)
     parser.add_argument("--max_cluster_seeds", type=int, default=10)
@@ -436,14 +556,29 @@ def main() -> None:
     parser.add_argument("--min_final_inliers", type=int, default=12)
     parser.add_argument("--point_memory_max_obs", type=int, default=0)
     parser.add_argument("--point_memory_batch_size", type=int, default=256)
+    parser.add_argument("--point_viewproto_k", type=int, default=4)
+    parser.add_argument("--point_viewproto_min_obs", type=int, default=2)
+    parser.add_argument("--point_viewproto_method", choices=("descriptor_kmeans", "viewdir_kmeans", "farthest_desc"), default="descriptor_kmeans")
+    parser.add_argument("--matcher_confs", type=str, default="superglue", help="Comma-separated HLoc matcher configs for matcher ablations.")
     parser.add_argument("--superglue_weights", choices=("auto", "outdoor", "indoor"), default="auto")
+    parser.add_argument("--superglue_weights_path", type=Path, default=None)
     parser.add_argument("--max_queries", type=int, default=None)
+    parser.add_argument("--hloc_eval_model", type=Path, default=None, help="Optional COLMAP GT model for HLoc-style evaluation.")
+    parser.add_argument("--hloc_eval_list", type=Path, default=None, help="Optional image list for HLoc-style evaluation.")
+    parser.add_argument("--hloc_eval_thresholds", type=str, default=None, help="Optional thresholds for HLoc-style evaluation.")
+    parser.add_argument("--hloc_eval_only_localized", action="store_true")
     args = parser.parse_args()
 
     groups = {item.strip() for item in str(args.mode_groups).split(",") if item.strip()}
     if "matcher" in groups or "all" in groups:
         if args.db_features_path is None or args.query_features_path is None:
             raise ValueError("--db_features_path and --query_features_path are required for matcher runs")
+    if {"main", "plm", "sensitivity"} & groups:
+        if args.db_features_path is None or args.query_features_path is None:
+            raise ValueError(
+                "--db_features_path and --query_features_path are required for "
+                "main, plm, and sensitivity runs (method=superpoint_h5)"
+            )
 
     suite_root = Path(args.base_dir) / "ablation_suite"
     commands_dir = suite_root / "commands"
@@ -454,6 +589,8 @@ def main() -> None:
 
     runs = _planned_runs(args)
     _write_plan(suite_root, runs)
+    split_query_count = _split_query_count(args.split_json)
+    expected_num_queries = int(args.max_queries) if args.max_queries is not None else split_query_count
     for run in runs:
         _write_command(commands_dir / f"{run.name}.sh", run.command)
         _write_command(commands_dir / f"{run.name}_leakage.sh", _leakage_cmd(args, run))
@@ -463,14 +600,28 @@ def main() -> None:
             (run.out_dir / "leakage_command.txt").write_text(shlex.join(_leakage_cmd(args, run)) + "\n", encoding="utf-8")
             continue
         if run.out_dir.exists() and (run.out_dir / "metrics.json").exists() and not args.overwrite:
-            if not (run.out_dir / "leakage_check.json").exists():
-                leakage = _leakage_cmd(args, run)
-                _run_checked(leakage)
-                leakage_payload = json.loads((run.out_dir / "leakage_check.json").read_text(encoding="utf-8"))
-                if not bool(leakage_payload.get("ok", False)) and not args.allow_leakage:
-                    raise RuntimeError(f"Leakage check failed for existing run {run.name}: {run.out_dir / 'leakage_check.json'}")
-            print(f"Skipping existing run: {run.name}")
-            continue
+            existing_num_queries = _existing_num_queries(run.out_dir / "metrics.json")
+            if (
+                expected_num_queries is not None
+                and existing_num_queries is not None
+                and int(existing_num_queries) != int(expected_num_queries)
+            ):
+                print(
+                    f"Existing run {run.name} has num_queries={existing_num_queries}; "
+                    f"expected {expected_num_queries}. Rerunning."
+                )
+            else:
+                if not (run.out_dir / "leakage_check.json").exists():
+                    leakage = _leakage_cmd(args, run)
+                    _run_checked(leakage)
+                    leakage_payload = json.loads((run.out_dir / "leakage_check.json").read_text(encoding="utf-8"))
+                    if not bool(leakage_payload.get("ok", False)) and not args.allow_leakage:
+                        raise RuntimeError(
+                            f"Leakage check failed for existing run {run.name}: {run.out_dir / 'leakage_check.json'}"
+                        )
+                print(f"Skipping existing run: {run.name}")
+                _run_hloc_eval_if_needed(args, run)
+                continue
         if not run.attached_index.exists():
             raise FileNotFoundError(f"Attached index for {run.name} does not exist: {run.attached_index}")
         leakage = _leakage_cmd(args, run)
@@ -479,6 +630,7 @@ def main() -> None:
         if not bool(leakage_payload.get("ok", False)) and not args.allow_leakage:
             raise RuntimeError(f"Leakage check failed for {run.name}: {run.out_dir / 'leakage_check.json'}")
         _run_checked(run.command)
+        _run_hloc_eval_if_needed(args, run)
 
     if not args.dry_run:
         _summarize(args, results_dir, summary_dir)

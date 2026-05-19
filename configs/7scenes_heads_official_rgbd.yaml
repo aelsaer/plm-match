@@ -1,0 +1,62 @@
+dataset_root: /mnt/d/private/pairs/heads
+
+dataset:
+  type: seven_scenes_rgbd
+  train_split_file: TrainSplit.txt
+  test_split_file: TestSplit.txt
+  image_root: .
+  intrinsics:
+    fx: 585.0
+    fy: 585.0
+    cx: 320.0
+    cy: 240.0
+    width: 640
+    height: 480
+    camera_model: SIMPLE_RADIAL
+    k1: 0.0
+  map:
+    stride: 1
+  query:
+    stride: 1
+
+hloc:
+  retrieval_file: /mnt/d/private/pairs/7scenes_densevlad_retrieval_top_10/7scenes_densevlad_retrieval_top_10/heads_top10.txt
+  topk_db_images: 10
+
+matching:
+  fine_rerank:
+    enabled: true
+    method: superpoint_h5
+    db_features_path: outputs/7scenes_heads_official_rgbd/sp_features/feats-superpoint-n4096-rmax1600_db.h5
+    query_features_path: outputs/7scenes_heads_official_rgbd/sp_features/feats-superpoint-n4096-rmax1600_queries.h5
+    patch_size: 24
+    xfeat_topk: 4096
+    match_radius_px: 8.0
+
+lifted_nn:
+  metric_thresholds:
+    - [0.05, 5.0]
+    - [0.10, 5.0]
+    - [0.25, 10.0]
+  topk: 10
+  query_topk: 4096
+  ratio_margin: 0.10
+  min_similarity: 0.65
+  support_weight: 0.03
+  point_support_weight: 0.02
+  rank_weight: 0.02
+  attach_dist_weight: 0.0
+  rank_tau: 10.0
+  min_shared_points: 0
+  max_cluster_images: 5
+  max_cluster_seeds: 10
+  max_matches: 4096
+  pnp_first_thresh: 8.0
+  pnp_refine_thresh: 4.0
+  pnp_iterations: 8000
+  min_final_inliers: 12
+  min_pose_guided_inliers: 16
+  pose_guided: false
+  pose_guided_radius_px: 8.0
+  pose_guided_score_thresh: 0.1
+  pose_guided_reproj_penalty: 0.02

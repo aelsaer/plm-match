@@ -35,6 +35,7 @@ from plm_match.types import Match3D2D
 from plm_match.utils.config import load_config
 from plm_match.utils.io import read_pose_txt, write_json
 from plm_match.utils.pose import rotation_error_deg, translation_error
+from plm_match.utils.runtime import ResourceSampler
 
 try:
     from scipy.spatial import cKDTree
@@ -255,15 +256,19 @@ def _build_dataset_and_frames(cfg: dict, split: dict | None, args: argparse.Name
     if split is not None:
         dataset_cfg.pop("db_image_names_file", None)
         dataset_cfg.pop("max_map_frames", None)
-        query_list_path = (
-            _split_file_path(split, "hloc_query_list", split_json=args.split_json, dataset_root=args.dataset_root)
-            or _split_file_path(split, "query_list", split_json=args.split_json, dataset_root=args.dataset_root)
-        )
-        query_gt_dir = _split_file_path(split, "query_gt_pose_dir", split_json=args.split_json, dataset_root=args.dataset_root)
-        if query_list_path is not None:
-            dataset_cfg["query_list"] = str(query_list_path)
-        if query_gt_dir is not None:
-            dataset_cfg["query_gt_pose_dir"] = str(query_gt_dir)
+        dataset_type = str(dataset_cfg.get("type", "")).lower()
+        if dataset_type in {"colmap_localization", "hloc_colmap", "colmap"}:
+            if not dataset_cfg.get("query_list"):
+                query_list_path = (
+                    _split_file_path(split, "hloc_query_list", split_json=args.split_json, dataset_root=args.dataset_root)
+                    or _split_file_path(split, "query_list", split_json=args.split_json, dataset_root=args.dataset_root)
+                )
+                if query_list_path is not None:
+                    dataset_cfg["query_list"] = str(query_list_path)
+            if not dataset_cfg.get("query_gt_pose_dir"):
+                query_gt_dir = _split_file_path(split, "query_gt_pose_dir", split_json=args.split_json, dataset_root=args.dataset_root)
+                if query_gt_dir is not None:
+                    dataset_cfg["query_gt_pose_dir"] = str(query_gt_dir)
     dataset = build_dataset(str(args.dataset_root), dataset_cfg)
     all_map_frames = list(dataset.get_map_frames())
     all_query_frames = list(dataset.get_query_frames())
@@ -313,6 +318,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     dataset, map_frames, query_frames = _build_dataset_and_frames(cfg, split, args)
+    if args.max_queries is not None:
+        query_frames = query_frames[: int(args.max_queries)]
     map_names = [_frame_name(frame) for frame in map_frames]
     query_names = [_frame_name(frame) for frame in query_frames]
     name_to_map_frame = _map_name_lookup(map_frames)
@@ -321,15 +328,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     query_features = Path(args.query_features_path)
     db_features = Path(args.db_features_path)
     retrieval_file = Path(args.retrieval_file)
-    matches_path, filtered_retrieval, kept_pairs, kept_queries = _prepare_matches(
-        args=args,
-        retrieval_file=retrieval_file,
-        artifacts_dir=artifacts_dir,
-        query_features=query_features,
-        db_features=db_features,
-        query_names=query_names,
-        map_names=map_names,
-    )
+    query_resource = ResourceSampler(scope="hloc_colmap_query")
+    with query_resource:
+        t_match0 = time.perf_counter()
+        matches_path, filtered_retrieval, kept_pairs, kept_queries = _prepare_matches(
+            args=args,
+            retrieval_file=retrieval_file,
+            artifacts_dir=artifacts_dir,
+            query_features=query_features,
+            db_features=db_features,
+            query_names=query_names,
+            map_names=map_names,
+        )
+        match_time_s = time.perf_counter() - t_match0
     retrievals = parse_retrieval_file(filtered_retrieval)
     lift_radius = float(args.db_keypoint_attach_radius_px)
     if lift_radius < 0:
@@ -338,7 +349,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     rows: list[tuple[str, np.ndarray]] = []
     metrics: list[dict[str, object]] = []
     t0 = time.perf_counter()
-    with h5py.File(query_features, "r") as qh5, h5py.File(db_features, "r") as dbh5, h5py.File(matches_path, "r") as mh5:
+    with query_resource, h5py.File(query_features, "r") as qh5, h5py.File(db_features, "r") as dbh5, h5py.File(matches_path, "r") as mh5:
         for qframe in query_frames:
             tq0 = time.perf_counter()
             q_name = _frame_name(qframe)
@@ -449,6 +460,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 row["rot_err_deg"] = float(rotation_error_deg(pose.T_wc, gt_pose))
             rows.append((q_name, pose.T_wc))
             metrics.append(row)
+            query_resource.sample()
 
     thresholds = args.metric_thresholds if args.metric_thresholds is not None else cfg.get("lifted_nn", {}).get("metric_thresholds")
     summary = _summarize_metrics(metrics, thresholds=thresholds)
@@ -456,11 +468,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         dataset_cfg_for_report = cfg.get("dataset", {})
         scene = dataset_cfg_for_report.get("scene") if isinstance(dataset_cfg_for_report, dict) else None
         add_cambridge_report_fields(summary, scene=scene)
-    total = time.perf_counter() - t0
+    localize_time_s = time.perf_counter() - t0
+    num_q = max(1, int(summary.get("num_queries", 1)))
+    mean_online_time_s = float((match_time_s + localize_time_s) / num_q)
     summary.update(
         {
             "runner": "hloc_colmap_attached_baseline",
-            "method": "HLoc SP+SG lifted COLMAP",
+            "method": f"HLoc {args.matcher_conf} lifted COLMAP",
             "local_feature": "superpoint_h5",
             "map_source": "colmap",
             "dataset": dataset.describe(),
@@ -475,10 +489,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "ransac_thresh": float(args.ransac_thresh),
             "pnp_iterations": int(args.pnp_iterations),
             "db_keypoint_attach_radius_px": float(lift_radius),
-            "total_time_s": float(total),
+            "match_time_s": float(match_time_s),
+            "localize_time_s": float(localize_time_s),
+            "total_time_s": float(match_time_s + localize_time_s),
+            "mean_query_time_s": mean_online_time_s,
+            "mean_query_process_time_s": mean_online_time_s,
+            "mean_match_time_per_query_s": float(match_time_s / num_q),
+            "mean_localize_only_time_s": float(localize_time_s / num_q),
+            "mean_cached_online_time_s": mean_online_time_s,
             "metric_thresholds": [list(x) for x in _parse_metric_thresholds(thresholds)],
             "retrieval_pairs_count": int(kept_pairs),
             "retrieval_queries_count": int(kept_queries),
+            "max_queries": int(args.max_queries) if args.max_queries is not None else None,
+            **query_resource.summary_fields(),
         }
     )
     payload = {"dataset": dataset.describe(), "frames": metrics, "summary": summary}
@@ -515,6 +538,7 @@ def main() -> None:
     parser.add_argument("--pnp_iterations", type=int, default=8000)
     parser.add_argument("--metric_thresholds", type=str, default=None)
     parser.add_argument("--index_cache_size", type=int, default=128)
+    parser.add_argument("--max_queries", type=int, default=None)
     args = parser.parse_args()
     payload = run(args)
     print(json.dumps(payload["summary"], indent=2, sort_keys=True))

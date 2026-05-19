@@ -27,6 +27,7 @@ from plm_match.types import Match3D2D
 from plm_match.utils.config import load_config
 from plm_match.utils.io import read_depth, read_pose_txt, write_json
 from plm_match.utils.pose import backproject_depth, rotation_error_deg, translation_error
+from plm_match.utils.runtime import ResourceSampler
 
 
 @contextlib.contextmanager
@@ -162,6 +163,19 @@ def _write_filtered_retrieval(
             kept_pairs += 1
             kept_queries.add(query_name)
     return kept_pairs, len(kept_queries)
+
+
+def _count_cached_match_pairs(matches_path: Path) -> int | None:
+    try:
+        with h5py.File(matches_path, "r") as hfile:
+            total = 0
+            for query_name in hfile.keys():
+                item = hfile[query_name]
+                if hasattr(item, "keys"):
+                    total += len(item.keys())
+            return int(total)
+    except Exception:
+        return None
 
 
 def _resolve_feature_roots(dataset_root: Path, cfg: dict, split: dict, args: argparse.Namespace) -> tuple[Path, Path]:
@@ -427,8 +441,19 @@ def _prepare_matches(
             raise FileNotFoundError(f"Matching was skipped but matches file does not exist: {matches_path}")
         return matches_path, matcher_conf, filtered_retrieval, kept_pairs, kept_queries
 
+    force_match_overwrite = False
     if matches_path.exists() and not args.overwrite:
-        print(f"Reusing matches: {matches_path}")
+        cached_pairs = _count_cached_match_pairs(matches_path)
+        if cached_pairs is not None and cached_pairs >= int(kept_pairs):
+            print(f"Reusing matches: {matches_path}")
+        else:
+            print(
+                f"Cached matches at {matches_path} cover {cached_pairs} pairs; "
+                f"expected {kept_pairs}. Rebuilding."
+            )
+            force_match_overwrite = True
+    if matches_path.exists() and not args.overwrite and not force_match_overwrite:
+        pass
     else:
         with _single_process_dataloader(match_features.torch):
             match_features.main(
@@ -438,7 +463,7 @@ def _prepare_matches(
                 export_dir=artifacts_dir,
                 matches=matches_path,
                 features_ref=db_features,
-                overwrite=args.overwrite,
+                overwrite=bool(args.overwrite or force_match_overwrite),
             )
     return matches_path, matcher_conf, filtered_retrieval, kept_pairs, kept_queries
 
@@ -465,6 +490,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         label="split queries",
         source_label="dataset query frames",
     )
+    if args.max_queries is not None:
+        query_names = query_names[: int(args.max_queries)]
+        query_frames = query_frames[: int(args.max_queries)]
     name_to_map_frame = _map_name_lookup(map_frames)
 
     retrieval_file = Path(args.retrieval_file)
@@ -483,18 +511,20 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         map_names=map_names,
     )
 
-    t_match0 = time.perf_counter()
-    matches_path, matcher_conf, filtered_retrieval, kept_pairs, kept_queries = _prepare_matches(
-        args=args,
-        retrieval_file=retrieval_file,
-        artifacts_dir=artifacts_dir,
-        query_features=query_features,
-        db_features=db_features,
-        matcher_conf_name=args.matcher_conf,
-        query_names=query_names,
-        map_names=map_names,
-    )
-    t_match = time.perf_counter() - t_match0
+    query_resource = ResourceSampler(scope="hloc_rgbd_query")
+    with query_resource:
+        t_match0 = time.perf_counter()
+        matches_path, matcher_conf, filtered_retrieval, kept_pairs, kept_queries = _prepare_matches(
+            args=args,
+            retrieval_file=retrieval_file,
+            artifacts_dir=artifacts_dir,
+            query_features=query_features,
+            db_features=db_features,
+            matcher_conf_name=args.matcher_conf,
+            query_names=query_names,
+            map_names=map_names,
+        )
+        t_match = time.perf_counter() - t_match0
 
     retrievals = parse_retrieval_file(filtered_retrieval)
     rows: list[tuple[str, np.ndarray]] = []
@@ -503,7 +533,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     db_kpt_cache: OrderedDict[str, np.ndarray] = OrderedDict()
 
     t_loc0 = time.perf_counter()
-    with h5py.File(query_features, "r") as qh5, h5py.File(db_features, "r") as dbh5, h5py.File(matches_path, "r") as mh5:
+    with query_resource, h5py.File(query_features, "r") as qh5, h5py.File(db_features, "r") as dbh5, h5py.File(matches_path, "r") as mh5:
         for qframe in query_frames:
             q_name = _frame_name(qframe)
             tq0 = time.perf_counter()
@@ -690,6 +720,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 row["rot_err_deg"] = float(rotation_error_deg(pose.T_wc, gt_pose))
             rows.append((q_name, pose.T_wc))
             metrics.append(row)
+            query_resource.sample()
 
     t_loc = time.perf_counter() - t_loc0
     total = time.perf_counter() - t0
@@ -704,10 +735,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         summary["mean_localize_only_time_s"] = float(localize_only_mean)
     if localize_only_median is not None:
         summary["median_localize_only_time_s"] = float(localize_only_median)
-    per_query_frontend_time = float(feature_timings["query_feature_time_s"] + float(t_match)) / max(1, len(query_frames))
-    summary["mean_query_time_s"] = float(per_query_frontend_time + float(localize_only_mean or 0.0))
+    per_query_match_time = float(t_match) / max(1, len(query_frames))
+    summary["mean_query_time_s"] = float(per_query_match_time + float(localize_only_mean or 0.0))
+    summary["mean_query_process_time_s"] = float(summary["mean_query_time_s"])
     if localize_only_median is not None:
-        summary["median_query_time_s"] = float(per_query_frontend_time + float(localize_only_median))
+        summary["median_query_time_s"] = float(per_query_match_time + float(localize_only_median))
+        summary["median_query_process_time_s"] = float(summary["median_query_time_s"])
     summary.update(
         {
             "runner": "hloc_rgbd_baseline",
@@ -738,6 +771,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "metric_thresholds": [list(x) for x in thresholds],
             "retrieval_pairs_count": int(kept_pairs),
             "retrieval_queries_count": int(kept_queries),
+            "max_queries": int(args.max_queries) if args.max_queries is not None else None,
+            **query_resource.summary_fields(),
         }
     )
 
@@ -783,6 +818,7 @@ def main() -> None:
     parser.add_argument("--metric_thresholds", type=str, default=None)
     parser.add_argument("--depth_cache_size", type=int, default=32)
     parser.add_argument("--keypoint_cache_size", type=int, default=128)
+    parser.add_argument("--max_queries", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip_feature_extraction", action="store_true")
     parser.add_argument("--skip_matching", action="store_true")

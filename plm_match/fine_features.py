@@ -51,10 +51,22 @@ H5_LOCAL_FEATURE_METHODS = (
     'superpoint-h5',
     'sp_h5',
     'sp-h5',
+    'aliked_h5',
+    'aliked-h5',
+    'xfeat_h5',
+    'xfeat-h5',
+    'r2d2_h5',
+    'r2d2-h5',
+    'disk_h5',
+    'disk-h5',
+    'dedode_h5',
+    'dedode-h5',
     'd2net_h5',
     'd2net-h5',
     'd2_h5',
     'd2-h5',
+    'sfd2_h5',
+    'sfd2-h5',
     'd2net',
     'd2-net',
 )
@@ -62,6 +74,26 @@ H5_LOCAL_FEATURE_METHODS = (
 
 def is_h5_local_feature_method(method: str | None) -> bool:
     return str(method or '').lower() in H5_LOCAL_FEATURE_METHODS
+
+
+def _default_h5_descriptor_dim(method: str) -> int:
+    method = str(method or '').lower()
+    if method in ('d2net', 'd2-net', 'd2net_h5', 'd2net-h5', 'd2_h5', 'd2-h5'):
+        return 512
+    if method in ('xfeat_h5', 'xfeat-h5'):
+        return 64
+    if method in (
+        'aliked_h5',
+        'aliked-h5',
+        'r2d2_h5',
+        'r2d2-h5',
+        'disk_h5',
+        'disk-h5',
+        'sfd2_h5',
+        'sfd2-h5',
+    ):
+        return 128
+    return 256
 
 
 class LocalPatchDescriptor:
@@ -84,6 +116,9 @@ class LocalPatchDescriptor:
         sift_contrast_threshold: float = 0.04,
         sift_edge_threshold: float = 10.0,
         sift_sigma: float = 1.6,
+        sift_descriptor_norm: str = 'l2',
+        sift_fixed_keypoint_size: float | None = None,
+        sift_fixed_keypoint_angle: float = -1.0,
     ):
         self.method = str(method).lower()
         self.patch_size = float(max(8, int(patch_size)))
@@ -95,6 +130,13 @@ class LocalPatchDescriptor:
         self.sift_contrast_threshold = float(sift_contrast_threshold)
         self.sift_edge_threshold = float(sift_edge_threshold)
         self.sift_sigma = float(sift_sigma)
+        self.sift_descriptor_norm = str(sift_descriptor_norm).lower()
+        self.sift_fixed_keypoint_size = (
+            float(sift_fixed_keypoint_size) if sift_fixed_keypoint_size is not None else float(self.patch_size)
+        )
+        self.sift_fixed_keypoint_angle = float(sift_fixed_keypoint_angle)
+        if self.sift_descriptor_norm not in ('l2', 'rootsift'):
+            raise ValueError(f'Unsupported SIFT descriptor normalization: {sift_descriptor_norm!r}')
         h5_paths = []
         for p in (features_path, db_features_path, query_features_path):
             if p:
@@ -127,7 +169,7 @@ class LocalPatchDescriptor:
                     '`matching.fine_rerank.features_path`, `db_features_path`, or `query_features_path`.'
                 )
             self.impl = None
-            self._dim = 512 if self.method in ('d2net', 'd2-net', 'd2net_h5', 'd2net-h5', 'd2_h5', 'd2-h5') else 256
+            self._dim = _default_h5_descriptor_dim(self.method)
             self._binary = False
         elif self.method == 'orb':
             self.impl = cv2.ORB_create(nfeatures=0, patchSize=int(self.patch_size))
@@ -152,6 +194,12 @@ class LocalPatchDescriptor:
         desc = np.asarray(desc, dtype=np.float32).reshape(-1)
         if self._binary:
             desc = desc.astype(np.float32)
+        elif self.method == 'sift' and self.sift_descriptor_norm == 'rootsift':
+            desc = np.maximum(desc, 0.0)
+            l1 = float(np.sum(desc))
+            if l1 <= 1e-8:
+                return np.zeros_like(desc, dtype=np.float32)
+            desc = np.sqrt(desc / l1).astype(np.float32, copy=False)
         norm = float(np.linalg.norm(desc))
         if norm <= 1e-8:
             return np.zeros_like(desc, dtype=np.float32)
@@ -373,6 +421,133 @@ class LocalPatchDescriptor:
             scores=np.zeros((0,), dtype=np.float32),
         )
 
+    def _find_h5_group(self, image_name: str | None):
+        for path in self._h5_paths:
+            f = self._open_h5(path)
+            for key in self._h5_key_candidates(image_name):
+                if key in f:
+                    return f[key]
+        return None
+
+    @staticmethod
+    def _as_chw_descriptor_map(desc_map: np.ndarray) -> np.ndarray | None:
+        arr = np.asarray(desc_map, dtype=np.float32)
+        if arr.ndim == 4 and arr.shape[0] == 1:
+            arr = arr[0]
+        if arr.ndim != 3:
+            return None
+        common_dims = {32, 64, 128, 256, 512, 1024, 4096}
+        if int(arr.shape[0]) in common_dims and arr.shape[1] > 1 and arr.shape[2] > 1:
+            return arr.astype(np.float32, copy=False)
+        if int(arr.shape[-1]) in common_dims and arr.shape[0] > 1 and arr.shape[1] > 1:
+            return np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
+        if arr.shape[0] <= arr.shape[-1] and arr.shape[0] <= arr.shape[1]:
+            return arr.astype(np.float32, copy=False)
+        return np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False)
+
+    @staticmethod
+    def _sample_scalar_map(score_map: np.ndarray, points: np.ndarray, *, image_size_wh: tuple[int, int]) -> np.ndarray:
+        arr = np.asarray(score_map, dtype=np.float32)
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            arr = arr[0]
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        if arr.ndim != 2:
+            return np.ones((points.shape[0],), dtype=np.float32)
+        h_map, w_map = arr.shape[:2]
+        img_w, img_h = image_size_wh
+        if h_map <= 0 or w_map <= 0 or img_w <= 0 or img_h <= 0:
+            return np.ones((points.shape[0],), dtype=np.float32)
+        x = points[:, 0] * ((w_map - 1) / max(float(img_w - 1), 1.0))
+        y = points[:, 1] * ((h_map - 1) / max(float(img_h - 1), 1.0))
+        valid = (x >= 0.0) & (x <= float(w_map - 1)) & (y >= 0.0) & (y <= float(h_map - 1))
+        out = np.ones((points.shape[0],), dtype=np.float32)
+        if not np.any(valid):
+            return out
+        x0 = np.floor(x[valid]).astype(np.int64)
+        y0 = np.floor(y[valid]).astype(np.int64)
+        x1 = np.minimum(x0 + 1, w_map - 1)
+        y1 = np.minimum(y0 + 1, h_map - 1)
+        wx = (x[valid] - x0.astype(np.float32)).astype(np.float32)
+        wy = (y[valid] - y0.astype(np.float32)).astype(np.float32)
+        vals = (
+            arr[y0, x0] * (1.0 - wx) * (1.0 - wy)
+            + arr[y0, x1] * wx * (1.0 - wy)
+            + arr[y1, x0] * (1.0 - wx) * wy
+            + arr[y1, x1] * wx * wy
+        )
+        out[np.flatnonzero(valid)] = vals.astype(np.float32, copy=False)
+        return out
+
+    def _sample_descriptor_map(
+        self,
+        desc_chw: np.ndarray,
+        points: np.ndarray,
+        *,
+        image_size_wh: tuple[int, int],
+    ) -> np.ndarray:
+        desc_chw = np.asarray(desc_chw, dtype=np.float32)
+        c, h_map, w_map = desc_chw.shape
+        img_w, img_h = image_size_wh
+        out = np.zeros((points.shape[0], c), dtype=np.float32)
+        if h_map <= 0 or w_map <= 0 or img_w <= 0 or img_h <= 0 or points.shape[0] == 0:
+            return out
+        x = points[:, 0] * ((w_map - 1) / max(float(img_w - 1), 1.0))
+        y = points[:, 1] * ((h_map - 1) / max(float(img_h - 1), 1.0))
+        valid = (x >= 0.0) & (x <= float(w_map - 1)) & (y >= 0.0) & (y <= float(h_map - 1))
+        if not np.any(valid):
+            return out
+        valid_idx = np.flatnonzero(valid)
+        x0 = np.floor(x[valid]).astype(np.int64)
+        y0 = np.floor(y[valid]).astype(np.int64)
+        x1 = np.minimum(x0 + 1, w_map - 1)
+        y1 = np.minimum(y0 + 1, h_map - 1)
+        wx = (x[valid] - x0.astype(np.float32)).astype(np.float32)[:, None]
+        wy = (y[valid] - y0.astype(np.float32)).astype(np.float32)[:, None]
+        chw = np.moveaxis(desc_chw, 0, -1)
+        vals = (
+            chw[y0, x0] * (1.0 - wx) * (1.0 - wy)
+            + chw[y0, x1] * wx * (1.0 - wy)
+            + chw[y1, x0] * (1.0 - wx) * wy
+            + chw[y1, x1] * wx * wy
+        )
+        out[valid_idx] = np.stack([self._normalize(d) for d in vals], axis=0).astype(np.float32)
+        self._dim = int(c)
+        return out
+
+    def extract_dense_h5_at_points(
+        self,
+        image_rgb: np.ndarray,
+        points: Sequence[np.ndarray],
+        *,
+        image_name: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if not is_h5_local_feature_method(self.method):
+            raise RuntimeError(f"{self.method} colmap_uv_sample requires a dense descriptor map.")
+        pts = np.asarray([np.asarray(p, dtype=np.float32).reshape(2) for p in points], dtype=np.float32)
+        if pts.shape[0] == 0:
+            return np.zeros((0, self.dim), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+        group = self._find_h5_group(image_name)
+        if group is None:
+            raise RuntimeError(f"{self.method} colmap_uv_sample requires dense descriptor maps; use detected_nearest or SIFT.")
+        desc_chw = None
+        for key in ("dense_descriptors", "descriptor_map", "descriptors_dense", "descs_dense", "descriptors"):
+            if key not in group:
+                continue
+            desc_chw = self._as_chw_descriptor_map(np.asarray(group[key], dtype=np.float32))
+            if desc_chw is not None:
+                break
+        if desc_chw is None:
+            raise RuntimeError(f"{self.method} colmap_uv_sample requires dense descriptor maps; use detected_nearest or SIFT.")
+        image_size_wh = (int(image_rgb.shape[1]), int(image_rgb.shape[0]))
+        descs = self._sample_descriptor_map(desc_chw, pts, image_size_wh=image_size_wh)
+        scores = np.ones((pts.shape[0],), dtype=np.float32)
+        for score_key in ("scores_dense", "score_map", "scores", "prob", "probability"):
+            if score_key in group:
+                scores = self._sample_scalar_map(np.asarray(group[score_key], dtype=np.float32), pts, image_size_wh=image_size_wh)
+                break
+        return descs.astype(np.float32, copy=False), scores.astype(np.float32, copy=False)
+
     def extract_keypoints(
         self,
         image_name: str | None,
@@ -579,7 +754,9 @@ class LocalPatchDescriptor:
         h, w = gray.shape[:2]
         if x < 0.0 or x >= float(w) or y < 0.0 or y >= float(h):
             return None
-        kp = cv2.KeyPoint(x, y, self.patch_size)
+        size = self.sift_fixed_keypoint_size if self.method == 'sift' else self.patch_size
+        angle = self.sift_fixed_keypoint_angle if self.method == 'sift' else -1.0
+        kp = cv2.KeyPoint(x, y, float(size), float(angle))
         _, desc = self.impl.compute(gray, [kp])
         if desc is None or desc.shape[0] == 0:
             return None
@@ -600,7 +777,15 @@ class LocalPatchDescriptor:
         valid_indices = np.flatnonzero(valid).astype(np.int64, copy=False)
         if valid_indices.shape[0] == 0:
             return out
-        keypoints = [cv2.KeyPoint(float(pts[i, 0]), float(pts[i, 1]), self.patch_size) for i in valid_indices.tolist()]
+        keypoints = [
+            cv2.KeyPoint(
+                float(pts[i, 0]),
+                float(pts[i, 1]),
+                float(self.sift_fixed_keypoint_size),
+                float(self.sift_fixed_keypoint_angle),
+            )
+            for i in valid_indices.tolist()
+        ]
         computed_keypoints, desc = self.impl.compute(gray, keypoints)
         if desc is None or desc.shape[0] == 0:
             return out

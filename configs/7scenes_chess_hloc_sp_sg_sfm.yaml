@@ -1,0 +1,51 @@
+dataset_root: /mnt/d/private/pairs/chess
+
+dataset:
+  type: colmap_localization
+  scene: chess
+  image_root: .
+  model_path: /home/phd/plm-match/outputs/hloc_7scenes_official/chess/sfm_superpoint+superglue
+  db_image_names_file: /home/phd/plm-match/outputs/7scenes_chess_official_rgbd/split/map_images.txt
+  query_list: /home/phd/plm-match/outputs/hloc_7scenes_official/chess/query_list_with_intrinsics.txt
+  query_gt_pose_dir: /home/phd/plm-match/outputs/7scenes_chess_hloc_sp_sg_sfm/split/query_gt_pose_dir
+  default_query_camera_from_first_map: false
+
+reporting:
+  benchmark: 7scenes
+  scene: chess
+
+hloc:
+  retrieval_file: /mnt/d/private/pairs/7scenes_densevlad_retrieval_top_10/7scenes_densevlad_retrieval_top_10/chess_top10.txt
+  topk_db_images: 10
+
+matching:
+  fine_rerank:
+    enabled: true
+    method: superpoint_h5
+    db_features_path: outputs/hloc_7scenes_official/chess/feats-superpoint-n4096-r1024.h5
+    query_features_path: outputs/hloc_7scenes_official/chess/feats-superpoint-n4096-r1024.h5
+    patch_size: 24
+    xfeat_topk: 4096
+    match_radius_px: 8.0
+
+lifted_nn:
+  metric_thresholds:
+    - [0.05, 5.0]
+    - [0.10, 5.0]
+    - [0.25, 10.0]
+  topk: 10
+  query_topk: 4096
+  ratio_margin: 0.10
+  min_similarity: 0.65
+  support_weight: 0.03
+  point_support_weight: 0.02
+  rank_weight: 0.02
+  attach_dist_weight: 0.0
+  max_cluster_images: 5
+  max_cluster_seeds: 10
+  max_matches: 4096
+  pnp_first_thresh: 8.0
+  pnp_refine_thresh: 4.0
+  pnp_iterations: 8000
+  min_final_inliers: 12
+  pose_guided: false

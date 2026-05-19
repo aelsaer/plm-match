@@ -1,0 +1,4 @@
+backend: hloc
+hloc_conf: superpoint_max
+resize_max: 1024
+max_keypoints: 4096

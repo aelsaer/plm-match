@@ -51,6 +51,16 @@ def _load_result(path: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
     return summary, dataset if isinstance(dataset, dict) else {}, result_dir
 
 
+def _load_hloc_eval_summary(result_dir: Path) -> dict[str, Any]:
+    path = result_dir / "hloc_eval.json"
+    if not path.exists():
+        return {}
+    payload = _read_json(path)
+    if isinstance(payload.get("summary"), dict):
+        return dict(payload["summary"])
+    return dict(payload)
+
+
 def _discover_results(paths: list[Path]) -> list[Path]:
     out: list[Path] = []
     seen: set[Path] = set()
@@ -107,12 +117,40 @@ def _infer_local_feature(name: str, summary: dict[str, Any]) -> str:
 
 
 def _row(name: str, summary: dict[str, Any], dataset: dict[str, Any], result_dir: Path, dataset_name: str) -> dict[str, Any]:
+    hloc_eval = _load_hloc_eval_summary(result_dir)
+    metric_summary = dict(summary)
+    if hloc_eval:
+        for key, value in hloc_eval.items():
+            if (
+                key.startswith("success_")
+                or key in {
+                    "num_queries",
+                    "median_trans_err_m",
+                    "median_rot_err_deg",
+                    "mean_trans_err_m",
+                    "mean_rot_err_deg",
+                    "metric_thresholds",
+                }
+            ):
+                metric_summary[key] = value
+        if "num_localized" in hloc_eval:
+            metric_summary["num_success"] = hloc_eval["num_localized"]
+        metric_summary["success_rate"] = hloc_eval.get("success_rate", metric_summary.get("success_rate"))
     style = _metric_style(dataset_name, summary, dataset)
     strict_key, medium_key, coarse_key = SEVENSCENES_KEYS if style == "7scenes" else AACHEN_KEYS
-    median_t_m = summary.get("median_trans_err_m")
-    median_t_cm = summary.get("report_trans_cm", summary.get("median_trans_err_cm"))
+    median_t_m = metric_summary.get("median_trans_err_m")
+    median_t_cm = summary.get("report_trans_cm", metric_summary.get("median_trans_err_cm"))
     if median_t_cm is None and median_t_m is not None:
         median_t_cm = 100.0 * float(median_t_m)
+    query_ram_mb = summary.get(
+        "query_process_avg_rss_mb",
+        summary.get("query_process_ram_mb", summary.get("query_process_peak_rss_mb")),
+    )
+    mean_query_time_s = summary.get("mean_query_process_time_s", summary.get("mean_query_time_s"))
+    median_query_time_s = summary.get("median_query_process_time_s", summary.get("median_query_time_s"))
+    query_fps = summary.get("query_process_fps", summary.get("query_fps"))
+    if query_fps is None and mean_query_time_s is not None and float(mean_query_time_s) > 0.0:
+        query_fps = 1.0 / float(mean_query_time_s)
     row: dict[str, Any] = {
         "name": name,
         "dataset": dataset_name or str(summary.get("dataset_name") or dataset.get("name") or ""),
@@ -122,17 +160,25 @@ def _row(name: str, summary: dict[str, Any], dataset: dict[str, Any], result_dir
         "local_feature": _infer_local_feature(name, summary),
         "pairwise_matcher": str(summary.get("pairwise_matcher") or ""),
         "map_source": str(summary.get("map_source") or ""),
-        "num_queries": summary.get("num_queries"),
-        "num_success": summary.get("num_success"),
-        "success_rate": summary.get("success_rate"),
-        "strict": _rate(summary, strict_key),
-        "medium": _rate(summary, medium_key),
-        "coarse": _rate(summary, coarse_key),
+        "num_queries": metric_summary.get("num_queries"),
+        "num_success": metric_summary.get("num_success"),
+        "success_rate": metric_summary.get("success_rate"),
+        "strict": _rate(metric_summary, strict_key),
+        "medium": _rate(metric_summary, medium_key),
+        "coarse": _rate(metric_summary, coarse_key),
         "median_trans_err_m": median_t_m,
         "median_trans_err_cm": median_t_cm,
-        "median_rot_err_deg": summary.get("report_rot_deg", summary.get("median_rot_err_deg")),
-        "mean_query_time_s": summary.get("mean_query_time_s"),
-        "median_query_time_s": summary.get("median_query_time_s"),
+        "median_rot_err_deg": summary.get("report_rot_deg", metric_summary.get("median_rot_err_deg")),
+        "mean_query_time_s": mean_query_time_s,
+        "median_query_time_s": median_query_time_s,
+        "query_fps": query_fps,
+        "query_process_fps": query_fps,
+        "mean_query_process_time_s": summary.get("mean_query_process_time_s"),
+        "median_query_process_time_s": summary.get("median_query_process_time_s"),
+        "query_process_ram_mb": query_ram_mb,
+        "query_process_avg_rss_mb": summary.get("query_process_avg_rss_mb"),
+        "query_process_peak_sampled_rss_mb": summary.get("query_process_peak_sampled_rss_mb"),
+        "metric_source": "hloc_eval" if hloc_eval else "metrics_json",
         "result_dir": str(result_dir),
     }
     return row
@@ -164,8 +210,8 @@ def _markdown(rows: list[dict[str, Any]], *, title: str, style: str) -> str:
     if style == "cambridge":
         lines.extend(
             [
-                "| Run | Median cm | Median deg | Success | Runtime/query |",
-                "|---|---:|---:|---:|---:|",
+                "| Run | Median cm | Median deg | Success | Runtime/query | FPS | Avg RAM MB |",
+                "|---|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in rows:
@@ -178,6 +224,8 @@ def _markdown(rows: list[dict[str, Any]], *, title: str, style: str) -> str:
                         _fmt_num(row.get("median_rot_err_deg"), digits=1),
                         _fmt_pct(row.get("success_rate")),
                         _fmt_num(row.get("mean_query_time_s"), digits=3),
+                        _fmt_num(row.get("query_fps"), digits=2),
+                        _fmt_num(row.get("query_process_ram_mb"), digits=0),
                     ]
                 )
                 + " |"
@@ -190,8 +238,8 @@ def _markdown(rows: list[dict[str, Any]], *, title: str, style: str) -> str:
         )
         lines.extend(
             [
-                f"| Run | {headers[0]} | {headers[1]} | {headers[2]} | Median m | Median deg | Runtime/query |",
-                "|---|---:|---:|---:|---:|---:|---:|",
+                f"| Run | {headers[0]} | {headers[1]} | {headers[2]} | Median m | Median deg | Runtime/query | FPS | Avg RAM MB |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in rows:
@@ -206,6 +254,8 @@ def _markdown(rows: list[dict[str, Any]], *, title: str, style: str) -> str:
                         _fmt_num(row.get("median_trans_err_m"), digits=3),
                         _fmt_num(row.get("median_rot_err_deg"), digits=2),
                         _fmt_num(row.get("mean_query_time_s"), digits=3),
+                        _fmt_num(row.get("query_fps"), digits=2),
+                        _fmt_num(row.get("query_process_ram_mb"), digits=0),
                     ]
                 )
                 + " |"
@@ -214,11 +264,11 @@ def _markdown(rows: list[dict[str, Any]], *, title: str, style: str) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Summarize PLM-LiftedNN ablation result folders.")
+    parser = argparse.ArgumentParser(description="Summarize PLMLoc ablation result folders.")
     parser.add_argument("paths", nargs="+", type=Path, help="Result dirs, metrics files, or a suite root to scan.")
     parser.add_argument("--dataset_name", default="")
     parser.add_argument("--out_dir", type=Path, default=None)
-    parser.add_argument("--title", default="PLM-LiftedNN Ablation Suite")
+    parser.add_argument("--title", default="PLMLoc Ablation Suite")
     args = parser.parse_args()
 
     rows: list[dict[str, Any]] = []

@@ -1,0 +1,56 @@
+dataset_root: /mnt/d/private/pairs/cambridge_landmarks/ShopFacade
+
+dataset:
+  type: cambridge_landmarks
+  scene: ShopFacade
+  image_root: .
+  sfm_dir: /home/phd/plm-match/outputs/hloc_cambridge_sp_sg/ShopFacade
+  model_path: sfm_superpoint+superglue
+  query_model_path: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/ShopFacade/empty_all
+  db_list: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/ShopFacade/list_db.txt
+  query_list: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/ShopFacade/list_query.txt
+
+reporting:
+  benchmark: cambridge_landmarks
+
+hloc:
+  retrieval_file: outputs/hloc_cambridge_sp_sg/ShopFacade/pairs-query-netvlad10.txt
+  topk_db_images: 10
+
+matching:
+  fine_rerank:
+    enabled: true
+    method: superpoint_h5
+    db_features_path: outputs/hloc_cambridge_sp_sg/ShopFacade/feats-superpoint-n4096-r1024.h5
+    query_features_path: outputs/hloc_cambridge_sp_sg/ShopFacade/feats-superpoint-n4096-r1024.h5
+    patch_size: 24
+    xfeat_topk: 4096
+    match_radius_px: 8.0
+
+lifted_nn:
+  metric_thresholds:
+    - [0.05, 5.0]
+    - [0.25, 2.0]
+    - [0.50, 5.0]
+  topk: 10
+  query_topk: 4096
+  ratio_margin: 0.10
+  min_similarity: 0.65
+  support_weight: 0.03
+  point_support_weight: 0.02
+  rank_weight: 0.02
+  attach_dist_weight: 0.0
+  rank_tau: 10.0
+  min_shared_points: 20
+  max_cluster_images: 5
+  max_cluster_seeds: 10
+  max_matches: 4096
+  pnp_first_thresh: 8.0
+  pnp_refine_thresh: 4.0
+  pnp_iterations: 8000
+  min_final_inliers: 12
+  min_pose_guided_inliers: 16
+  pose_guided: false
+  pose_guided_radius_px: 8.0
+  pose_guided_score_thresh: 0.1
+  pose_guided_reproj_penalty: 0.02

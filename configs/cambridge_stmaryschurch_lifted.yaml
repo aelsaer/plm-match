@@ -1,10 +1,10 @@
-dataset_root: /mnt/d/private/pairs/cambridge_landmarks/KingsCollege
+dataset_root: /mnt/d/private/pairs/cambridge_landmarks/StMarysChurch
 
 dataset:
   type: cambridge_landmarks
-  scene: KingsCollege
+  scene: StMarysChurch
   image_root: .
-  sfm_dir: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/KingsCollege
+  sfm_dir: /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch
   model_path: sfm_superpoint+superglue
   query_model_path: empty_all
   db_list: list_db.txt

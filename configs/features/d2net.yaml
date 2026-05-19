@@ -1,0 +1,4 @@
+backend: hloc
+hloc_conf: d2net-ss
+resize_max: 1024
+max_keypoints: 4096

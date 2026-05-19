@@ -31,9 +31,13 @@ class CambridgeLandmarksDataset(BaseDatasetAdapter):
         self.query_list_path = self._resolve_path(cfg.get("query_list", "list_query.txt"), base=self.sfm_dir)
 
         self.cameras, self.images, self.points3d = load_colmap_model(self.model_path)
-        self.query_cameras, self.query_images, _ = load_colmap_model(self.query_model_path)
+        self.load_query_model = bool(cfg.get("load_query_model", True))
+        if self.load_query_model:
+            self.query_cameras, self.query_images, _ = load_colmap_model(self.query_model_path)
+        else:
+            self.query_cameras, self.query_images = {}, {}
         self._map_frames = self._make_map_frames()
-        self._query_frames = self._make_query_frames()
+        self._query_frames = self._make_query_frames() if self.load_query_model else []
 
     def _resolve_path(self, value: str | Path, *, base: Path | None = None) -> Path:
         path = Path(value)

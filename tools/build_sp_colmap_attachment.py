@@ -105,6 +105,9 @@ def _make_fine_extractor(cfg: dict, args: argparse.Namespace) -> LocalPatchDescr
         sift_contrast_threshold=float(args.sift_contrast_threshold),
         sift_edge_threshold=float(args.sift_edge_threshold),
         sift_sigma=float(args.sift_sigma),
+        sift_descriptor_norm=str(args.sift_descriptor_norm),
+        sift_fixed_keypoint_size=float(args.sift_fixed_keypoint_size),
+        sift_fixed_keypoint_angle=float(args.sift_fixed_keypoint_angle),
     )
 
 
@@ -144,6 +147,36 @@ def _point_passes_filters(point, *, min_track_len: int, max_error: float | None)
     return True
 
 
+def _can_attach_by_feature_index(
+    *,
+    mode: str,
+    sp_kpts: np.ndarray,
+    colmap_xys: np.ndarray,
+    valid_positions: np.ndarray,
+    radius: float,
+) -> bool:
+    mode = str(mode)
+    if mode == "nearest":
+        return False
+    if valid_positions.shape[0] == 0 or sp_kpts.shape[0] == 0:
+        return False
+    if int(np.max(valid_positions)) >= int(sp_kpts.shape[0]):
+        if mode == "index":
+            raise ValueError(
+                "COLMAP feature-index attachment was requested, but the COLMAP point2D index exceeds "
+                f"the local feature count ({int(np.max(valid_positions))} >= {int(sp_kpts.shape[0])})."
+            )
+        return False
+    if mode == "index":
+        return True
+    diffs = sp_kpts[valid_positions].astype(np.float32, copy=False) - colmap_xys[valid_positions].astype(np.float32, copy=False)
+    dists = np.linalg.norm(diffs, axis=1)
+    finite = dists[np.isfinite(dists)]
+    if finite.size == 0:
+        return False
+    return float(np.percentile(finite, 95)) <= max(float(radius), 1.0)
+
+
 def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     cfg = load_config(args.config)
     split: dict[str, object] | None = None
@@ -157,6 +190,8 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     if split is not None:
         dataset_cfg.pop("db_image_names_file", None)
         dataset_cfg.pop("max_map_frames", None)
+    if str(dataset_cfg.get("type", "")).lower() == "cambridge_landmarks":
+        dataset_cfg["load_query_model"] = False
     dataset = build_dataset(str(dataset_root), dataset_cfg)
     if not hasattr(dataset, "points3d"):
         raise ValueError("build_sp_colmap_attachment requires a COLMAP localization dataset")
@@ -167,6 +202,17 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     uses_named_h5 = is_h5_local_feature_method(getattr(fine_extractor, "method", ""))
     method_name = str(getattr(fine_extractor, "method", args.method or "local")).lower()
     sift_attach_mode = str(args.sift_attach_mode)
+    requested_attach_mode = str(args.attach_mode)
+    attach_mode = requested_attach_mode
+    if attach_mode == "index_aligned":
+        attach_mode = "detected_nearest"
+        if str(args.colmap_feature_index_mode) == "nearest":
+            args.colmap_feature_index_mode = "index"
+    effective_attach_mode = "index_aligned" if requested_attach_mode == "index_aligned" else str(attach_mode)
+    if sift_attach_mode == "colmap_uv_compute":
+        if attach_mode not in ("detected_nearest", "colmap_uv_sample"):
+            raise ValueError("--attach_mode and legacy --sift_attach_mode requested conflicting UV-sampling modes")
+        attach_mode = "colmap_uv_sample"
     descriptor_dtype = np.float16 if str(args.descriptor_dtype).lower() == "float16" else np.float32
 
     image_names = split_map_names if split_map_names is not None else (_read_names(args.image_names) if args.image_names is not None else None)
@@ -216,11 +262,37 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
             attached_count = 0
             obs_file = ""
             entry_obs_offsets.append(int(total_obs))
-            if method_name == "sift" and sift_attach_mode == "colmap_uv_compute" and valid_positions.shape[0] > 0:
+            run_detected_nearest = attach_mode == "detected_nearest"
+            if attach_mode == "colmap_uv_sample" and valid_positions.shape[0] > 0:
                 valid_xys = colmap_xys[valid_positions].astype(np.float32, copy=False)
                 valid_pids = colmap_pids[valid_positions].astype(np.int64, copy=False)
-                image = read_image(frame.image_path)
-                computed_descs = _normalise_descriptors(fine_extractor.extract_at_points(image, valid_xys, image_name=image_name))
+                if method_name == "sift":
+                    image = read_image(frame.image_path)
+                    computed_descs = _normalise_descriptors(
+                        fine_extractor.extract_at_points(image, valid_xys, image_name=image_name)
+                    )
+                    computed_scores = np.ones((computed_descs.shape[0],), dtype=np.float32)
+                elif uses_named_h5:
+                    image = read_image(frame.image_path)
+                    try:
+                        computed_descs, computed_scores = fine_extractor.extract_dense_h5_at_points(
+                            image,
+                            valid_xys,
+                            image_name=image_name,
+                        )
+                    except RuntimeError:
+                        if str(args.colmap_uv_fallback) != "nearest_detected":
+                            raise
+                        run_detected_nearest = True
+                        computed_descs = np.zeros((0, descriptor_dim), dtype=np.float32)
+                        computed_scores = np.zeros((0,), dtype=np.float32)
+                    else:
+                        computed_descs = _normalise_descriptors(computed_descs)
+                        computed_scores = np.asarray(computed_scores, dtype=np.float32).reshape(-1)
+                else:
+                    raise ValueError(
+                        f"{method_name} colmap_uv_sample is not implemented; use detected_nearest or SIFT."
+                    )
                 descriptor_dim = max(descriptor_dim, int(computed_descs.shape[1]) if computed_descs.ndim == 2 else 0)
                 valid_desc = (
                     np.linalg.norm(computed_descs.astype(np.float32, copy=False), axis=1) > 1e-8
@@ -231,7 +303,10 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                     sp_indices = valid_positions[valid_desc].astype(np.int32, copy=False)
                     attached_pids = valid_pids[valid_desc].astype(np.int64, copy=False)
                     attached_uvs = valid_xys[valid_desc].astype(np.float32, copy=False)
-                    attached_scores = np.ones((attached_pids.shape[0],), dtype=np.float32)
+                    if computed_scores.shape[0] == computed_descs.shape[0]:
+                        attached_scores = computed_scores[valid_desc].astype(np.float32, copy=False)
+                    else:
+                        attached_scores = np.ones((attached_pids.shape[0],), dtype=np.float32)
                     attached_descs = computed_descs[valid_desc].astype(descriptor_dtype, copy=False)
                     attached_dists = np.zeros((attached_pids.shape[0],), dtype=np.float32)
                     attached_xyz = np.stack(
@@ -260,7 +335,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                     global_descs.append(attached_descs)
                     total_obs += attached_count
                     frames_with_obs += 1
-            else:
+            if run_detected_nearest:
                 sp_kpts, sp_scores, sp_descs = fine_extractor.extract_keypoints(image_name, topk=int(args.max_keypoints))
                 if sp_kpts.shape[0] == 0 and not uses_named_h5:
                     image = read_image(frame.image_path)
@@ -273,17 +348,33 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                 sp_descs = _normalise_descriptors(sp_descs)
                 descriptor_dim = max(descriptor_dim, int(sp_descs.shape[1]) if sp_descs.ndim == 2 else 0)
                 if sp_kpts.shape[0] > 0 and valid_positions.shape[0] > 0 and sp_descs.shape[0] > 0:
-                    valid_xys = colmap_xys[valid_positions].astype(np.float32, copy=False)
-                    valid_pids = colmap_pids[valid_positions].astype(np.int64, copy=False)
-                    dists, nn = _nearest_points(sp_kpts, valid_xys)
-                    keep = np.isfinite(dists) & (dists <= radius) & (nn >= 0)
+                    use_index = _can_attach_by_feature_index(
+                        mode=str(args.colmap_feature_index_mode),
+                        sp_kpts=sp_kpts,
+                        colmap_xys=colmap_xys,
+                        valid_positions=valid_positions,
+                        radius=radius,
+                    )
+                    if use_index:
+                        sp_indices_all = valid_positions.astype(np.int64, copy=False)
+                        attached_dists_all = np.zeros((sp_indices_all.shape[0],), dtype=np.float32)
+                        keep = np.ones((sp_indices_all.shape[0],), dtype=bool)
+                        attached_pids_all = colmap_pids[sp_indices_all].astype(np.int64, copy=False)
+                    else:
+                        valid_xys = colmap_xys[valid_positions].astype(np.float32, copy=False)
+                        valid_pids = colmap_pids[valid_positions].astype(np.int64, copy=False)
+                        dists, nn = _nearest_points(sp_kpts, valid_xys)
+                        keep = np.isfinite(dists) & (dists <= radius) & (nn >= 0)
+                        sp_indices_all = np.flatnonzero(keep).astype(np.int64, copy=False)
+                        attached_dists_all = dists[keep].astype(np.float32, copy=False)
+                        attached_pids_all = valid_pids[nn[keep]].astype(np.int64, copy=False)
                     if np.any(keep):
-                        sp_indices = np.flatnonzero(keep).astype(np.int32, copy=False)
-                        attached_pids = valid_pids[nn[keep]].astype(np.int64, copy=False)
+                        sp_indices = sp_indices_all.astype(np.int32, copy=False)
+                        attached_pids = attached_pids_all.astype(np.int64, copy=False)
                         attached_uvs = sp_kpts[sp_indices].astype(np.float32, copy=False)
                         attached_scores = sp_scores[sp_indices].astype(np.float32, copy=False)
                         attached_descs = sp_descs[sp_indices].astype(descriptor_dtype, copy=False)
-                        attached_dists = dists[keep].astype(np.float32, copy=False)
+                        attached_dists = attached_dists_all.astype(np.float32, copy=False)
                         attached_xyz = np.stack(
                             [np.asarray(dataset.points3d[int(pid)].xyz, dtype=np.float32) for pid in attached_pids],
                             axis=0,
@@ -343,6 +434,8 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         obs_offsets=np.asarray(entry_obs_offsets, dtype=np.int64),
         obs_counts=np.asarray(entry_obs_counts, dtype=np.int32),
         attach_radius_px=np.asarray(radius, dtype=np.float32),
+        attach_mode=np.asarray(requested_attach_mode),
+        effective_attach_mode=np.asarray(effective_attach_mode),
         max_keypoints=np.asarray(int(args.max_keypoints), dtype=np.int32),
         descriptor_dim=np.asarray(int(descriptor_dim), dtype=np.int32),
     )
@@ -383,8 +476,15 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         "num_images_with_attached_obs": int(frames_with_obs),
         "num_attached_observations": int(total_obs),
         "num_landmarks": int(num_landmarks),
+        "requested_attach_mode": str(requested_attach_mode),
+        "attach_mode": str(requested_attach_mode),
+        "effective_attach_mode": str(effective_attach_mode),
         "attach_radius_px": float(radius),
+        "colmap_uv_fallback": str(args.colmap_uv_fallback),
+        "colmap_feature_index_mode": str(args.colmap_feature_index_mode),
         "sift_attach_mode": str(sift_attach_mode),
+        "sift_fixed_keypoint_size": float(args.sift_fixed_keypoint_size),
+        "sift_fixed_keypoint_angle": float(args.sift_fixed_keypoint_angle),
         "sift_match_test": str(args.sift_match_test),
         "sift_ratio": float(args.sift_ratio),
         "sift_nfeatures": int(args.sift_nfeatures),
@@ -392,6 +492,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         "sift_contrast_threshold": float(args.sift_contrast_threshold),
         "sift_edge_threshold": float(args.sift_edge_threshold),
         "sift_sigma": float(args.sift_sigma),
+        "sift_descriptor_norm": str(args.sift_descriptor_norm),
         "max_keypoints": int(args.max_keypoints),
         "descriptor_dim": int(descriptor_dim),
         "descriptor_dtype": str(np.dtype(descriptor_dtype)),
@@ -405,7 +506,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Attach local feature keypoints to nearest valid COLMAP observations for each DB image."
+        description="Attach local descriptors to valid COLMAP observations for each DB image."
     )
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--dataset_root", type=str, default=None)
@@ -414,9 +515,38 @@ def main() -> None:
     parser.add_argument("--image_names", type=Path, default=None, help="Optional line-separated DB image names to process.")
     parser.add_argument("--max_images", type=int, default=0)
     parser.add_argument("--max_keypoints", type=int, default=4096)
+    parser.add_argument(
+        "--attach_mode",
+        choices=("detected_nearest", "colmap_uv_sample", "index_aligned"),
+        default="detected_nearest",
+        help=(
+            "Attachment mode. index_aligned is a compatibility alias for detected_nearest with "
+            "--colmap_feature_index_mode index, intended for HLoc maps built from the same H5 feature file."
+        ),
+    )
+    parser.add_argument(
+        "--colmap_uv_fallback",
+        choices=("error", "nearest_detected"),
+        default="error",
+        help="Fallback for H5 colmap_uv_sample when no dense descriptor map exists.",
+    )
     parser.add_argument("--attach_radius_px", type=float, default=5.0)
+    parser.add_argument(
+        "--colmap_feature_index_mode",
+        choices=("nearest", "index_if_aligned", "index"),
+        default="nearest",
+        help=(
+            "Use COLMAP point2D indices as local-feature indices. Use index_if_aligned for HLoc-triangulated "
+            "models imported from the same H5 feature file; keep nearest for generic/SIFT COLMAP models."
+        ),
+    )
     parser.add_argument("--method", type=str, default=None)
-    parser.add_argument("--sift_attach_mode", choices=("detected_nearest", "colmap_uv_compute"), default="detected_nearest")
+    parser.add_argument(
+        "--sift_attach_mode",
+        choices=("detected_nearest", "colmap_uv_compute"),
+        default="detected_nearest",
+        help="Deprecated compatibility alias; colmap_uv_compute maps to --attach_mode colmap_uv_sample.",
+    )
     parser.add_argument("--sift_match_test", choices=("cosine_margin", "l2_ratio"), default="cosine_margin")
     parser.add_argument("--sift_ratio", type=float, default=0.80)
     parser.add_argument("--sift_nfeatures", type=int, default=0)
@@ -424,6 +554,9 @@ def main() -> None:
     parser.add_argument("--sift_contrast_threshold", type=float, default=0.04)
     parser.add_argument("--sift_edge_threshold", type=float, default=10.0)
     parser.add_argument("--sift_sigma", type=float, default=1.6)
+    parser.add_argument("--sift_descriptor_norm", choices=("l2", "rootsift"), default="l2")
+    parser.add_argument("--sift_fixed_keypoint_size", type=float, default=12.0)
+    parser.add_argument("--sift_fixed_keypoint_angle", type=float, default=-1.0)
     parser.add_argument("--features_path", type=Path, default=None)
     parser.add_argument("--db_features_path", type=Path, default=None)
     parser.add_argument("--query_features_path", type=Path, default=None)

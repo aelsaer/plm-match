@@ -1,0 +1,4 @@
+backend: sfd2
+resize_max: 1024
+max_keypoints: 4096
+sfd2_conf: ressegnetv2-20220810-wapv2-sd2mfsf-uspg-0001-n4096-r1024
