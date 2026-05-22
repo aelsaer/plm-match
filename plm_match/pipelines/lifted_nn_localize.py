@@ -4620,7 +4620,12 @@ def _localize_one_query(
         rank_prior_by_name = {}
     use_joint_obs = landmark_match_mode == "image_obs_joint"
     use_c2f = landmark_match_mode == "image_obs_c2f"
-    use_hloc_nn = landmark_match_mode in {"image_obs_hloc_nn", "point_mean_hloc_nn", "point_memory_hloc_nn"}
+    use_hloc_nn = landmark_match_mode in {
+        "image_obs_hloc_nn",
+        "point_mean_hloc_nn",
+        "point_memory_hloc_nn",
+        "point_memory_imagewise_hloc_nn",
+    }
     use_viewproto = landmark_match_mode in {"point_viewproto", "point_viewproto_support"}
     memory_score_mode = str(cfg.get("memory_score_mode", "point_memory"))
     memory_search_backend = str(cfg.get("memory_search_backend", "exact"))
@@ -4940,6 +4945,7 @@ def _localize_one_query(
         "point_mean_hloc_nn",
         "point_memory",
         "point_memory_hloc_nn",
+        "point_memory_imagewise_hloc_nn",
         "point_memory_support",
         "point_viewproto",
         "point_viewproto_support",
@@ -4986,7 +4992,13 @@ def _localize_one_query(
     num_candidate_prototypes = 0
     mean_num_prototypes_per_point = 0.0
     median_num_prototypes_per_point = 0.0
-    if landmark_match_mode in {"image_obs", "image_obs_hloc_nn", "image_obs_joint", "image_obs_c2f"}:
+    if landmark_match_mode in {
+        "image_obs",
+        "image_obs_hloc_nn",
+        "image_obs_joint",
+        "image_obs_c2f",
+        "point_memory_imagewise_hloc_nn",
+    }:
         candidate_point_chunks: list[np.ndarray] = []
         num_candidate_points = 0
         num_candidate_observations = 0
@@ -5015,7 +5027,13 @@ def _localize_one_query(
 
     hypotheses_by_image: dict[str, list[LiftedHypothesis]] = {}
     total_hypotheses = 0
-    if landmark_match_mode in {"image_obs", "image_obs_hloc_nn", "image_obs_joint", "image_obs_c2f"}:
+    if landmark_match_mode in {
+        "image_obs",
+        "image_obs_hloc_nn",
+        "image_obs_joint",
+        "image_obs_c2f",
+        "point_memory_imagewise_hloc_nn",
+    }:
         for rank, db_image in enumerate(db_names):
             db_obs = _filter_observations_to_points(index.get(db_image), active_pool_filter_ids)
             num_candidate_observations += int(db_obs.point_ids.shape[0])
@@ -5066,13 +5084,14 @@ def _localize_one_query(
                     preverify_stats["time_s"] = float(preverify_stats["time_s"]) + float(time.perf_counter() - t_preverify0)
                 hypotheses_by_image[str(db_image)] = hyps
                 total_hypotheses += int(len(hyps))
-            elif landmark_match_mode == "image_obs_hloc_nn":
+            elif landmark_match_mode in {"image_obs_hloc_nn", "point_memory_imagewise_hloc_nn"}:
                 t_match0 = time.perf_counter()
                 db_all_descs: np.ndarray | None = None
-                try:
-                    _, _, db_all_descs = extractor.extract_keypoints(str(db_image), topk=None)
-                except Exception:
-                    db_all_descs = None
+                if landmark_match_mode == "image_obs_hloc_nn":
+                    try:
+                        _, _, db_all_descs = extractor.extract_keypoints(str(db_image), topk=None)
+                    except Exception:
+                        db_all_descs = None
                 hyps = _lifted_hloc_nn_for_image(
                     q_kpts=q_kpts,
                     q_descs=q_descs,
@@ -5127,6 +5146,9 @@ def _localize_one_query(
             for image_name in cluster:
                 cluster_hyps.extend(hypotheses_by_image.get(str(image_name), ()))
         elif landmark_match_mode == "image_obs_hloc_nn":
+            for image_name in cluster:
+                cluster_hyps.extend(hypotheses_by_image.get(str(image_name), ()))
+        elif landmark_match_mode == "point_memory_imagewise_hloc_nn":
             for image_name in cluster:
                 cluster_hyps.extend(hypotheses_by_image.get(str(image_name), ()))
         elif landmark_match_mode == "image_obs_joint":
@@ -6444,6 +6466,7 @@ def main() -> None:
             "point_mean_hloc_nn",
             "point_memory",
             "point_memory_hloc_nn",
+            "point_memory_imagewise_hloc_nn",
             "point_memory_support",
             "point_viewproto",
             "point_viewproto_support",
