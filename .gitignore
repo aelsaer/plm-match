@@ -7,6 +7,15 @@ outputs/
 out_hloc_test/
 log.txt
 
+# Local dependencies, checkpoints, and assistant scratch spaces.
+external/
+MixVPR/
+.codex
+academic-research-skills/
+eu-proposal-chatgpt/
+eu-proposal-chatgpt-skill-archives/
+eu-proposal-chatgpt-skill.zip
+
 *.h5
 *.pkl
 *.npy

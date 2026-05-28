@@ -153,6 +153,7 @@ class AttachedSPCOLMAPIndex:
         self._point_viewproto_cache_key: tuple[object, ...] | None = None
         self._point_viewproto_cache: dict[str, np.ndarray] | None = None
         self._descriptor_context = "none"
+        self._descriptor_adapter: DescriptorAdapter | None = None
         self._global_store: GlobalDescriptorStore | None = None
         self._global_fusion_lambda = 0.5
         self._contextual_point_obs_descs: np.ndarray | None = None
@@ -286,6 +287,19 @@ class AttachedSPCOLMAPIndex:
         self._point_viewproto_cache = None
         self._point_viewproto_cache_key = None
 
+    def configure_descriptor_adapter(self, adapter: DescriptorAdapter | None = None) -> None:
+        old_key = self._descriptor_context_key()
+        self._descriptor_adapter = adapter
+        if self._descriptor_context_key() == old_key:
+            return
+        self._cache.clear()
+        self._contextual_point_obs_descs = None
+        self._contextual_point_obs_descs_key = None
+        self._point_mean_descs = None
+        self._point_mean_descs_key = None
+        self._point_viewproto_cache = None
+        self._point_viewproto_cache_key = None
+
     def _descriptor_context_key(
         self,
         context: str | None = None,
@@ -295,8 +309,16 @@ class AttachedSPCOLMAPIndex:
         context = str(self._descriptor_context if context is None else context)
         store = self._global_store if store is None else store
         lam = self._global_fusion_lambda if lam is None else float(lam)
+        adapter = self._descriptor_adapter
+        adapter_key = (
+            "adapter",
+            str(adapter.path),
+            str(adapter.method),
+            int(adapter.input_dim),
+            int(adapter.output_dim),
+        ) if adapter is not None else ("no_adapter",)
         if context != "global_fusion" or store is None:
-            return ("none",)
+            return ("none", *adapter_key)
         return (
             "global_fusion",
             str(store.path),
@@ -306,28 +328,34 @@ class AttachedSPCOLMAPIndex:
             int(store.raw_dim),
             int(store.target_dim),
             round(float(lam), 8),
+            *adapter_key,
         )
+
+    def _adapt_descriptors(self, descs: np.ndarray) -> np.ndarray:
+        descs = _normalise_descriptors(descs)
+        if self._descriptor_adapter is None or descs.shape[0] == 0:
+            return descs
+        return self._descriptor_adapter.apply(descs)
 
     def _contextualize_image_descriptors(self, image_name: str, descs: np.ndarray) -> np.ndarray:
         descs = _normalise_descriptors(descs)
-        if self._descriptor_context != "global_fusion" or self._global_store is None or descs.shape[0] == 0:
-            return descs
-        global_desc = self._global_store.get(image_name)
-        if global_desc is None:
-            return descs
-        return fuse_local_global(descs, global_desc, self._global_fusion_lambda)
+        if self._descriptor_context == "global_fusion" and self._global_store is not None and descs.shape[0] > 0:
+            global_desc = self._global_store.get(image_name)
+            if global_desc is not None:
+                descs = fuse_local_global(descs, global_desc, self._global_fusion_lambda)
+        return self._adapt_descriptors(descs)
 
     def contextual_point_obs_descs(self) -> np.ndarray:
-        if self._descriptor_context != "global_fusion" or self._global_store is None:
+        if self._descriptor_context != "global_fusion" and self._descriptor_adapter is None:
             return self.point_obs_descs
         key = self._descriptor_context_key()
         if self._contextual_point_obs_descs is not None and self._contextual_point_obs_descs_key == key:
             return self._contextual_point_obs_descs
         base = _normalise_descriptors(np.asarray(self.point_obs_descs, dtype=np.float32))
-        if base.shape[0] == 0:
-            self._contextual_point_obs_descs = base
+        if self._descriptor_context != "global_fusion" or self._global_store is None or base.shape[0] == 0:
+            self._contextual_point_obs_descs = self._adapt_descriptors(base)
             self._contextual_point_obs_descs_key = key
-            return base
+            return self._contextual_point_obs_descs
         fused = base.copy()
         frame_ids = np.asarray(self.point_obs_frame_ids, dtype=np.int32)
         if frame_ids.shape[0] >= fused.shape[0]:
@@ -341,7 +369,7 @@ class AttachedSPCOLMAPIndex:
                 mask = frame_ids[: fused.shape[0]] == int(frame_id)
                 if np.any(mask):
                     fused[mask] = fuse_local_global(base[mask], global_desc, self._global_fusion_lambda)
-        self._contextual_point_obs_descs = _normalise_descriptors(fused)
+        self._contextual_point_obs_descs = self._adapt_descriptors(fused)
         self._contextual_point_obs_descs_key = key
         return self._contextual_point_obs_descs
 
@@ -854,6 +882,61 @@ def _normalise_vector(desc: np.ndarray) -> np.ndarray:
     if norm <= 1e-8:
         return arr.astype(np.float32, copy=False)
     return (arr / norm).astype(np.float32, copy=False)
+
+
+class DescriptorAdapter:
+    """Offline descriptor-space transform used before exact PLM memory search."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"Descriptor adapter not found: {self.path}")
+        data = np.load(self.path, allow_pickle=False)
+        if "mean" not in data or "projection" not in data:
+            raise ValueError(f"Descriptor adapter {self.path} must contain 'mean' and 'projection'.")
+        self.mean = np.asarray(data["mean"], dtype=np.float32).reshape(-1)
+        self.projection = np.asarray(data["projection"], dtype=np.float32)
+        if self.projection.ndim != 2:
+            raise ValueError(f"Descriptor adapter projection must be 2D, got {self.projection.shape}.")
+        if self.projection.shape[0] != self.mean.shape[0]:
+            raise ValueError(
+                f"Descriptor adapter mean dim {self.mean.shape[0]} does not match projection input "
+                f"{self.projection.shape[0]}."
+            )
+        self.method = str(np.asarray(data["method"]).reshape(())) if "method" in data.files else "unknown"
+        self.summary: dict[str, object] = {
+            "path": str(self.path),
+            "method": self.method,
+            "input_dim": int(self.projection.shape[0]),
+            "output_dim": int(self.projection.shape[1]),
+        }
+        for key in ("regularization", "energy_retained", "num_training_descriptors", "num_training_landmarks"):
+            if key in data.files:
+                value = np.asarray(data[key]).reshape(())
+                self.summary[key] = value.item() if hasattr(value, "item") else value
+
+    @property
+    def input_dim(self) -> int:
+        return int(self.projection.shape[0])
+
+    @property
+    def output_dim(self) -> int:
+        return int(self.projection.shape[1])
+
+    def apply(self, descs: np.ndarray, *, batch_size: int = 65536) -> np.ndarray:
+        arr = _normalise_descriptors(np.asarray(descs, dtype=np.float32))
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            return np.zeros((0, self.output_dim), dtype=np.float32)
+        if int(arr.shape[1]) != self.input_dim:
+            raise ValueError(
+                f"Descriptor adapter {self.path} expects dim {self.input_dim}, got {arr.shape[1]}."
+            )
+        out = np.empty((int(arr.shape[0]), self.output_dim), dtype=np.float32)
+        batch_size = max(1, int(batch_size))
+        for start in range(0, int(arr.shape[0]), batch_size):
+            end = min(int(arr.shape[0]), start + batch_size)
+            out[start:end] = (arr[start:end] - self.mean.reshape(1, -1)) @ self.projection
+        return _normalise_descriptors(out)
 
 
 def fuse_local_global(local_descs: np.ndarray, global_desc: np.ndarray | None, lam: float) -> np.ndarray:
@@ -1583,15 +1666,17 @@ def _contextualize_query_descriptors(
     cfg: dict[str, object],
 ) -> np.ndarray:
     descs = _normalise_descriptors(q_descs)
-    if str(cfg.get("descriptor_context", "none")) != "global_fusion" or descs.shape[0] == 0:
-        return descs
-    store = cfg.get("global_descriptor_store")
-    if not isinstance(store, GlobalDescriptorStore):
-        return descs
-    for name in [str(query_name), *_query_candidates(frame)]:
-        global_desc = store.get(name)
-        if global_desc is not None:
-            return fuse_local_global(descs, global_desc, float(cfg.get("global_fusion_lambda", 0.5)))
+    if str(cfg.get("descriptor_context", "none")) == "global_fusion" and descs.shape[0] > 0:
+        store = cfg.get("global_descriptor_store")
+        if isinstance(store, GlobalDescriptorStore):
+            for name in [str(query_name), *_query_candidates(frame)]:
+                global_desc = store.get(name)
+                if global_desc is not None:
+                    descs = fuse_local_global(descs, global_desc, float(cfg.get("global_fusion_lambda", 0.5)))
+                    break
+    adapter = cfg.get("descriptor_adapter")
+    if isinstance(adapter, DescriptorAdapter):
+        descs = adapter.apply(descs)
     return descs
 
 
@@ -3909,6 +3994,20 @@ def _run_two_stage_pnp(
     return first, matches, "pnp_first"
 
 
+def _limit_matches_for_pnp(matches: list[Match3D2D], max_matches: int) -> list[Match3D2D]:
+    if int(max_matches) <= 0 or len(matches) <= int(max_matches):
+        return matches
+    order = sorted(
+        range(len(matches)),
+        key=lambda idx: (
+            -float(matches[int(idx)].score),
+            int(matches[int(idx)].anchor_idx),
+            int(matches[int(idx)].landmark_id),
+        ),
+    )
+    return [matches[int(idx)] for idx in order[: int(max_matches)]]
+
+
 def _pose_quality(
     pose: PoseResult,
     matches: Sequence[Match3D2D],
@@ -5090,6 +5189,9 @@ def _localize_one_query(
                 if landmark_match_mode == "image_obs_hloc_nn":
                     try:
                         _, _, db_all_descs = extractor.extract_keypoints(str(db_image), topk=None)
+                        adapter = cfg.get("descriptor_adapter")
+                        if isinstance(adapter, DescriptorAdapter) and db_all_descs is not None:
+                            db_all_descs = adapter.apply(db_all_descs)
                     except Exception:
                         db_all_descs = None
                 hyps = _lifted_hloc_nn_for_image(
@@ -5296,9 +5398,12 @@ def _localize_one_query(
                 )
         if len(matches) < 4:
             continue
+        matches_for_pnp = _limit_matches_for_pnp(matches, int(cfg["max_matches"]))
+        if len(matches_for_pnp) < 4:
+            continue
         clusters_tested += 1
         pose, used_matches, stage = _run_two_stage_pnp(
-            matches,
+            matches_for_pnp,
             intr,
             first_thresh=float(cfg["pnp_first_thresh"]),
             refine_thresh=float(cfg["pnp_refine_thresh"]),
@@ -5862,6 +5967,11 @@ def _runtime_cfg(cfg: dict, args: argparse.Namespace) -> dict[str, object]:
             if getattr(args, "descriptor_context", None) is not None
             else lnn_cfg.get("descriptor_context", "none")
         ),
+        "descriptor_adapter_path": (
+            str(getattr(args, "descriptor_adapter", ""))
+            if getattr(args, "descriptor_adapter", None) is not None
+            else str(lnn_cfg.get("descriptor_adapter", ""))
+        ),
         "global_desc_path": (
             str(getattr(args, "global_desc_path", ""))
             if getattr(args, "global_desc_path", None) is not None
@@ -6060,6 +6170,18 @@ def run(args: argparse.Namespace) -> dict:
     else:
         runtime_cfg["global_descriptor_store"] = None
         index.configure_descriptor_context(descriptor_context="none")
+    descriptor_adapter: DescriptorAdapter | None = None
+    raw_adapter_path = str(runtime_cfg.get("descriptor_adapter_path", "")).strip()
+    if raw_adapter_path:
+        adapter_path = _resolve_path(raw_adapter_path, dataset_root=dataset_root)
+        if adapter_path is None or not adapter_path.exists():
+            raise FileNotFoundError(f"Descriptor adapter not found: {adapter_path}")
+        descriptor_adapter = DescriptorAdapter(adapter_path)
+        runtime_cfg["descriptor_adapter_path"] = str(adapter_path)
+    else:
+        runtime_cfg["descriptor_adapter_path"] = ""
+    runtime_cfg["descriptor_adapter"] = descriptor_adapter
+    index.configure_descriptor_adapter(descriptor_adapter)
     memory_backend = str(runtime_cfg.get("memory_search_backend", "exact"))
     if memory_backend not in {"exact", "vocab"}:
         raise ValueError(f"Unsupported memory_search_backend: {memory_backend}")
@@ -6291,6 +6413,10 @@ def run(args: argparse.Namespace) -> dict:
             "retrieval_topk": int(runtime_cfg["topk"]),
             **retrieval_stats,
             "descriptor_context": str(runtime_cfg["descriptor_context"]),
+            "descriptor_adapter": str(runtime_cfg.get("descriptor_adapter_path", "")) or None,
+            "descriptor_adapter_summary": (
+                descriptor_adapter.summary if isinstance(descriptor_adapter, DescriptorAdapter) else {}
+            ),
             "global_desc_method": str(runtime_cfg["global_desc_method"]),
             "global_fusion_lambda": float(runtime_cfg["global_fusion_lambda"]),
             "global_projection": str(runtime_cfg["global_projection"]),
@@ -6415,6 +6541,7 @@ def main() -> None:
     parser.add_argument("--rerank_method", type=str, default=None)
     parser.add_argument("--retrieval_prior_mode", choices=("rank", "score", "rank_score"), default=None)
     parser.add_argument("--descriptor_context", choices=("none", "global_fusion"), default=None)
+    parser.add_argument("--descriptor_adapter", type=Path, default=None)
     parser.add_argument("--global_desc_path", type=Path, default=None)
     parser.add_argument(
         "--global_desc_method",

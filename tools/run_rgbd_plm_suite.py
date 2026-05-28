@@ -93,6 +93,18 @@ def _read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+def _rgbd_builder_quality_args(args: argparse.Namespace) -> list[str]:
+    return [
+        "--min_depth_m", str(float(args.min_depth_m)),
+        "--max_depth_m", str(float(args.max_depth_m)),
+        "--depth_window", str(int(args.depth_window)),
+        "--min_landmark_observations", str(int(args.min_landmark_observations)),
+        "--min_source_frames", str(int(args.min_source_frames)),
+        "--max_descriptor_variance", str(float(args.max_descriptor_variance)),
+        "--min_reliability", str(float(args.min_reliability)),
+    ]
+
+
 def _ate_style_rmse(summary_or_metrics_path: Path) -> float | None:
     metrics_path = summary_or_metrics_path.parent / "metrics.json"
     data = _read_json(metrics_path)
@@ -214,6 +226,13 @@ def main() -> None:
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument("--query_topk", type=int, default=4096)
     parser.add_argument("--merge_radius_m", type=float, default=0.02)
+    parser.add_argument("--min_depth_m", type=float, default=0.2)
+    parser.add_argument("--max_depth_m", type=float, default=5.0)
+    parser.add_argument("--depth_window", type=int, default=1)
+    parser.add_argument("--min_landmark_observations", type=int, default=1)
+    parser.add_argument("--min_source_frames", type=int, default=1)
+    parser.add_argument("--max_descriptor_variance", type=float, default=float("inf"))
+    parser.add_argument("--min_reliability", type=float, default=0.0)
     parser.add_argument("--grid_stride", type=int, default=12)
     parser.add_argument("--grid_max_points_per_image", type=int, default=4096)
     parser.add_argument("--reliability_weight", type=float, default=0.10)
@@ -235,6 +254,7 @@ def main() -> None:
     parser.add_argument("--pnp_refine_thresh", type=float, default=4.0)
     parser.add_argument("--min_final_inliers", type=int, default=12)
     parser.add_argument("--point_memory_max_obs", type=int, default=4)
+    parser.add_argument("--point_memory_obs_select", choices=("first", "uniform", "diverse_desc"), default="first")
     parser.add_argument("--point_memory_batch_size", type=int, default=128)
     parser.add_argument("--point_viewproto_k", type=int, default=4)
     parser.add_argument("--point_viewproto_min_obs", type=int, default=2)
@@ -292,6 +312,7 @@ def main() -> None:
         "--pnp_refine_thresh", str(float(args.pnp_refine_thresh)),
         "--min_final_inliers", str(int(args.min_final_inliers)),
         "--point_memory_max_obs", str(int(args.point_memory_max_obs)),
+        "--point_memory_obs_select", str(args.point_memory_obs_select),
         "--point_memory_batch_size", str(int(args.point_memory_batch_size)),
         "--point_viewproto_k", str(int(args.point_viewproto_k)),
         "--point_viewproto_min_obs", str(int(args.point_viewproto_min_obs)),
@@ -319,6 +340,7 @@ def main() -> None:
             "--merge_radius_m", str(float(args.merge_radius_m)),
             "--descriptor_dtype", "float32",
         ]
+        cmd += _rgbd_builder_quality_args(args)
         if db_features_path is not None:
             cmd += ["--db_features_path", str(db_features_path)]
         if query_features_path is not None:
@@ -364,6 +386,7 @@ def main() -> None:
             "--merge_radius_m", str(float(args.merge_radius_m)),
             "--descriptor_dtype", "float32",
         ]
+        build_cmd += _rgbd_builder_quality_args(args)
         if args.overwrite or not (grid_index / "summary.json").exists():
             build_times["sift_keypoints_grid"] = _run(build_cmd, cwd=ROOT, dry_run=args.dry_run)
         memory_summaries["sift_keypoints_grid"] = _read_json(grid_index / "summary.json")

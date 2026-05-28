@@ -95,6 +95,21 @@ def _prepare_superglue_shim(
                 target_weight.symlink_to(wp)
             except Exception:
                 shutil.copy2(wp, target_weight)
+    if not target_weight.exists():
+        for root in (Path("/tmp"), Path.home()):
+            try:
+                found = next(root.rglob(f"superglue_{weights}.pth"))
+            except StopIteration:
+                continue
+            except Exception:
+                continue
+            if found.resolve() == target_weight.resolve():
+                continue
+            try:
+                target_weight.symlink_to(found.resolve())
+            except Exception:
+                shutil.copy2(found, target_weight)
+            break
     # HLoc's SuperPoint wrapper imports MagicLeap's SuperPoint implementation,
     # which expects the detector weights beside the SuperGlue weights. The
     # `imm` third-party source tree often ships code only, so make the weight

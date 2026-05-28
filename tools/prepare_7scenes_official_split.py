@@ -16,6 +16,7 @@ from plm_match.datasets import build_dataset
 from plm_match.datasets.base import FrameRecord
 from plm_match.utils.config import load_config
 from plm_match.utils.io import read_pose_txt, write_json
+from tools.extract_7scenes_sequences import extract_missing_sequences
 
 
 def _frame_name(frame: FrameRecord) -> str:
@@ -67,11 +68,29 @@ def main() -> None:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--out_dir", required=True, type=Path)
     parser.add_argument("--dataset_root", type=Path, default=None)
+    parser.add_argument(
+        "--no_extract_sequences",
+        action="store_true",
+        help="Do not extract missing seq-*.zip archives before reading the official split.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     dataset_root = Path(args.dataset_root or cfg.get("dataset_root", "."))
-    dataset = build_dataset(str(dataset_root), cfg.get("dataset", {"type": "seven_scenes_rgbd"}))
+    dataset_cfg = cfg.get("dataset", {"type": "seven_scenes_rgbd"})
+    if not args.no_extract_sequences:
+        split_files = [
+            str(dataset_cfg.get("train_split_file", "TrainSplit.txt")),
+            str(dataset_cfg.get("test_split_file", "TestSplit.txt")),
+        ]
+        extracted = [
+            row
+            for row in extract_missing_sequences(dataset_root, split_files=split_files)
+            if row["status"] == "extracted"
+        ]
+        if extracted:
+            print(json.dumps({"extracted_sequences": extracted}, indent=2), file=sys.stderr)
+    dataset = build_dataset(str(dataset_root), dataset_cfg)
     if dataset.map_mode != "rgbd":
         raise ValueError(f"Expected an RGB-D dataset, got {dataset.map_mode!r}")
 

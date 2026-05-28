@@ -302,6 +302,20 @@ class LocalPatchDescriptor:
             return self._pack_xfeat_output(self._to_numpy(kpts), self._to_numpy(desc))
         raise RuntimeError(f'Unsupported XFeat output type: {type(output).__name__}')
 
+    def _reshape_descriptor_rows(self, descriptors: np.ndarray) -> np.ndarray:
+        descriptors = np.asarray(descriptors, dtype=np.float32)
+        if descriptors.size == 0:
+            dim = self.dim
+            if descriptors.ndim >= 2 and descriptors.shape[0] == 0:
+                tail = descriptors.shape[1:]
+                if tail and all(int(item) > 0 for item in tail):
+                    dim = int(np.prod(tail))
+            elif descriptors.ndim == 2 and descriptors.shape[1] == 0 and descriptors.shape[0] > 0:
+                dim = int(descriptors.shape[0])
+            self._dim = int(dim)
+            return np.zeros((0, int(dim)), dtype=np.float32)
+        return descriptors.reshape(descriptors.shape[0], -1).astype(np.float32, copy=False)
+
     def _pack_xfeat_output(self, keypoints: np.ndarray | None, descriptors: np.ndarray | None) -> XFeatImageCacheEntry:
         if keypoints is None or descriptors is None:
             return XFeatImageCacheEntry(
@@ -315,7 +329,7 @@ class LocalPatchDescriptor:
         if descriptors.ndim == 3 and descriptors.shape[0] == 1:
             descriptors = descriptors[0]
         keypoints = keypoints.reshape(-1, 2).astype(np.float32, copy=False)
-        descriptors = descriptors.reshape(descriptors.shape[0], -1).astype(np.float32, copy=False)
+        descriptors = self._reshape_descriptor_rows(descriptors)
         if descriptors.shape[0] != keypoints.shape[0]:
             n = min(keypoints.shape[0], descriptors.shape[0])
             keypoints = keypoints[:n]
@@ -393,7 +407,7 @@ class LocalPatchDescriptor:
                     and descriptors.shape[1] == keypoints.shape[0]
                 ):
                     descriptors = descriptors.T
-                descriptors = descriptors.reshape(descriptors.shape[0], -1).astype(np.float32, copy=False)
+                descriptors = self._reshape_descriptor_rows(descriptors)
                 score_key = next((k for k in ('scores', 'score', 'responses', 'response') if k in group), None)
                 scores = np.asarray(group[score_key], dtype=np.float32).reshape(-1) if score_key is not None else None
                 n = min(keypoints.shape[0], descriptors.shape[0], scores.shape[0] if scores is not None else keypoints.shape[0])

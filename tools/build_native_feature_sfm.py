@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from loo_utils import load_split, split_map_names  # noqa: E402
+from loo_utils import load_split, split_map_names, write_reduced_colmap_text_model  # noqa: E402
+from generate_loo_superglue_matches import _prepare_superglue_shim  # noqa: E402
 from plm_match.utils.config import load_config  # noqa: E402
 from plm_match.utils.colmap_model import load_colmap_model  # noqa: E402
 from plm_match.utils.io import write_json  # noqa: E402
@@ -27,6 +28,12 @@ METHOD_DEFAULTS: dict[str, dict[str, str]] = {
     "aliked": {"matcher_conf": "aliked+lightglue"},
     "disk": {"matcher_conf": "disk+lightglue"},
     "superpoint": {"matcher_conf": "superpoint+lightglue"},
+}
+
+MATCHER_CONF_ALIASES: dict[str, str] = {
+    "superpoint+superglue": "superglue",
+    "sp+sg": "superglue",
+    "sp_sg": "superglue",
 }
 
 
@@ -53,6 +60,58 @@ def _import_hloc(hloc_root: Path | None):
     from hloc import match_features, pairs_from_covisibility, triangulation
 
     return match_features, pairs_from_covisibility, triangulation
+
+
+def _resolve_matcher_conf_name(match_features: Any, name: str) -> str:
+    if name in match_features.confs:
+        return name
+    aliased = MATCHER_CONF_ALIASES.get(name)
+    if aliased is not None and aliased in match_features.confs:
+        return aliased
+    available = ", ".join(sorted(match_features.confs))
+    raise KeyError(f"Unknown HLoc matcher config {name!r}. Available configs: {available}")
+
+
+def _native_sfm_dir(out_dir: Path, method: str, matcher_conf_name: str) -> Path:
+    if matcher_conf_name == "superglue":
+        return out_dir / f"sfm_{method}+superglue"
+    if matcher_conf_name.endswith("+lightglue"):
+        return out_dir / f"sfm_{method}_lightglue"
+    return out_dir / f"sfm_{method}_{matcher_conf_name.replace('+', '_')}"
+
+
+def _filter_pairs_to_names(pairs_path: Path, out_path: Path, allowed_names: set[str]) -> dict[str, Any]:
+    total = 0
+    kept = 0
+    dropped = 0
+    dropped_examples: list[dict[str, str]] = []
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pairs_path.open("r", encoding="utf-8") as fin, out_path.open("w", encoding="utf-8") as fout:
+        for raw_line in fin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            total += 1
+            name0, name1 = parts[0], parts[1]
+            if name0 in allowed_names and name1 in allowed_names:
+                fout.write(f"{name0} {name1}\n")
+                kept += 1
+                continue
+            dropped += 1
+            if len(dropped_examples) < 10:
+                dropped_examples.append({"name0": name0, "name1": name1})
+    if total > 0 and kept == 0:
+        raise RuntimeError(f"Filtering {pairs_path} to map images produced no pairs. Check the split/model image names.")
+    return {
+        "input_pairs": int(total),
+        "kept_pairs": int(kept),
+        "dropped_pairs": int(dropped),
+        "dropped_examples": dropped_examples,
+        "path": str(out_path),
+    }
 
 
 def _import_cambridge_scale_sfm(hloc_root: Path | None):
@@ -97,7 +156,56 @@ def _infer_reference_model(cfg: dict[str, Any], dataset_root: Path) -> Path:
 
 
 def _model_has_files(path: Path) -> bool:
-    return (path / "cameras.bin").exists() and (path / "images.bin").exists()
+    has_binary = (path / "cameras.bin").exists() and (path / "images.bin").exists() and (path / "points3D.bin").exists()
+    has_text = (path / "cameras.txt").exists() and (path / "images.txt").exists() and (path / "points3D.txt").exists()
+    return has_binary or has_text
+
+
+def _reduce_reference_model_to_map_images(
+    *,
+    reference_model: Path,
+    artifacts: Path,
+    map_names: list[str],
+    overwrite: bool,
+) -> tuple[Path, dict[str, Any]]:
+    reduced_model = artifacts / "reference_model_map_only"
+    summary_path = reduced_model / "plm_reduction_summary.json"
+    expected_summary = {
+        "input_reference_model": str(reference_model),
+        "num_map_images": int(len(map_names)),
+    }
+    reuse_existing = False
+    if _model_has_files(reduced_model) and summary_path.exists():
+        try:
+            existing_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            reuse_existing = all(existing_summary.get(k) == v for k, v in expected_summary.items())
+        except Exception:
+            reuse_existing = False
+    if (overwrite or not reuse_existing) and reduced_model.exists():
+        shutil.rmtree(reduced_model)
+    if not reuse_existing:
+        write_reduced_colmap_text_model(
+            source_model=reference_model,
+            out_model=reduced_model,
+            keep_image_names=map_names,
+        )
+    _cameras, images, points3d = load_colmap_model(reduced_model)
+    kept_names = {image.name for image in images.values()}
+    missing = sorted(set(map_names) - kept_names)
+    if missing:
+        raise RuntimeError(
+            "The map-only reference model does not cover all map images; "
+            f"first missing image: {missing[0]}"
+        )
+    stats = {
+        "input_reference_model": str(reference_model),
+        "reference_model_for_triangulation": str(reduced_model),
+        "num_map_images": int(len(map_names)),
+        "num_reference_images": int(len(images)),
+        "num_reference_points3d": int(len(points3d)),
+    }
+    write_json(summary_path, stats)
+    return reduced_model, stats
 
 
 def _reference_image_size_stats(reference_model: Path, image_root: Path) -> dict[str, Any]:
@@ -324,7 +432,7 @@ def _write_native_config(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a native sparse-feature SfM map by triangulating feature-specific LightGlue "
+            "Build a native sparse-feature SfM map by triangulating feature-specific matcher "
             "tracks on fixed reference DB poses, preserving the benchmark coordinate frame."
         )
     )
@@ -352,6 +460,10 @@ def main() -> None:
     parser.add_argument("--pairs_path", type=Path, default=None)
     parser.add_argument("--matches_path", type=Path, default=None)
     parser.add_argument("--matcher_conf", type=str, default=None)
+    parser.add_argument("--native_sfm_dir", type=Path, default=None)
+    parser.add_argument("--superglue_weights", choices=("outdoor", "indoor"), default=None)
+    parser.add_argument("--superglue_weights_path", type=Path, default=None)
+    parser.add_argument("--download_superglue_weights", action="store_true")
     parser.add_argument("--num_covis", type=int, default=20)
     parser.add_argument("--hloc_root", type=Path, default=None)
     parser.add_argument("--resize_max", type=int, default=None)
@@ -380,8 +492,9 @@ def main() -> None:
 
     image_root = _image_root(cfg, dataset_root)
     reference_model_input = args.reference_model or _infer_reference_model(cfg, dataset_root)
-    matcher_conf_name = args.matcher_conf or METHOD_DEFAULTS[str(args.method)]["matcher_conf"]
+    requested_matcher_conf_name = args.matcher_conf or METHOD_DEFAULTS[str(args.method)]["matcher_conf"]
     match_features, pairs_from_covisibility, triangulation = _import_hloc(args.hloc_root)
+    matcher_conf_name = _resolve_matcher_conf_name(match_features, requested_matcher_conf_name)
     reference_model, reference_model_stats = _prepare_reference_model_for_features(
         reference_model=reference_model_input,
         image_root=image_root,
@@ -390,17 +503,39 @@ def main() -> None:
         hloc_root=args.hloc_root,
         overwrite=bool(args.overwrite_reference_model or args.overwrite_sfm),
     )
+    reference_model, map_reference_model_stats = _reduce_reference_model_to_map_images(
+        reference_model=reference_model,
+        artifacts=artifacts,
+        map_names=map_names,
+        overwrite=bool(args.overwrite_reference_model or args.overwrite_sfm),
+    )
 
     map_list = artifacts / "map_images.txt"
     _write_image_list(map_list, map_names)
 
-    pairs_path = args.pairs_path or artifacts / f"pairs-db-covis{int(args.num_covis)}.txt"
-    if pairs_path.exists() and not args.overwrite_pairs:
-        print(f"Reusing SfM pairs: {pairs_path}")
+    raw_pairs_path = args.pairs_path or artifacts / f"pairs-db-covis{int(args.num_covis)}.txt"
+    if raw_pairs_path.exists() and not args.overwrite_pairs:
+        print(f"Reusing SfM pairs: {raw_pairs_path}")
     else:
-        pairs_from_covisibility.main(reference_model, pairs_path, int(args.num_covis))
+        pairs_from_covisibility.main(reference_model, raw_pairs_path, int(args.num_covis))
+    pairs_path = artifacts / f"{raw_pairs_path.stem}-map{raw_pairs_path.suffix}"
+    pair_filter_stats = _filter_pairs_to_names(raw_pairs_path, pairs_path, set(map_names))
+    print(
+        "Filtered SfM pairs to map images: "
+        f"{pair_filter_stats['kept_pairs']}/{pair_filter_stats['input_pairs']} -> {pairs_path}"
+    )
 
     matcher_conf = dict(match_features.confs[matcher_conf_name])
+    matcher_model = dict(matcher_conf.get("model", {}))
+    if args.superglue_weights is not None and matcher_model.get("name") == "superglue":
+        matcher_model["weights"] = str(args.superglue_weights)
+        matcher_conf["model"] = matcher_model
+    if matcher_model.get("name") == "superglue":
+        _prepare_superglue_shim(
+            weights=str(matcher_model.get("weights", "outdoor")),
+            weights_path=args.superglue_weights_path,
+            download_weights=bool(args.download_superglue_weights),
+        )
     matches_path = args.matches_path or artifacts / f"{Path(hloc_db_features).stem}_{matcher_conf['output']}_{pairs_path.stem}.h5"
     if matches_path.exists() and not args.overwrite_matches:
         print(f"Reusing SfM matches: {matches_path}")
@@ -415,7 +550,7 @@ def main() -> None:
                 overwrite=True,
             )
 
-    native_sfm = out_dir / f"sfm_{args.method}_lightglue"
+    native_sfm = args.native_sfm_dir or _native_sfm_dir(out_dir, str(args.method), matcher_conf_name)
     if native_sfm.exists() and args.overwrite_sfm:
         shutil.rmtree(native_sfm)
     if (native_sfm / "images.bin").exists() and not args.overwrite_sfm:
@@ -452,6 +587,7 @@ def main() -> None:
     summary = {
         "method": str(args.method),
         "matcher_conf": str(matcher_conf_name),
+        "requested_matcher_conf": str(requested_matcher_conf_name),
         "dataset_root": str(dataset_root),
         "image_root": str(image_root),
         "split_json": str(args.split_json),
@@ -459,7 +595,10 @@ def main() -> None:
         "reference_model_input": str(reference_model_input),
         "reference_model_coordinate_mode": str(args.reference_model_coordinate_mode),
         "reference_model_stats": reference_model_stats,
+        "map_reference_model_stats": map_reference_model_stats,
+        "raw_pairs_path": str(raw_pairs_path),
         "pairs_path": str(pairs_path),
+        "pair_filter_stats": pair_filter_stats,
         "matches_path": str(matches_path),
         "db_features_path": str(db_features),
         "query_features_path": str(query_features),

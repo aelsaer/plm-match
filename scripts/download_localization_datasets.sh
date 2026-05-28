@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PY="${PY:-/home/andreas/anaconda3/envs/sam3/bin/python}"
+PY="${PY:-python}"
 DATA_ROOT="${DATA_ROOT:-datasets}"
 DRY_RUN="${DRY_RUN:-0}"
 KEEP_ARCHIVES="${KEEP_ARCHIVES:-0}"
 EXTRACT_IMAGES="${EXTRACT_IMAGES:-1}"
 DOWNLOAD_RENDERED_DEPTH="${DOWNLOAD_RENDERED_DEPTH:-0}"
 
-CAMBRIDGE_ROOT="${CAMBRIDGE_ROOT:-/mnt/d/private/pairs/cambridge_landmarks}"
+CAMBRIDGE_ROOT="${CAMBRIDGE_ROOT:-$DATA_ROOT/cambridge_landmarks}"
 AACHEN_ROOT="${AACHEN_ROOT:-$DATA_ROOT/aachen_v1_1}"
 ROBOTCAR_ROOT="${ROBOTCAR_ROOT:-$DATA_ROOT/RobotCar-Seasons}"
 CMU_EXT_ROOT="${CMU_EXT_ROOT:-$DATA_ROOT/CMU-Seasons}"
@@ -73,7 +73,7 @@ Environment:
   KEEP_ARCHIVES=1
   EXTRACT_IMAGES=0                  skip image zip extraction for huge datasets
   DOWNLOAD_RENDERED_DEPTH=1          also fetch rendered 7-Scenes depth used only by dense-depth HLoc variants
-  CAMBRIDGE_ROOT=/mnt/d/private/pairs/cambridge_landmarks
+  CAMBRIDGE_ROOT=datasets/cambridge_landmarks
   AACHEN_ROOT=datasets/aachen_v1_1
   ROBOTCAR_ROOT=datasets/RobotCar-Seasons
   CMU_EXT_ROOT=datasets/CMU-Seasons

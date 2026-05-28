@@ -551,6 +551,7 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
         valid_raw = np.zeros((0,), dtype=bool)
 
     needs_filter_rewrite = bool(valid_raw.shape[0] != all_pids_raw.shape[0] or not np.all(valid_raw))
+    missing_obs_files = 0
     if needs_filter_rewrite:
         total_obs = 0
         frames_with_obs = 0
@@ -561,6 +562,12 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
                 record["obs_offset"] = int(total_obs)
                 continue
             path = image_obs_dir / obs_file
+            if not path.exists():
+                missing_obs_files += 1
+                record["obs_file"] = ""
+                record["obs_count"] = 0
+                record["obs_offset"] = int(total_obs)
+                continue
             data = np.load(path, allow_pickle=False)
             pids = np.asarray(data["point_ids"], dtype=np.int64)
             local_keep = (pids >= 0) & (pids < keep_pid.shape[0]) & keep_pid[pids]
@@ -651,6 +658,7 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
         "num_landmarks": int(saved_point_ids.shape[0]),
         "num_raw_merged_landmarks": int(point_xyz.shape[0]),
         "num_landmarks_after_filters": int(saved_point_ids.shape[0]),
+        "num_missing_obs_files_during_filter": int(missing_obs_files),
         "sift_attach_mode": str(args.sift_attach_mode),
         "sift_match_test": str(args.sift_match_test),
         "sift_ratio": float(args.sift_ratio),
@@ -678,6 +686,7 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
         "median_landmark_source_frames": float(np.median(np.asarray(saved_num_frames, dtype=np.float64))) if saved_num_frames.shape[0] > 0 else 0.0,
         "min_depth_m": float(args.min_depth_m),
         "max_depth_m": float(args.max_depth_m),
+        "depth_window": int(args.depth_window),
         "max_keypoints": int(args.max_keypoints),
         "descriptor_dim": int(descriptor_dim),
         "descriptor_dtype": str(np.dtype(descriptor_dtype)),

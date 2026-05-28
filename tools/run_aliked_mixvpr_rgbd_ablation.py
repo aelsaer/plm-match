@@ -201,7 +201,16 @@ def main() -> None:
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument("--query_topk", type=int, default=4096)
     parser.add_argument("--landmark_match_mode", default="image_obs_hloc_nn")
+    parser.add_argument("--point_memory_max_obs", type=int, default=4)
+    parser.add_argument("--point_memory_obs_select", choices=("first", "uniform", "diverse_desc"), default="first")
     parser.add_argument("--merge_radius_m", type=float, default=0.02)
+    parser.add_argument("--min_depth_m", type=float, default=0.2)
+    parser.add_argument("--max_depth_m", type=float, default=5.0)
+    parser.add_argument("--depth_window", type=int, default=1)
+    parser.add_argument("--min_landmark_observations", type=int, default=1)
+    parser.add_argument("--min_source_frames", type=int, default=1)
+    parser.add_argument("--max_descriptor_variance", type=float, default=float("inf"))
+    parser.add_argument("--min_reliability", type=float, default=0.0)
     parser.add_argument("--reliability_weight", type=float, default=0.10)
     parser.add_argument("--sequence_activation", choices=("prev_pose", "window_retrieval"), default="window_retrieval")
     parser.add_argument("--sequence_window", type=int, default=3)
@@ -310,10 +319,28 @@ def main() -> None:
             str(int(args.query_topk)),
             "--landmark_match_mode",
             str(args.landmark_match_mode),
+            "--point_memory_max_obs",
+            str(int(args.point_memory_max_obs)),
+            "--point_memory_obs_select",
+            str(args.point_memory_obs_select),
             "--retrieval_method",
             "mixvpr",
             "--merge_radius_m",
             str(float(args.merge_radius_m)),
+            "--min_depth_m",
+            str(float(args.min_depth_m)),
+            "--max_depth_m",
+            str(float(args.max_depth_m)),
+            "--depth_window",
+            str(int(args.depth_window)),
+            "--min_landmark_observations",
+            str(int(args.min_landmark_observations)),
+            "--min_source_frames",
+            str(int(args.min_source_frames)),
+            "--max_descriptor_variance",
+            str(float(args.max_descriptor_variance)),
+            "--min_reliability",
+            str(float(args.min_reliability)),
             "--reliability_weight",
             str(float(args.reliability_weight)),
             "--sequence_activation",
