@@ -59,6 +59,61 @@ for required in "$DATASET" "$MODEL_DIR"; do
 done
 
 if [[ ! -f "$MODEL_DIR/cameras.txt" || ! -f "$MODEL_DIR/images.txt" || ! -f "$MODEL_DIR/points3D.txt" ]]; then
+  if [[ -f "$MODEL_DIR/cameras.bin" && -f "$MODEL_DIR/images.bin" && -f "$MODEL_DIR/points3D.bin" ]]; then
+    CONVERTED_MODEL_DIR=${CONVERTED_MODEL_DIR:-$BASE/colmap_model_text}
+    if [[ "$OVERWRITE" == "1" || ! -f "$CONVERTED_MODEL_DIR/cameras.txt" || ! -f "$CONVERTED_MODEL_DIR/images.txt" || ! -f "$CONVERTED_MODEL_DIR/points3D.txt" ]]; then
+      echo "Converting binary COLMAP model to text: $CONVERTED_MODEL_DIR"
+      "$PY" - "$MODEL_DIR" "$CONVERTED_MODEL_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+repo = Path.cwd()
+if str(repo) not in sys.path:
+    sys.path.insert(0, str(repo))
+
+from plm_match.utils.colmap_model import load_colmap_model
+
+src = Path(sys.argv[1])
+out = Path(sys.argv[2])
+out.mkdir(parents=True, exist_ok=True)
+cams, images, points = load_colmap_model(src)
+
+with (out / "cameras.txt").open("w", encoding="utf-8") as f:
+    f.write("# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+    for camera_id in sorted(cams):
+        cam = cams[camera_id]
+        params = " ".join(f"{float(x):.17g}" for x in cam.params)
+        f.write(f"{int(cam.id)} {cam.model} {int(cam.width)} {int(cam.height)} {params}\n")
+
+with (out / "images.txt").open("w", encoding="utf-8") as f:
+    f.write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+    f.write("# POINTS2D[] as (X, Y, POINT3D_ID)\n")
+    for image_id in sorted(images):
+        im = images[image_id]
+        q = " ".join(f"{float(x):.17g}" for x in im.qvec)
+        t = " ".join(f"{float(x):.17g}" for x in im.tvec)
+        f.write(f"{int(im.id)} {q} {t} {int(im.camera_id)} {im.name}\n")
+        triplets = []
+        for uv, pid in zip(im.xys, im.point3D_ids):
+            triplets.extend([f"{float(uv[0]):.17g}", f"{float(uv[1]):.17g}", str(int(pid))])
+        f.write(" ".join(triplets) + "\n")
+
+with (out / "points3D.txt").open("w", encoding="utf-8") as f:
+    f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+    for point_id in sorted(points):
+        p = points[point_id]
+        xyz = " ".join(f"{float(x):.17g}" for x in p.xyz)
+        rgb = " ".join(str(int(x)) for x in p.rgb)
+        track = " ".join(f"{int(i)} {int(j)}" for i, j in zip(p.image_ids, p.point2D_idxs))
+        f.write(f"{int(p.id)} {xyz} {rgb} {float(p.error):.17g} {track}\n")
+PY
+    fi
+    MODEL_DIR=$CONVERTED_MODEL_DIR
+  fi
+fi
+
+if [[ ! -f "$MODEL_DIR/cameras.txt" || ! -f "$MODEL_DIR/images.txt" || ! -f "$MODEL_DIR/points3D.txt" ]]; then
   echo "Missing COLMAP text model files in $MODEL_DIR" >&2
   echo "If the model is binary, convert it to text with COLMAP before this script." >&2
   exit 2
