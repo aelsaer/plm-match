@@ -22,7 +22,7 @@ from plm_match.pipelines.localize_from_map import PLMMapLocalizer, _ppca_penalty
 from plm_match.utils.config import load_config
 from plm_match.utils.io import read_image, write_json
 from plm_match.utils.pose import camera_center_from_Twc
-from loo_utils import frame_name, load_split
+from loo_utils import frame_name, load_split, map_only_dataset_cfg
 from run_db_leave_one_out import LeaveOneOutDataset, _deep_set, _parse_override, make_candidate_provider, merge_retrievals
 
 
@@ -37,7 +37,7 @@ def _parse_csv_strs(raw: str) -> list[str]:
 def _make_loo_dataset(config_path: Path, dataset_root: Path | None, split_json: Path) -> tuple[dict[str, Any], LeaveOneOutDataset]:
     cfg = load_config(config_path)
     root = dataset_root or Path(cfg["dataset_root"])
-    base_dataset = build_dataset(str(root), cfg.get("dataset", {"type": "colmap_localization"}))
+    base_dataset = build_dataset(str(root), map_only_dataset_cfg(cfg))
     split = load_split(split_json)
     all_frames = base_dataset.get_map_frames()
     name_to_idx = {frame_name(frame): i for i, frame in enumerate(all_frames)}

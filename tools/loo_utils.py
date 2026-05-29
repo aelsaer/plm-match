@@ -32,10 +32,18 @@ def frame_name(frame: FrameRecord) -> str:
     return str(frame.meta.get("relative_path", frame.image_path.name))
 
 
+def map_only_dataset_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return dataset config for LOO tasks that only need COLMAP map frames."""
+    dataset_cfg = dict(cfg.get("dataset", {"type": "colmap_localization"}))
+    for key in ("query_list", "query_gt_pose_dir", "query_image_dir", "max_query_frames"):
+        dataset_cfg.pop(key, None)
+    return dataset_cfg
+
+
 def build_base_dataset(config_path: Path, dataset_root: Path | None = None):
     cfg = load_config(config_path)
     root = dataset_root or Path(cfg["dataset_root"])
-    return cfg, root, build_dataset(str(root), cfg.get("dataset", {"type": "colmap_localization"}))
+    return cfg, root, build_dataset(str(root), map_only_dataset_cfg(cfg))
 
 
 def frame_intrinsics_line(frame: FrameRecord) -> str:

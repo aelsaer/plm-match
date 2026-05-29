@@ -27,7 +27,7 @@ from plm_match.types import LandmarkCandidateGroup, LandmarkCandidateSchedule, L
 from plm_match.utils.config import load_config
 from plm_match.utils.io import read_image, write_json
 from plm_match.utils.pose import camera_center_from_Twc
-from loo_utils import evaluate_results, load_split
+from loo_utils import evaluate_results, load_split, map_only_dataset_cfg
 from build_sp_micro_map import (
     UnionFind,
     _build_point_groups,
@@ -1707,7 +1707,7 @@ def main() -> None:
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    base_dataset = build_dataset(str(dataset_root), cfg.get("dataset", {"type": "colmap_localization"}))
+    base_dataset = build_dataset(str(dataset_root), map_only_dataset_cfg(cfg))
     all_frames = base_dataset.get_map_frames()
     selectable_frames = all_frames[: args.max_frame_index] if args.max_frame_index is not None else all_frames
     fixed_split = load_split(args.split_json) if args.split_json is not None else None

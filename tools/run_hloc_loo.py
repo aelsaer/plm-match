@@ -14,7 +14,15 @@ from scipy.spatial import cKDTree
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from loo_utils import evaluate_results, frame_name, load_split, split_map_names, split_query_names, write_reduced_colmap_text_model
+from loo_utils import (
+    evaluate_results,
+    frame_name,
+    load_split,
+    map_only_dataset_cfg,
+    split_map_names,
+    split_query_names,
+    write_reduced_colmap_text_model,
+)
 from plm_match.datasets import build_dataset
 from plm_match.geometry import solve_pnp_ransac
 from plm_match.hloc import parse_retrieval_file
@@ -115,7 +123,7 @@ def _run_nearest_lift_localization(
     keypoints but use Aachen's provided COLMAP model, so we must map DB
     keypoints back to nearest COLMAP observations before lifting to 3D.
     """
-    dataset = build_dataset(str(dataset_root), cfg.get("dataset", {"type": "colmap_localization"}))
+    dataset = build_dataset(str(dataset_root), map_only_dataset_cfg(cfg))
     map_frames = dataset.get_map_frames()
     name_to_frame = {frame_name(frame): frame for frame in map_frames}
     query_names = split_query_names(split)

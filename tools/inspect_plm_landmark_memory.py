@@ -19,6 +19,7 @@ from plm_match.datasets import build_dataset
 from plm_match.fine_features import LocalPatchDescriptor, is_h5_local_feature_method
 from plm_match.utils.config import load_config
 from plm_match.utils.io import ensure_dir, read_image
+from loo_utils import map_only_dataset_cfg
 
 
 def _jsonable(value: Any) -> Any:
@@ -138,7 +139,7 @@ def _load_dataset(args: argparse.Namespace, summary: dict[str, Any], command_fla
     if config_path is None or not Path(config_path).exists() or dataset_root is None:
         return None, {}, None
     cfg = load_config(config_path)
-    dataset_cfg = dict(cfg.get("dataset", {"type": "colmap_localization"}))
+    dataset_cfg = map_only_dataset_cfg(cfg)
     split_path = args.split_json or _resolve_path(command_flags.get("split_json"), base=ROOT)
     if split_path is not None:
         dataset_cfg.pop("db_image_names_file", None)

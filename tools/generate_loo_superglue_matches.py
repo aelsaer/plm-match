@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 from plm_match.datasets import build_dataset
 from plm_match.utils.config import load_config
 from plm_match.utils.pose import camera_center_from_Twc
+from loo_utils import map_only_dataset_cfg
 
 
 SUPERGLUE_URLS = {
@@ -169,7 +170,7 @@ def _write_pairs(
     topk: int,
 ) -> int:
     split = json.loads(split_path.read_text(encoding="utf-8"))
-    dataset = build_dataset(cfg["dataset_root"], cfg.get("dataset", {"type": "colmap_localization"}))
+    dataset = build_dataset(cfg["dataset_root"], map_only_dataset_cfg(cfg))
     all_frames = dataset.get_map_frames()
     count = _selectable_count(split, len(all_frames))
     selectable = all_frames[:count]

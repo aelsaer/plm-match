@@ -19,6 +19,7 @@ from plm_match.datasets import build_dataset
 from plm_match.fine_features import LocalPatchDescriptor, is_h5_local_feature_method
 from plm_match.utils.config import load_config
 from plm_match.utils.io import ensure_dir, read_image
+from loo_utils import map_only_dataset_cfg
 
 try:
     from scipy.spatial import cKDTree
@@ -186,7 +187,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     dataset_root = args.dataset_root or (split.get("dataset_root") if split is not None else None) or cfg.get("dataset_root")
     if dataset_root is None:
         raise ValueError("dataset_root must be set either in the config or via --dataset_root")
-    dataset_cfg = dict(cfg.get("dataset", {"type": "colmap_localization"}))
+    dataset_cfg = map_only_dataset_cfg(cfg)
     if split is not None:
         dataset_cfg.pop("db_image_names_file", None)
         dataset_cfg.pop("max_map_frames", None)

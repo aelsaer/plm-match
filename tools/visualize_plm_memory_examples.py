@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-from loo_utils import load_split
+from loo_utils import load_split, map_only_dataset_cfg
 from plm_match.datasets import build_dataset
 from plm_match.geometry import solve_pnp_ransac
 from plm_match.hloc import parse_retrieval_file
@@ -78,7 +78,7 @@ def _draw_label(draw: ImageDraw.ImageDraw, xy: tuple[int, int], text: str, fill=
 
 def _make_loo_dataset(cfg: dict, split: dict):
     dataset_root = Path(split.get("dataset_root") or cfg["dataset_root"])
-    base_dataset = build_dataset(str(dataset_root), cfg.get("dataset", {"type": "colmap_localization"}))
+    base_dataset = build_dataset(str(dataset_root), map_only_dataset_cfg(cfg))
     all_frames = base_dataset.get_map_frames()
     name_to_idx = {_query_name(frame): i for i, frame in enumerate(all_frames)}
     heldout = []

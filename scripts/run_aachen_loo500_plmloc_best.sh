@@ -152,6 +152,8 @@ for line in text.splitlines():
     elif line.strip().startswith("model_path:"):
         indent = line[: len(line) - len(line.lstrip())]
         lines.append(f"{indent}model_path: {model_dir}")
+    elif line.strip().startswith(("query_list:", "query_gt_pose_dir:")):
+        continue
     else:
         lines.append(line)
 cfg_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
