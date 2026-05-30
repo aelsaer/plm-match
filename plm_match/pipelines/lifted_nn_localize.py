@@ -15,11 +15,12 @@ from tqdm import tqdm
 from plm_match.datasets import build_dataset
 from plm_match.eval.cambridge import add_cambridge_report_fields
 from plm_match.fine_features import LocalPatchDescriptor, is_h5_local_feature_method
-from plm_match.geometry import solve_pnp_ransac
+from plm_match.geometry import solve_pnp_ransac, solve_rigid_3d3d_ransac
 from plm_match.types import Match3D2D, PoseResult
 from plm_match.utils.config import load_config
-from plm_match.utils.io import ensure_dir, read_image, read_pose_txt, write_json, write_pose_txt
+from plm_match.utils.io import ensure_dir, read_depth, read_image, read_pose_txt, write_json, write_pose_txt
 from plm_match.utils.pose import (
+    backproject_depth,
     camera_center_from_Twc,
     invert_pose,
     pose_to_quat_t,
@@ -3994,6 +3995,164 @@ def _run_two_stage_pnp(
     return first, matches, "pnp_first"
 
 
+def _read_query_depth(frame) -> np.ndarray | None:
+    if frame.depth_path is None:
+        return None
+    depth = read_depth(frame.depth_path)
+    scale = frame.meta.get("depth_scale_correction") if isinstance(frame.meta, dict) else None
+    if scale is not None:
+        depth = depth.astype(np.float32, copy=False) * float(scale)
+    return np.asarray(depth, dtype=np.float32)
+
+
+def _sample_depth_at_uv(
+    depth: np.ndarray,
+    uv: np.ndarray,
+    *,
+    min_depth_m: float,
+    max_depth_m: float,
+    window: int,
+) -> float | None:
+    if depth is None or depth.ndim < 2:
+        return None
+    h, w = depth.shape[:2]
+    x = int(round(float(uv[0])))
+    y = int(round(float(uv[1])))
+    if x < 0 or x >= w or y < 0 or y >= h:
+        return None
+    radius = max(0, int(window) // 2)
+    patch = depth[max(0, y - radius) : min(h, y + radius + 1), max(0, x - radius) : min(w, x + radius + 1)]
+    vals = patch[np.isfinite(patch) & (patch >= float(min_depth_m)) & (patch <= float(max_depth_m))]
+    if vals.size == 0:
+        return None
+    return float(np.median(vals.astype(np.float64, copy=False)))
+
+
+def _matches_with_query_depth(
+    matches: list[Match3D2D],
+    depth: np.ndarray | None,
+    intr: dict,
+    *,
+    min_depth_m: float,
+    max_depth_m: float,
+    depth_window: int,
+) -> tuple[list[Match3D2D], np.ndarray, np.ndarray]:
+    if depth is None:
+        return [], np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.float64)
+    kept: list[Match3D2D] = []
+    query_xyz: list[np.ndarray] = []
+    world_xyz: list[np.ndarray] = []
+    for match in matches:
+        z = _sample_depth_at_uv(
+            depth,
+            match.uv_query,
+            min_depth_m=float(min_depth_m),
+            max_depth_m=float(max_depth_m),
+            window=int(depth_window),
+        )
+        if z is None:
+            continue
+        kept.append(match)
+        query_xyz.append(backproject_depth(match.uv_query, z, intr))
+        world_xyz.append(np.asarray(match.xyz_landmark, dtype=np.float64).reshape(3))
+    if not kept:
+        return kept, np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.float64)
+    return kept, np.stack(query_xyz, axis=0), np.stack(world_xyz, axis=0)
+
+
+def _run_two_stage_rgbd_3d3d(
+    matches: list[Match3D2D],
+    intr: dict,
+    query_depth: np.ndarray | None,
+    *,
+    first_thresh_m: float,
+    refine_thresh_m: float,
+    iterations: int,
+    min_depth_m: float,
+    max_depth_m: float,
+    depth_window: int,
+    min_inliers: int,
+) -> tuple[PoseResult, list[Match3D2D], str]:
+    if query_depth is None:
+        return PoseResult(False, None, None, 0, 0, None), [], "rgbd_3d3d_no_depth"
+    depth_matches, query_xyz, world_xyz = _matches_with_query_depth(
+        matches,
+        query_depth,
+        intr,
+        min_depth_m=float(min_depth_m),
+        max_depth_m=float(max_depth_m),
+        depth_window=int(depth_window),
+    )
+    if len(depth_matches) < 3:
+        return PoseResult(False, None, None, 0, len(depth_matches), None), depth_matches, "rgbd_3d3d_not_enough_depth"
+    first = solve_rigid_3d3d_ransac(
+        query_xyz,
+        world_xyz,
+        inlier_thresh_m=float(first_thresh_m),
+        iterations=int(iterations),
+        min_inliers=max(3, int(min_inliers)),
+    )
+    if not first.success or first.inlier_mask is None:
+        return first, depth_matches, "rgbd_3d3d_first"
+    inlier_idx = np.asarray(first.inlier_mask, dtype=np.int64).reshape(-1)
+    inlier_idx = inlier_idx[(inlier_idx >= 0) & (inlier_idx < len(depth_matches))]
+    if inlier_idx.shape[0] < 3:
+        return first, depth_matches, "rgbd_3d3d_first"
+    inlier_matches = [depth_matches[int(i)] for i in inlier_idx.tolist()]
+    second = solve_rigid_3d3d_ransac(
+        query_xyz[inlier_idx],
+        world_xyz[inlier_idx],
+        inlier_thresh_m=float(refine_thresh_m),
+        iterations=int(iterations),
+        min_inliers=max(3, int(min_inliers)),
+    )
+    if second.success:
+        return second, inlier_matches, "rgbd_3d3d_refine"
+    return first, depth_matches, "rgbd_3d3d_first"
+
+
+def _run_two_stage_pose(
+    matches: list[Match3D2D],
+    intr: dict,
+    *,
+    query_depth: np.ndarray | None,
+    pose_backend: str,
+    pnp_first_thresh: float,
+    pnp_refine_thresh: float,
+    pnp_iterations: int,
+    rgbd_first_thresh_m: float,
+    rgbd_refine_thresh_m: float,
+    rgbd_iterations: int,
+    rgbd_min_depth_m: float,
+    rgbd_max_depth_m: float,
+    rgbd_depth_window: int,
+    min_final_inliers: int,
+) -> tuple[PoseResult, list[Match3D2D], str]:
+    backend = str(pose_backend)
+    if backend == "auto":
+        backend = "rgbd_3d3d" if query_depth is not None else "pnp"
+    if backend == "rgbd_3d3d":
+        return _run_two_stage_rgbd_3d3d(
+            matches,
+            intr,
+            query_depth,
+            first_thresh_m=float(rgbd_first_thresh_m),
+            refine_thresh_m=float(rgbd_refine_thresh_m),
+            iterations=int(rgbd_iterations),
+            min_depth_m=float(rgbd_min_depth_m),
+            max_depth_m=float(rgbd_max_depth_m),
+            depth_window=int(rgbd_depth_window),
+            min_inliers=int(min_final_inliers),
+        )
+    return _run_two_stage_pnp(
+        matches,
+        intr,
+        first_thresh=float(pnp_first_thresh),
+        refine_thresh=float(pnp_refine_thresh),
+        iterations=int(pnp_iterations),
+    )
+
+
 def _limit_matches_for_pnp(matches: list[Match3D2D], max_matches: int) -> list[Match3D2D]:
     if int(max_matches) <= 0 or len(matches) <= int(max_matches):
         return matches
@@ -4879,6 +5038,8 @@ def _localize_one_query(
             "success": False,
             "reason": "missing_intrinsics",
             "landmark_match_mode": landmark_match_mode,
+            "pose_backend": str(cfg.get("pose_backend", "pnp")),
+            "query_depth_available": False,
             "num_candidate_points": 0,
             "num_candidate_observations": 0,
             "early_exit_triggered": False,
@@ -4910,6 +5071,8 @@ def _localize_one_query(
             "success": False,
             "reason": "no_query_superpoint",
             "landmark_match_mode": landmark_match_mode,
+            "pose_backend": str(cfg.get("pose_backend", "pnp")),
+            "query_depth_available": False,
             "num_query_keypoints": int(q_kpts.shape[0]),
             "num_candidate_points": 0,
             "num_candidate_observations": 0,
@@ -4933,6 +5096,11 @@ def _localize_one_query(
             "query_time_s": float(time.perf_counter() - t0),
         }
         return row, None, query_name
+    query_depth = (
+        _read_query_depth(frame)
+        if str(cfg.get("pose_backend", "pnp")) in {"rgbd_3d3d", "auto"}
+        else None
+    )
     if adaptive_schedule and not adaptive_disabled and db_names:
         best_row: dict | None = None
         best_pose: np.ndarray | None = None
@@ -5402,12 +5570,21 @@ def _localize_one_query(
         if len(matches_for_pnp) < 4:
             continue
         clusters_tested += 1
-        pose, used_matches, stage = _run_two_stage_pnp(
+        pose, used_matches, stage = _run_two_stage_pose(
             matches_for_pnp,
             intr,
-            first_thresh=float(cfg["pnp_first_thresh"]),
-            refine_thresh=float(cfg["pnp_refine_thresh"]),
-            iterations=int(cfg["pnp_iterations"]),
+            query_depth=query_depth,
+            pose_backend=str(cfg["pose_backend"]),
+            pnp_first_thresh=float(cfg["pnp_first_thresh"]),
+            pnp_refine_thresh=float(cfg["pnp_refine_thresh"]),
+            pnp_iterations=int(cfg["pnp_iterations"]),
+            rgbd_first_thresh_m=float(cfg["rgbd_3d3d_first_thresh_m"]),
+            rgbd_refine_thresh_m=float(cfg["rgbd_3d3d_refine_thresh_m"]),
+            rgbd_iterations=int(cfg["rgbd_3d3d_iterations"]),
+            rgbd_min_depth_m=float(cfg["rgbd_min_depth_m"]),
+            rgbd_max_depth_m=float(cfg["rgbd_max_depth_m"]),
+            rgbd_depth_window=int(cfg["rgbd_depth_window"]),
+            min_final_inliers=int(cfg["min_final_inliers"]),
         )
         quality = _pose_quality(
             pose,
@@ -5490,15 +5667,25 @@ def _localize_one_query(
                     float(pg_aggregate_stats.get("mean_memory_rerank_candidates_per_query", 0.0))
                 )
             if len(pg_matches) >= 4:
-                pg_pose = solve_pnp_ransac(
+                pg_pose, pg_used_matches, pg_stage = _run_two_stage_pose(
                     pg_matches,
                     intr,
-                    reproj_err=float(cfg["pnp_refine_thresh"]),
-                    iterations=int(cfg["pnp_iterations"]),
+                    query_depth=query_depth,
+                    pose_backend=str(cfg["pose_backend"]),
+                    pnp_first_thresh=float(cfg["pnp_refine_thresh"]),
+                    pnp_refine_thresh=float(cfg["pnp_refine_thresh"]),
+                    pnp_iterations=int(cfg["pnp_iterations"]),
+                    rgbd_first_thresh_m=float(cfg["rgbd_3d3d_refine_thresh_m"]),
+                    rgbd_refine_thresh_m=float(cfg["rgbd_3d3d_refine_thresh_m"]),
+                    rgbd_iterations=int(cfg["rgbd_3d3d_iterations"]),
+                    rgbd_min_depth_m=float(cfg["rgbd_min_depth_m"]),
+                    rgbd_max_depth_m=float(cfg["rgbd_max_depth_m"]),
+                    rgbd_depth_window=int(cfg["rgbd_depth_window"]),
+                    min_final_inliers=int(cfg["min_pose_guided_inliers"]),
                 )
                 pg_quality = _pose_quality(
                     pg_pose,
-                    pg_matches,
+                    pg_used_matches,
                     min_inliers=int(cfg["min_pose_guided_inliers"]),
                     cluster_rank=0,
                 )
@@ -5506,9 +5693,9 @@ def _localize_one_query(
                     best_quality = pg_quality
                     best = ClusterPose(
                         pose=pg_pose,
-                        matches=pg_matches,
+                        matches=pg_used_matches,
                         cluster_images=best.cluster_images,
-                        stage="pose_guided",
+                        stage=f"pose_guided_{pg_stage}",
                         raw_hypotheses=combined,
                         aggregated=pg_aggregated,
                     )
@@ -5537,6 +5724,8 @@ def _localize_one_query(
             "success": False,
             "reason": "no_cluster_pose",
             "landmark_match_mode": landmark_match_mode,
+            "pose_backend": str(cfg["pose_backend"]),
+            "query_depth_available": bool(query_depth is not None),
             "num_query_keypoints": int(q_kpts.shape[0]),
             "num_db_images": int(len(db_names)),
             "num_clusters": int(len(clusters)),
@@ -5634,6 +5823,8 @@ def _localize_one_query(
         "query": query_name,
         "success": bool(pose.success),
         "landmark_match_mode": landmark_match_mode,
+        "pose_backend": str(cfg["pose_backend"]),
+        "query_depth_available": bool(query_depth is not None),
         "stage": str(best.stage),
         "num_query_keypoints": int(q_kpts.shape[0]),
         "num_db_images": int(len(db_names)),
@@ -6017,6 +6208,44 @@ def _runtime_cfg(cfg: dict, args: argparse.Namespace) -> dict[str, object]:
         ),
         "pnp_refine_thresh": float(args.pnp_refine_thresh if args.pnp_refine_thresh is not None else lnn_cfg.get("pnp_refine_thresh", 4.0)),
         "pnp_iterations": int(args.pnp_iterations if args.pnp_iterations is not None else lnn_cfg.get("pnp_iterations", pnp_cfg.get("iterations", 8000))),
+        "pose_backend": str(
+            args.pose_backend if getattr(args, "pose_backend", None) is not None else lnn_cfg.get("pose_backend", "pnp")
+        ),
+        "rgbd_3d3d_first_thresh_m": float(
+            args.rgbd_3d3d_first_thresh_m
+            if getattr(args, "rgbd_3d3d_first_thresh_m", None) is not None
+            else lnn_cfg.get("rgbd_3d3d_first_thresh_m", 0.08)
+        ),
+        "rgbd_3d3d_refine_thresh_m": float(
+            args.rgbd_3d3d_refine_thresh_m
+            if getattr(args, "rgbd_3d3d_refine_thresh_m", None) is not None
+            else lnn_cfg.get("rgbd_3d3d_refine_thresh_m", 0.04)
+        ),
+        "rgbd_3d3d_iterations": int(
+            args.rgbd_3d3d_iterations
+            if getattr(args, "rgbd_3d3d_iterations", None) is not None
+            else lnn_cfg.get(
+                "rgbd_3d3d_iterations",
+                args.pnp_iterations
+                if getattr(args, "pnp_iterations", None) is not None
+                else lnn_cfg.get("pnp_iterations", pnp_cfg.get("iterations", 8000)),
+            )
+        ),
+        "rgbd_min_depth_m": float(
+            args.rgbd_min_depth_m
+            if getattr(args, "rgbd_min_depth_m", None) is not None
+            else lnn_cfg.get("rgbd_min_depth_m", 0.2)
+        ),
+        "rgbd_max_depth_m": float(
+            args.rgbd_max_depth_m
+            if getattr(args, "rgbd_max_depth_m", None) is not None
+            else lnn_cfg.get("rgbd_max_depth_m", 5.0)
+        ),
+        "rgbd_depth_window": int(
+            args.rgbd_depth_window
+            if getattr(args, "rgbd_depth_window", None) is not None
+            else lnn_cfg.get("rgbd_depth_window", 3)
+        ),
         "min_final_inliers": int(args.min_final_inliers if args.min_final_inliers is not None else lnn_cfg.get("min_final_inliers", 12)),
         "early_exit": bool(
             getattr(args, "early_exit", None)
@@ -6136,6 +6365,8 @@ def run(args: argparse.Namespace) -> dict:
     runtime_cfg = _runtime_cfg(cfg, args)
     if str(runtime_cfg["preverify_geometry"]) not in {"off", "essential", "homography", "auto"}:
         raise ValueError(f"Unsupported preverify_geometry: {runtime_cfg['preverify_geometry']}")
+    if str(runtime_cfg["pose_backend"]) not in {"pnp", "rgbd_3d3d", "auto"}:
+        raise ValueError(f"Unsupported pose_backend: {runtime_cfg['pose_backend']}")
     if str(runtime_cfg["sequence_activation"]) not in {"off", "prev_pose", "window_retrieval"}:
         raise ValueError(f"Unsupported sequence_activation: {runtime_cfg['sequence_activation']}")
     global_store: GlobalDescriptorStore | None = None
@@ -6464,6 +6695,13 @@ def run(args: argparse.Namespace) -> dict:
             "pnp_first_thresh": float(runtime_cfg["pnp_first_thresh"]),
             "pnp_refine_thresh": float(runtime_cfg["pnp_refine_thresh"]),
             "pnp_iterations": int(runtime_cfg["pnp_iterations"]),
+            "pose_backend": str(runtime_cfg["pose_backend"]),
+            "rgbd_3d3d_first_thresh_m": float(runtime_cfg["rgbd_3d3d_first_thresh_m"]),
+            "rgbd_3d3d_refine_thresh_m": float(runtime_cfg["rgbd_3d3d_refine_thresh_m"]),
+            "rgbd_3d3d_iterations": int(runtime_cfg["rgbd_3d3d_iterations"]),
+            "rgbd_min_depth_m": float(runtime_cfg["rgbd_min_depth_m"]),
+            "rgbd_max_depth_m": float(runtime_cfg["rgbd_max_depth_m"]),
+            "rgbd_depth_window": int(runtime_cfg["rgbd_depth_window"]),
             "min_final_inliers": int(runtime_cfg["min_final_inliers"]),
             "point_memory_batch_size": int(runtime_cfg["point_memory_batch_size"]),
             "point_memory_max_obs": int(runtime_cfg["point_memory_max_obs"]),
@@ -6637,6 +6875,13 @@ def main() -> None:
     parser.add_argument("--pnp_first_thresh", type=float, default=None)
     parser.add_argument("--pnp_refine_thresh", type=float, default=None)
     parser.add_argument("--pnp_iterations", type=int, default=None)
+    parser.add_argument("--pose_backend", choices=("pnp", "rgbd_3d3d", "auto"), default=None)
+    parser.add_argument("--rgbd_3d3d_first_thresh_m", type=float, default=None)
+    parser.add_argument("--rgbd_3d3d_refine_thresh_m", type=float, default=None)
+    parser.add_argument("--rgbd_3d3d_iterations", type=int, default=None)
+    parser.add_argument("--rgbd_min_depth_m", type=float, default=None)
+    parser.add_argument("--rgbd_max_depth_m", type=float, default=None)
+    parser.add_argument("--rgbd_depth_window", type=int, default=None)
     parser.add_argument("--min_final_inliers", type=int, default=None)
     parser.add_argument("--early_exit", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--early_exit_min_inliers", type=int, default=None)

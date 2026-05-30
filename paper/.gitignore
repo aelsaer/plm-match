@@ -1,0 +1,12 @@
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.pdf:Zone.Identifier
+*.tex:Zone.Identifier
+plmloc_main.pdf
