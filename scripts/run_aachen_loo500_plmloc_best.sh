@@ -27,6 +27,8 @@ HLOC_ROOT=${HLOC_ROOT:-$ROOT/external/Hierarchical-Localization}
 RETRIEVAL=${RETRIEVAL:-mixvpr}
 TOPK=${TOPK:-}
 QUERY_TOPK=${QUERY_TOPK:-4096}
+MNN_TOPK=${MNN_TOPK:-1}
+MNN_MIN_SIMILARITY=${MNN_MIN_SIMILARITY:--1.0}
 MIXVPR_BATCH_SIZE=${MIXVPR_BATCH_SIZE:-16}
 MIXVPR_DEVICE=${MIXVPR_DEVICE:-cuda}
 MAX_QUERIES=${MAX_QUERIES:-}
@@ -262,7 +264,13 @@ if [[ -n "$MAX_QUERIES" ]]; then
   max_query_args+=(--max_queries "$MAX_QUERIES")
 fi
 
-RESULT_DIR=$BASE/results/${RETRIEVAL}${TOPK}/point_memory_hloc_nn_obs16_diverse
+MNN_TAG=${MNN_TAG:-}
+if [[ -z "$MNN_TAG" && ( "$MNN_TOPK" != "1" || "$MNN_MIN_SIMILARITY" != "-1.0" ) ]]; then
+  sim_tag=${MNN_MIN_SIMILARITY//./p}
+  sim_tag=${sim_tag//-/m}
+  MNN_TAG="_mnnk${MNN_TOPK}_sim${sim_tag}"
+fi
+RESULT_DIR=$BASE/results/${RETRIEVAL}${TOPK}/point_memory_hloc_nn_obs16_diverse${MNN_TAG}
 "$PY" -m plm_match.pipelines.lifted_nn_localize \
   --config "$CFG" \
   --dataset_root "$DATASET" \
@@ -278,6 +286,8 @@ RESULT_DIR=$BASE/results/${RETRIEVAL}${TOPK}/point_memory_hloc_nn_obs16_diverse
   --point_memory_max_obs 16 \
   --point_memory_obs_select diverse_desc \
   --memory_search_backend exact \
+  --mnn_topk "$MNN_TOPK" \
+  --mnn_min_similarity "$MNN_MIN_SIMILARITY" \
   --topk "$TOPK" \
   --query_topk "$QUERY_TOPK" \
   --metric_thresholds 0.25/2,0.5/5,5/10 \

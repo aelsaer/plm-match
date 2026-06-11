@@ -1806,13 +1806,17 @@ def _lifted_hloc_nn_for_image(
     db_image: str,
     rank_tau: float,
     rank_prior: float | None = None,
+    mnn_topk: int = 1,
+    mnn_min_similarity: float = -1.0,
 ) -> list[LiftedHypothesis]:
     """HLoc nearest-neighbor semantics for one retrieved image.
 
-    This mirrors hloc's NN-mutual matcher: one nearest DB keypoint per query
+    This defaults to hloc's NN-mutual matcher: one nearest DB keypoint per query
     keypoint, no ratio/distance threshold, then a mutual nearest-neighbor check.
-    When full DB descriptors are available, mutual competition is performed over
-    all DB keypoints first and only then filtered to triangulated PLM rows.
+    For appearance-change sweeps, mnn_topk > 1 relaxes the reverse check to
+    symmetric top-k while preserving the query-to-memory top-1 assignment.
+    When full DB descriptors are available, reverse competition is performed
+    over all DB keypoints first and only then filtered to triangulated PLM rows.
     """
     if q_descs.shape[0] == 0:
         return []
@@ -1838,9 +1842,23 @@ def _lifted_hloc_nn_for_image(
         return []
     best_db = np.argmax(sims, axis=1).astype(np.int64, copy=False)
     best_score = sims[np.arange(sims.shape[0], dtype=np.int64), best_db].astype(np.float32, copy=False)
-    best_q_for_db = np.argmax(sims, axis=0).astype(np.int64, copy=False)
+    mnn_topk = max(1, int(mnn_topk))
+    if mnn_topk == 1:
+        best_q_for_db = np.argmax(sims, axis=0).astype(np.int64, copy=False).reshape(1, -1)
+    else:
+        local_k = min(mnn_topk, int(sims.shape[0]))
+        if local_k <= 1:
+            best_q_for_db = np.argmax(sims, axis=0).astype(np.int64, copy=False).reshape(1, -1)
+        elif local_k == int(sims.shape[0]):
+            best_q_for_db = np.argsort(-sims, axis=0)[:local_k].astype(np.int64, copy=False)
+        else:
+            top_q = np.argpartition(-sims, kth=local_k - 1, axis=0)[:local_k].astype(np.int64, copy=False)
+            vals = np.take_along_axis(sims, top_q, axis=0)
+            order = np.argsort(-vals, axis=0)
+            best_q_for_db = np.take_along_axis(top_q, order, axis=0).astype(np.int64, copy=False)
     rows = np.arange(sims.shape[0], dtype=np.int64)
-    keep = best_q_for_db[best_db] == rows
+    keep = np.any(best_q_for_db[:, best_db] == rows.reshape(1, -1), axis=0)
+    keep &= best_score >= float(mnn_min_similarity)
     keep_idxs = np.flatnonzero(keep)
     prior = float(rank_prior) if rank_prior is not None else _rank_prior(int(db_rank), float(rank_tau))
     out: list[LiftedHypothesis] = []
@@ -2956,8 +2974,10 @@ def _lifted_point_landmark_hloc_nn(
     point_memory_batch_size: int,
     point_memory_obs_select: str = "first",
     support_info: dict[int, dict[str, object]] | None = None,
+    mnn_topk: int = 1,
+    mnn_min_similarity: float = -1.0,
 ) -> list[LiftedHypothesis]:
-    """Point-level memory matching with HLoc mutual-NN semantics."""
+    """Point-level memory matching with strict or symmetric top-k MNN semantics."""
     mode = str(mode)
     base_mode = mode.removesuffix("_hloc_nn")
     if base_mode not in {"point_mean", "point_memory"}:
@@ -3016,10 +3036,11 @@ def _lifted_point_landmark_hloc_nn(
         return []
     q_descs = q_descs.astype(np.float32, copy=False)
     batch_size = max(1, int(point_memory_batch_size))
+    mnn_topk = max(1, int(mnn_topk))
     best_item = np.full((int(q_descs.shape[0]),), -1, dtype=np.int64)
     best_score = np.full((int(q_descs.shape[0]),), -np.inf, dtype=np.float32)
-    best_q_for_item = np.full((int(item_descs.shape[0]),), -1, dtype=np.int64)
-    best_item_score = np.full((int(item_descs.shape[0]),), -np.inf, dtype=np.float32)
+    top_q_for_item = np.full((mnn_topk, int(item_descs.shape[0])), -1, dtype=np.int64)
+    top_score_for_item = np.full((mnn_topk, int(item_descs.shape[0])), -np.inf, dtype=np.float32)
 
     for start in range(0, int(q_descs.shape[0]), batch_size):
         end = min(int(q_descs.shape[0]), start + batch_size)
@@ -3028,16 +3049,41 @@ def _lifted_point_landmark_hloc_nn(
         local_scores = sims[np.arange(int(sims.shape[0]), dtype=np.int64), local_best].astype(np.float32, copy=False)
         best_item[start:end] = local_best
         best_score[start:end] = local_scores
-        local_item_best_q = np.argmax(sims, axis=0).astype(np.int64, copy=False) + int(start)
-        local_item_scores = np.max(sims, axis=0).astype(np.float32, copy=False)
-        improve = local_item_scores > best_item_score
-        if np.any(improve):
-            best_item_score[improve] = local_item_scores[improve]
-            best_q_for_item[improve] = local_item_best_q[improve]
+        local_k = min(mnn_topk, int(sims.shape[0]))
+        if local_k <= 1:
+            local_q = np.argmax(sims, axis=0).astype(np.int64, copy=False).reshape(1, -1)
+        elif local_k == int(sims.shape[0]):
+            local_q = np.argsort(-sims, axis=0)[:local_k].astype(np.int64, copy=False)
+        else:
+            local_q = np.argpartition(-sims, kth=local_k - 1, axis=0)[:local_k].astype(np.int64, copy=False)
+            vals = np.take_along_axis(sims, local_q, axis=0)
+            order = np.argsort(-vals, axis=0)
+            local_q = np.take_along_axis(local_q, order, axis=0).astype(np.int64, copy=False)
+        local_item_scores = np.take_along_axis(sims, local_q, axis=0).astype(np.float32, copy=False)
+        local_item_q = local_q + int(start)
+        combined_scores = np.concatenate([top_score_for_item, local_item_scores], axis=0)
+        combined_q = np.concatenate([top_q_for_item, local_item_q], axis=0)
+        if combined_scores.shape[0] <= mnn_topk:
+            top_score_for_item = combined_scores.astype(np.float32, copy=False)
+            top_q_for_item = combined_q.astype(np.int64, copy=False)
+        else:
+            top_idx = np.argpartition(-combined_scores, kth=mnn_topk - 1, axis=0)[:mnn_topk]
+            vals = np.take_along_axis(combined_scores, top_idx, axis=0)
+            order = np.argsort(-vals, axis=0)
+            top_idx = np.take_along_axis(top_idx, order, axis=0)
+            top_score_for_item = np.take_along_axis(combined_scores, top_idx, axis=0).astype(np.float32, copy=False)
+            top_q_for_item = np.take_along_axis(combined_q, top_idx, axis=0).astype(np.int64, copy=False)
 
     out: list[LiftedHypothesis] = []
     rows = np.arange(int(q_descs.shape[0]), dtype=np.int64)
-    keep = (best_item >= 0) & (best_q_for_item[best_item] == rows)
+    keep = best_item >= 0
+    valid_rows = np.flatnonzero(keep)
+    if valid_rows.shape[0] > 0:
+        keep[valid_rows] = np.any(
+            top_q_for_item[:, best_item[valid_rows]] == valid_rows.reshape(1, -1),
+            axis=0,
+        )
+    keep &= best_score >= float(mnn_min_similarity)
     for q_idx in np.flatnonzero(keep).tolist():
         item_idx = int(best_item[int(q_idx)])
         local_point_idx = int(item_point_local[item_idx])
@@ -3383,6 +3429,8 @@ def _lifted_point_landmark_nn(
     vocab_min_candidates: int = 128,
     vocab_compare_exact: bool = False,
     search_stats: dict[str, object] | None = None,
+    mnn_topk: int = 1,
+    mnn_min_similarity: float = -1.0,
 ) -> list[LiftedHypothesis]:
     mode = str(mode)
     if mode in {"point_mean_hloc_nn", "point_memory_hloc_nn"}:
@@ -3398,6 +3446,8 @@ def _lifted_point_landmark_nn(
             point_memory_batch_size=point_memory_batch_size,
             point_memory_obs_select=point_memory_obs_select,
             support_info=support_info,
+            mnn_topk=int(mnn_topk),
+            mnn_min_similarity=float(mnn_min_similarity),
         )
     backend = str(memory_search_backend)
     if backend not in {"exact", "vocab"}:
@@ -5371,6 +5421,8 @@ def _localize_one_query(
                     db_image=str(db_image),
                     rank_tau=float(cfg["rank_tau"]),
                     rank_prior=rank_prior_by_name.get(str(db_image)),
+                    mnn_topk=int(cfg["mnn_topk"]),
+                    mnn_min_similarity=float(cfg["mnn_min_similarity"]),
                 )
                 matching_time_s += float(time.perf_counter() - t_match0)
                 hypotheses_by_image[str(db_image)] = hyps
@@ -5524,6 +5576,8 @@ def _localize_one_query(
                 vocab_min_candidates=int(cfg["vocab_min_candidates"]),
                 vocab_compare_exact=bool(cfg["vocab_compare_exact"]),
                 search_stats=vocab_stats,
+                mnn_topk=int(cfg["mnn_topk"]),
+                mnn_min_similarity=float(cfg["mnn_min_similarity"]),
             )
             matching_time_s += float(time.perf_counter() - t_match0)
             total_hypotheses += int(len(cluster_hyps))
@@ -5985,6 +6039,16 @@ def _runtime_cfg(cfg: dict, args: argparse.Namespace) -> dict[str, object]:
             else lnn_cfg.get("sift_descriptor_norm", matching_cfg.get("sift_descriptor_norm", "l2"))
         ),
         "mutual": bool(args.mutual if args.mutual is not None else lnn_cfg.get("mutual_nn", False)),
+        "mnn_topk": int(
+            getattr(args, "mnn_topk", None)
+            if getattr(args, "mnn_topk", None) is not None
+            else lnn_cfg.get("mnn_topk", 1)
+        ),
+        "mnn_min_similarity": float(
+            getattr(args, "mnn_min_similarity", None)
+            if getattr(args, "mnn_min_similarity", None) is not None
+            else lnn_cfg.get("mnn_min_similarity", -1.0)
+        ),
         "support_weight": float(args.support_weight if args.support_weight is not None else lnn_cfg.get("support_weight", 0.0)),
         "rank_weight": float(args.rank_weight if args.rank_weight is not None else lnn_cfg.get("rank_weight", 0.0)),
         "attach_dist_weight": float(args.attach_dist_weight if args.attach_dist_weight is not None else lnn_cfg.get("attach_dist_weight", 0.01)),
@@ -6363,6 +6427,7 @@ def run(args: argparse.Namespace) -> dict:
         raise FileNotFoundError(f"Retrieval file not found: {retrieval_path}")
     extractor = _make_fine_extractor(cfg, args)
     runtime_cfg = _runtime_cfg(cfg, args)
+    runtime_cfg["mnn_topk"] = max(1, int(runtime_cfg["mnn_topk"]))
     if str(runtime_cfg["preverify_geometry"]) not in {"off", "essential", "homography", "auto"}:
         raise ValueError(f"Unsupported preverify_geometry: {runtime_cfg['preverify_geometry']}")
     if str(runtime_cfg["pose_backend"]) not in {"pnp", "rgbd_3d3d", "auto"}:
@@ -6742,6 +6807,8 @@ def run(args: argparse.Namespace) -> dict:
             "median_prototypes_per_point": float(np.median(proto_counts_all.astype(np.float64))) if proto_counts_all.size > 0 else 0.0,
             "memory_summary": memory_summary,
             "mutual_nn": bool(runtime_cfg["mutual"]),
+            "mnn_topk": int(runtime_cfg["mnn_topk"]),
+            "mnn_min_similarity": float(runtime_cfg["mnn_min_similarity"]),
             "pose_guided": bool(runtime_cfg["pose_guided"]),
             "early_exit": bool(runtime_cfg["early_exit"]),
             "early_exit_min_inliers": int(runtime_cfg["early_exit_min_inliers"]),
@@ -6808,6 +6875,18 @@ def main() -> None:
     parser.add_argument("--sift_ratio", type=float, default=None)
     parser.add_argument("--sift_descriptor_norm", choices=("l2", "rootsift"), default=None)
     parser.add_argument("--mutual", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--mnn_topk",
+        type=int,
+        default=None,
+        help="For HLoc-style MNN modes, accept if the query is among the memory item's top-k query descriptors.",
+    )
+    parser.add_argument(
+        "--mnn_min_similarity",
+        type=float,
+        default=None,
+        help="Minimum raw cosine similarity for accepted HLoc-style MNN matches.",
+    )
     parser.add_argument("--support_weight", type=float, default=None)
     parser.add_argument("--rank_weight", type=float, default=None)
     parser.add_argument("--attach_dist_weight", type=float, default=None)
