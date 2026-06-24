@@ -40,6 +40,52 @@ def _safe_obs_filename(image_id: int, image_name: str) -> str:
     return f"{int(image_id):08d}_{digest}_{stem}.npz"
 
 
+def _validate_saved_memory(out_dir: Path, *, expected_obs: int, descriptor_dim: int) -> None:
+    required = [
+        "point_obs_offsets.npy",
+        "point_obs_descs.npy",
+        "point_obs_frame_ids.npy",
+        "point_obs_uvs.npy",
+        "point_ids.npy",
+        "point_xyz.npy",
+        "point_reliability.npy",
+        "point_num_observations.npy",
+        "point_num_source_frames.npy",
+        "db_image_entries.npz",
+    ]
+    for name in required:
+        path = out_dir / name
+        try:
+            data = np.load(path, mmap_mode="r")
+            if hasattr(data, "close"):
+                data.close()
+        except Exception as exc:
+            raise RuntimeError(f"Saved RGB-D memory file is not readable: {path}") from exc
+
+    descs = np.load(out_dir / "point_obs_descs.npy", mmap_mode="r")
+    try:
+        if tuple(descs.shape) != (int(expected_obs), int(descriptor_dim)):
+            raise RuntimeError(
+                "Saved RGB-D descriptor memory has unexpected shape: "
+                f"{descs.shape}, expected {(int(expected_obs), int(descriptor_dim))}"
+            )
+    finally:
+        if hasattr(descs, "_mmap"):
+            descs._mmap.close()
+    frame_ids = np.load(out_dir / "point_obs_frame_ids.npy", mmap_mode="r")
+    uvs = np.load(out_dir / "point_obs_uvs.npy", mmap_mode="r")
+    try:
+        if int(frame_ids.shape[0]) != int(expected_obs) or int(uvs.shape[0]) != int(expected_obs):
+            raise RuntimeError(
+                "Saved RGB-D observation arrays have inconsistent lengths: "
+                f"frame_ids={frame_ids.shape}, uvs={uvs.shape}, expected observations={int(expected_obs)}"
+            )
+    finally:
+        for arr in (frame_ids, uvs):
+            if hasattr(arr, "_mmap"):
+                arr._mmap.close()
+
+
 def _make_fine_extractor(cfg: dict, args: argparse.Namespace) -> LocalPatchDescriptor:
     fine_cfg = cfg.get("matching", {}).get("fine_rerank", {})
     if not isinstance(fine_cfg, dict):
@@ -643,6 +689,8 @@ def build_rgbd_attachment(args: argparse.Namespace) -> dict[str, object]:
         np.save(out_dir / "point_depth_residual_m.npy", np.zeros((0,), dtype=np.float32))
         np.save(out_dir / "point_view_diversity_deg.npy", np.zeros((0,), dtype=np.float32))
         np.save(out_dir / "point_reprojection_error_px.npy", np.zeros((0,), dtype=np.float32))
+
+    _validate_saved_memory(out_dir, expected_obs=int(total_obs), descriptor_dim=int(descriptor_dim))
 
     saved_point_ids = np.load(out_dir / "point_ids.npy", mmap_mode="r")
     saved_reliability = np.load(out_dir / "point_reliability.npy", mmap_mode="r")

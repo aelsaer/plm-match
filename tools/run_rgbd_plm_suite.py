@@ -254,7 +254,16 @@ def main() -> None:
     parser.add_argument("--pnp_refine_thresh", type=float, default=4.0)
     parser.add_argument("--min_final_inliers", type=int, default=12)
     parser.add_argument("--point_memory_max_obs", type=int, default=4)
-    parser.add_argument("--point_memory_obs_select", choices=("first", "uniform", "diverse_desc"), default="first")
+    parser.add_argument(
+        "--point_memory_obs_select",
+        choices=("all", "first", "uniform", "random", "diverse_desc", "fixed_fps", "adaptive_cover"),
+        default="first",
+    )
+    parser.add_argument("--point_memory_adaptive_k_min", type=int, default=1)
+    parser.add_argument("--point_memory_adaptive_k_max", type=int, default=32)
+    parser.add_argument("--point_memory_adaptive_min_gain", type=float, default=0.005)
+    parser.add_argument("--point_memory_adaptive_sigma_attach", type=float, default=2.0)
+    parser.add_argument("--point_memory_adaptive_sigma_reproj", type=float, default=4.0)
     parser.add_argument("--point_memory_batch_size", type=int, default=128)
     parser.add_argument("--point_viewproto_k", type=int, default=4)
     parser.add_argument("--point_viewproto_min_obs", type=int, default=2)
@@ -313,6 +322,11 @@ def main() -> None:
         "--min_final_inliers", str(int(args.min_final_inliers)),
         "--point_memory_max_obs", str(int(args.point_memory_max_obs)),
         "--point_memory_obs_select", str(args.point_memory_obs_select),
+        "--point_memory_adaptive_k_min", str(int(args.point_memory_adaptive_k_min)),
+        "--point_memory_adaptive_k_max", str(int(args.point_memory_adaptive_k_max)),
+        "--point_memory_adaptive_min_gain", str(float(args.point_memory_adaptive_min_gain)),
+        "--point_memory_adaptive_sigma_attach", str(float(args.point_memory_adaptive_sigma_attach)),
+        "--point_memory_adaptive_sigma_reproj", str(float(args.point_memory_adaptive_sigma_reproj)),
         "--point_memory_batch_size", str(int(args.point_memory_batch_size)),
         "--point_viewproto_k", str(int(args.point_viewproto_k)),
         "--point_viewproto_min_obs", str(int(args.point_viewproto_min_obs)),

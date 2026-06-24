@@ -28,7 +28,7 @@ from plm_match.utils.io import read_image, write_json  # noqa: E402
 
 
 METHOD_DEFAULTS: dict[str, dict[str, Any]] = {
-    "superpoint": {"backend": "hloc", "hloc_conf": "superpoint_max", "resize_max": 1024, "max_keypoints": 4096},
+    "superpoint": {"backend": "hloc", "hloc_conf": "superpoint_aachen", "resize_max": 1024, "max_keypoints": 4096},
     "aliked": {"backend": "hloc", "hloc_conf": "aliked-n16", "resize_max": 1024, "max_keypoints": 4096},
     "xfeat": {"backend": "xfeat", "resize_max": 1024, "max_keypoints": 4096},
     "r2d2": {"backend": "hloc", "hloc_conf": "r2d2", "resize_max": 1024, "max_keypoints": 4096},
@@ -51,6 +51,18 @@ def _load_optional_yaml(path: Path | None) -> dict[str, Any]:
         raise FileNotFoundError(f"Feature config not found: {path}")
     data = load_config(path)
     return data if isinstance(data, dict) else {}
+
+
+def _h5_is_readable(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        import h5py
+
+        with h5py.File(path, "r"):
+            return True
+    except OSError:
+        return False
 
 
 def _resolve_image_roots(args: argparse.Namespace, cfg: dict[str, Any], split: dict[str, Any]) -> tuple[Path, Path]:
@@ -217,7 +229,7 @@ def _resolve_hloc_conf(extract_features, method: str, requested: str | None) -> 
             raise ValueError(f"HLoc extractor config {requested!r} is unavailable. Available: {available}")
         return requested
     candidates = {
-        "superpoint": ("superpoint_max", "superpoint_aachen"),
+        "superpoint": ("superpoint_aachen", "superpoint_max"),
         "aliked": ("aliked-n16",),
         "r2d2": ("r2d2",),
         "disk": ("disk",),
@@ -273,7 +285,7 @@ def _extract_with_hloc(
         resize_max=resize_max,
         max_keypoints=max_keypoints,
     )
-    if raw_path.exists() and args.overwrite:
+    if raw_path.exists() and (args.overwrite or not _h5_is_readable(raw_path)):
         raw_path.unlink()
     if not raw_path.exists():
         with _single_process_dataloader(extract_features.torch):

@@ -19,25 +19,17 @@ MODEL_DIR=${MODEL_DIR:-$ROOT/outputs/robotcar_seasons_v2_train/colmap_model}
 FEATURE_DIR=${FEATURE_DIR:-$RUN_ROOT/sp_features}
 RETRIEVAL_DIR=${RETRIEVAL_DIR:-$RUN_ROOT/retrieval_mixvpr10}
 ATTACHED_INDEX=${ATTACHED_INDEX:-$RUN_ROOT/sp_colmap_attach_r3}
+RESULT_DIR=${RESULT_DIR:-$RUN_ROOT/results/mixvpr10/point_memory_hloc_nn_obs16_diverse}
 
 MIXVPR_CHECKPOINT=${MIXVPR_CHECKPOINT:-$ROOT/MixVPR/resnet50_MixVPR_large.ckpt}
 TOPK=${TOPK:-10}
 QUERY_TOPK=${QUERY_TOPK:-4096}
-MNN_TOPK=${MNN_TOPK:-1}
-MNN_MIN_SIMILARITY=${MNN_MIN_SIMILARITY:--1.0}
 MIXVPR_BATCH_SIZE=${MIXVPR_BATCH_SIZE:-16}
 DESCRIPTOR_DTYPE=${DESCRIPTOR_DTYPE:-float16}
 ATTACH_RADIUS_PX=${ATTACH_RADIUS_PX:-3}
 MIN_COLMAP_TRACK_LEN=${MIN_COLMAP_TRACK_LEN:-3}
 MAX_COLMAP_POINT_ERROR=${MAX_COLMAP_POINT_ERROR:-4.0}
 MAX_QUERIES=${MAX_QUERIES:-}
-MNN_TAG=${MNN_TAG:-}
-if [[ -z "$MNN_TAG" && ( "$MNN_TOPK" != "1" || "$MNN_MIN_SIMILARITY" != "-1.0" ) ]]; then
-  sim_tag=${MNN_MIN_SIMILARITY//./p}
-  sim_tag=${sim_tag//-/m}
-  MNN_TAG="_mnnk${MNN_TOPK}_sim${sim_tag}"
-fi
-RESULT_DIR=${RESULT_DIR:-$RUN_ROOT/results/mixvpr10/point_memory_hloc_nn_obs16_diverse${MNN_TAG}}
 
 cd "$ROOT"
 mkdir -p "$RUN_ROOT" "$FEATURE_DIR" "$RETRIEVAL_DIR" "$(dirname "$RESULT_DIR")"
@@ -119,8 +111,6 @@ fi
   --point_memory_max_obs 16 \
   --point_memory_obs_select diverse_desc \
   --memory_search_backend exact \
-  --mnn_topk "$MNN_TOPK" \
-  --mnn_min_similarity "$MNN_MIN_SIMILARITY" \
   --topk "$TOPK" \
   --query_topk "$QUERY_TOPK" \
   --metric_thresholds 0.25/2,0.5/5,5/10 \

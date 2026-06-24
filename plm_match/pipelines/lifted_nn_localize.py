@@ -66,6 +66,18 @@ class ActiveObservationBank:
 
 
 @dataclass(slots=True)
+class SelectedObservationCache:
+    selected_obs_descs: np.ndarray
+    selected_obs_offsets: np.ndarray
+    selected_obs_frame_ids: np.ndarray
+    selected_obs_uvs: np.ndarray
+    selected_obs_scores: np.ndarray
+    selected_obs_global_indices: np.ndarray
+    adaptive_budgets: np.ndarray
+    summary: dict[str, object]
+
+
+@dataclass(slots=True)
 class RetrievalItem:
     db_name: str
     rank: int
@@ -144,6 +156,19 @@ class AttachedSPCOLMAPIndex:
         self.point_obs_offsets = self._load_array("point_obs_offsets.npy", dtype=np.int64)
         self.point_obs_descs = self._load_array("point_obs_descs.npy", dtype=np.float32)
         self.point_obs_frame_ids = self._load_array("point_obs_frame_ids.npy", dtype=np.int32)
+        self.point_obs_uvs = self._load_optional_obs_array(("point_obs_uvs.npy",), dtype=np.float32, shape_tail=(2,))
+        self.point_obs_scores = self._load_optional_obs_array(
+            ("point_obs_scores.npy", "point_obs_detector_scores.npy", "point_obs_alphas.npy"),
+            dtype=np.float32,
+        )
+        self.point_obs_attach_dist = self._load_optional_obs_array(
+            ("point_obs_attach_dist.npy", "point_obs_attach_dists.npy", "point_obs_attachment_dist.npy"),
+            dtype=np.float32,
+        )
+        self.point_obs_reproj_error = self._load_optional_obs_array(
+            ("point_obs_reproj_error.npy", "point_obs_reprojection_error_px.npy", "point_obs_reproj_errors.npy"),
+            dtype=np.float32,
+        )
         self.point_reliability = self._load_point_metric("point_reliability.npy", dtype=np.float32, default=0.0)
         self.point_num_observations = self._load_point_metric("point_num_observations.npy", dtype=np.int32, default=0)
         self.point_num_source_frames = self._load_point_metric("point_num_source_frames.npy", dtype=np.int32, default=0)
@@ -159,6 +184,8 @@ class AttachedSPCOLMAPIndex:
         self._global_fusion_lambda = 0.5
         self._contextual_point_obs_descs: np.ndarray | None = None
         self._contextual_point_obs_descs_key: tuple[object, ...] | None = None
+        self._selected_obs_cache: SelectedObservationCache | None = None
+        self._selected_obs_cache_key: tuple[object, ...] | None = None
         self.cache_size = max(1, int(cache_size))
         self._cache: OrderedDict[int, AttachedImageObservations] = OrderedDict()
         self._name_to_idx: dict[str, int] = {}
@@ -189,6 +216,35 @@ class AttachedSPCOLMAPIndex:
         out = np.full((n,), default, dtype=dtype)
         out[: min(n, int(arr.shape[0]))] = arr[: min(n, int(arr.shape[0]))]
         return out
+
+    def _load_optional_obs_array(
+        self,
+        names: Sequence[str],
+        *,
+        dtype,
+        shape_tail: tuple[int, ...] = (),
+    ) -> np.ndarray | None:
+        n = int(self.point_obs_descs.shape[0]) if self.point_obs_descs.ndim == 2 else 0
+        for name in names:
+            path = self.root / str(name)
+            if not path.exists():
+                continue
+            arr = np.asarray(np.load(path, mmap_mode=self.mmap_mode), dtype=dtype)
+            if shape_tail:
+                arr = arr.reshape((-1, *shape_tail))
+                out_shape = (n, *shape_tail)
+            else:
+                arr = arr.reshape(-1)
+                out_shape = (n,)
+            if int(arr.shape[0]) == n:
+                return arr
+            fill = np.nan if np.issubdtype(np.dtype(dtype), np.floating) else 0
+            out = np.full(out_shape, fill, dtype=dtype)
+            take = min(n, int(arr.shape[0]))
+            if take > 0:
+                out[:take] = arr[:take]
+            return out
+        return None
 
     @staticmethod
     def _name_candidates(name: str) -> list[str]:
@@ -283,6 +339,8 @@ class AttachedSPCOLMAPIndex:
         self._cache.clear()
         self._contextual_point_obs_descs = None
         self._contextual_point_obs_descs_key = None
+        self._selected_obs_cache = None
+        self._selected_obs_cache_key = None
         self._point_mean_descs = None
         self._point_mean_descs_key = None
         self._point_viewproto_cache = None
@@ -296,6 +354,8 @@ class AttachedSPCOLMAPIndex:
         self._cache.clear()
         self._contextual_point_obs_descs = None
         self._contextual_point_obs_descs_key = None
+        self._selected_obs_cache = None
+        self._selected_obs_cache_key = None
         self._point_mean_descs = None
         self._point_mean_descs_key = None
         self._point_viewproto_cache = None
@@ -378,6 +438,171 @@ class AttachedSPCOLMAPIndex:
         source = self.contextual_point_obs_descs()
         return np.asarray(source[indices], dtype=np.float32)
 
+    def selected_observation_cache(
+        self,
+        *,
+        max_obs: int,
+        obs_select: str,
+        adaptive_k_min: int = 1,
+        adaptive_k_max: int = 32,
+        adaptive_min_gain: float = 0.005,
+        adaptive_sigma_attach: float = 2.0,
+        adaptive_sigma_reproj: float = 4.0,
+        adaptive_view_weight: float = 0.0,
+        frame_centers_by_frame_id: dict[int, np.ndarray] | None = None,
+    ) -> SelectedObservationCache:
+        has_frame_centers = frame_centers_by_frame_id is not None and len(frame_centers_by_frame_id) > 0
+        key = (
+            self._descriptor_context_key(),
+            int(max_obs),
+            str(obs_select),
+            int(adaptive_k_min),
+            int(adaptive_k_max),
+            round(float(adaptive_min_gain), 12),
+            round(float(adaptive_sigma_attach), 12),
+            round(float(adaptive_sigma_reproj), 12),
+            round(float(adaptive_view_weight), 12),
+            bool(has_frame_centers),
+            int(len(frame_centers_by_frame_id) if frame_centers_by_frame_id else 0),
+        )
+        if self._selected_obs_cache is not None and self._selected_obs_cache_key == key:
+            return self._selected_obs_cache
+
+        num_points = int(self.point_ids.shape[0])
+        offsets = np.asarray(self.point_obs_offsets, dtype=np.int64)
+        frame_ids_all = np.asarray(self.point_obs_frame_ids, dtype=np.int32)
+        desc_source = self.contextual_point_obs_descs()
+        selected_offsets = np.zeros((num_points + 1,), dtype=np.int64)
+        selected_chunks: list[np.ndarray] = []
+        budgets = np.zeros((num_points,), dtype=np.int32)
+        for point_idx in range(num_points):
+            if point_idx + 1 >= int(offsets.shape[0]):
+                selected_offsets[point_idx + 1] = selected_offsets[point_idx]
+                continue
+            start = int(offsets[point_idx])
+            end = int(offsets[point_idx + 1])
+            frame_ids = frame_ids_all[start:end].astype(np.int32, copy=False) if frame_ids_all.shape[0] >= end else None
+            selected = _select_point_observation_indices(
+                desc_source,
+                start,
+                end,
+                max_obs=int(max_obs),
+                obs_select=str(obs_select),
+                detector_scores=self.point_obs_scores,
+                attach_dist=self.point_obs_attach_dist,
+                reproj_error=self.point_obs_reproj_error,
+                adaptive_k_min=int(adaptive_k_min),
+                adaptive_k_max=int(adaptive_k_max),
+                adaptive_min_gain=float(adaptive_min_gain),
+                adaptive_sigma_attach=float(adaptive_sigma_attach),
+                adaptive_sigma_reproj=float(adaptive_sigma_reproj),
+                point_xyz=np.asarray(self.point_xyz[point_idx], dtype=np.float32),
+                obs_frame_ids=frame_ids,
+                frame_centers_by_frame_id=frame_centers_by_frame_id,
+                adaptive_view_weight=float(adaptive_view_weight),
+            )
+            if selected.shape[0] > 0:
+                selected_chunks.append(selected.astype(np.int64, copy=False))
+            budgets[point_idx] = int(selected.shape[0])
+            selected_offsets[point_idx + 1] = selected_offsets[point_idx] + int(selected.shape[0])
+
+        global_indices = (
+            np.concatenate(selected_chunks, axis=0).astype(np.int64, copy=False)
+            if selected_chunks
+            else np.zeros((0,), dtype=np.int64)
+        )
+        dim = int(self.point_obs_descs.shape[1]) if self.point_obs_descs.ndim == 2 else int(self.descriptor_dim)
+        selected_descs = (
+            np.asarray(desc_source[global_indices], dtype=np.float32)
+            if global_indices.shape[0] > 0
+            else np.zeros((0, dim), dtype=np.float32)
+        )
+        selected_frame_ids = (
+            np.asarray(self.point_obs_frame_ids[global_indices], dtype=np.int32)
+            if global_indices.shape[0] > 0 and int(self.point_obs_frame_ids.shape[0]) > int(np.max(global_indices, initial=-1))
+            else np.zeros((global_indices.shape[0],), dtype=np.int32)
+        )
+        if self.point_obs_uvs is not None and global_indices.shape[0] > 0:
+            selected_uvs = np.asarray(self.point_obs_uvs[global_indices], dtype=np.float32)
+        else:
+            selected_uvs = np.zeros((global_indices.shape[0], 2), dtype=np.float32)
+        if self.point_obs_scores is not None and global_indices.shape[0] > 0:
+            selected_scores = np.asarray(self.point_obs_scores[global_indices], dtype=np.float32)
+        else:
+            selected_scores = np.ones((global_indices.shape[0],), dtype=np.float32)
+        obs_counts = (
+            (offsets[1 : num_points + 1] - offsets[:num_points]).astype(np.int64, copy=False)
+            if offsets.shape[0] >= num_points + 1
+            else np.zeros((num_points,), dtype=np.int64)
+        )
+        summary = _selection_budget_summary(
+            mode=str(obs_select),
+            budgets=budgets,
+            original_counts=obs_counts,
+            max_obs=int(max_obs),
+            adaptive_k_min=int(adaptive_k_min),
+            adaptive_k_max=int(adaptive_k_max),
+            adaptive_min_gain=float(adaptive_min_gain),
+            adaptive_sigma_attach=float(adaptive_sigma_attach),
+            adaptive_sigma_reproj=float(adaptive_sigma_reproj),
+            adaptive_view_weight=float(adaptive_view_weight),
+        )
+        cache = SelectedObservationCache(
+            selected_obs_descs=selected_descs,
+            selected_obs_offsets=selected_offsets,
+            selected_obs_frame_ids=selected_frame_ids,
+            selected_obs_uvs=selected_uvs,
+            selected_obs_scores=selected_scores,
+            selected_obs_global_indices=global_indices,
+            adaptive_budgets=budgets,
+            summary=summary,
+        )
+        self._selected_obs_cache_key = key
+        self._selected_obs_cache = cache
+        return cache
+
+    def selected_point_observation_indices(
+        self,
+        point_idx: int,
+        *,
+        max_obs: int,
+        obs_select: str,
+        adaptive_k_min: int = 1,
+        adaptive_k_max: int = 32,
+        adaptive_min_gain: float = 0.005,
+        adaptive_sigma_attach: float = 2.0,
+        adaptive_sigma_reproj: float = 4.0,
+        adaptive_view_weight: float = 0.0,
+        frame_centers_by_frame_id: dict[int, np.ndarray] | None = None,
+    ) -> np.ndarray:
+        point_idx = int(point_idx)
+        offsets = np.asarray(self.point_obs_offsets, dtype=np.int64)
+        if point_idx < 0 or point_idx + 1 >= int(offsets.shape[0]):
+            return np.zeros((0,), dtype=np.int64)
+        start = int(offsets[point_idx])
+        end = int(offsets[point_idx + 1])
+        frame_ids_all = np.asarray(self.point_obs_frame_ids, dtype=np.int32)
+        frame_ids = frame_ids_all[start:end].astype(np.int32, copy=False) if frame_ids_all.shape[0] >= end else None
+        return _select_point_observation_indices(
+            self.contextual_point_obs_descs(),
+            start,
+            end,
+            max_obs=int(max_obs),
+            obs_select=str(obs_select),
+            detector_scores=self.point_obs_scores,
+            attach_dist=self.point_obs_attach_dist,
+            reproj_error=self.point_obs_reproj_error,
+            adaptive_k_min=int(adaptive_k_min),
+            adaptive_k_max=int(adaptive_k_max),
+            adaptive_min_gain=float(adaptive_min_gain),
+            adaptive_sigma_attach=float(adaptive_sigma_attach),
+            adaptive_sigma_reproj=float(adaptive_sigma_reproj),
+            point_xyz=np.asarray(self.point_xyz[point_idx], dtype=np.float32),
+            obs_frame_ids=frame_ids,
+            frame_centers_by_frame_id=frame_centers_by_frame_id,
+            adaptive_view_weight=float(adaptive_view_weight),
+        )
+
     def point_memory_max_similarity(
         self,
         q_desc: np.ndarray,
@@ -385,20 +610,28 @@ class AttachedSPCOLMAPIndex:
         *,
         max_obs: int = 0,
         obs_select: str = "first",
+        adaptive_k_min: int = 1,
+        adaptive_k_max: int = 32,
+        adaptive_min_gain: float = 0.005,
+        adaptive_sigma_attach: float = 2.0,
+        adaptive_sigma_reproj: float = 4.0,
+        adaptive_view_weight: float = 0.0,
+        frame_centers_by_frame_id: dict[int, np.ndarray] | None = None,
     ) -> float:
         idx = self._point_id_to_global_idx.get(int(point_id))
         if idx is None or idx + 1 >= int(self.point_obs_offsets.shape[0]):
             return 0.0
-        start = int(self.point_obs_offsets[idx])
-        end = int(self.point_obs_offsets[idx + 1])
-        if end <= start:
-            return 0.0
-        selected = _select_point_observation_indices(
-            self.contextual_point_obs_descs(),
-            start,
-            end,
+        selected = self.selected_point_observation_indices(
+            int(idx),
             max_obs=int(max_obs),
             obs_select=str(obs_select),
+            adaptive_k_min=int(adaptive_k_min),
+            adaptive_k_max=int(adaptive_k_max),
+            adaptive_min_gain=float(adaptive_min_gain),
+            adaptive_sigma_attach=float(adaptive_sigma_attach),
+            adaptive_sigma_reproj=float(adaptive_sigma_reproj),
+            adaptive_view_weight=float(adaptive_view_weight),
+            frame_centers_by_frame_id=frame_centers_by_frame_id,
         )
         if selected.shape[0] == 0:
             return 0.0
@@ -645,10 +878,43 @@ class AttachedSPCOLMAPIndex:
         sims = descs @ q
         return float(np.max(sims)) if sims.size else 0.0
 
-    def num_observations_for_points(self, point_ids: np.ndarray, *, max_obs: int = 0) -> int:
+    def num_observations_for_points(
+        self,
+        point_ids: np.ndarray,
+        *,
+        max_obs: int = 0,
+        obs_select: str = "first",
+        adaptive_k_min: int = 1,
+        adaptive_k_max: int = 32,
+        adaptive_min_gain: float = 0.005,
+        adaptive_sigma_attach: float = 2.0,
+        adaptive_sigma_reproj: float = 4.0,
+        adaptive_view_weight: float = 0.0,
+        frame_centers_by_frame_id: dict[int, np.ndarray] | None = None,
+    ) -> int:
         point_indices = self.point_indices_for_ids(point_ids)
         total = 0
         offsets = np.asarray(self.point_obs_offsets, dtype=np.int64)
+        if str(obs_select) == "adaptive_cover":
+            for idx in point_indices.tolist():
+                idx = int(idx)
+                if idx < 0 or idx + 1 >= offsets.shape[0]:
+                    continue
+                total += int(
+                    self.selected_point_observation_indices(
+                        idx,
+                        max_obs=int(max_obs),
+                        obs_select=str(obs_select),
+                        adaptive_k_min=int(adaptive_k_min),
+                        adaptive_k_max=int(adaptive_k_max),
+                        adaptive_min_gain=float(adaptive_min_gain),
+                        adaptive_sigma_attach=float(adaptive_sigma_attach),
+                        adaptive_sigma_reproj=float(adaptive_sigma_reproj),
+                        adaptive_view_weight=float(adaptive_view_weight),
+                        frame_centers_by_frame_id=frame_centers_by_frame_id,
+                    ).shape[0]
+                )
+            return int(total)
         for idx in point_indices.tolist():
             idx = int(idx)
             if idx < 0 or idx + 1 >= offsets.shape[0]:
@@ -670,6 +936,14 @@ class AttachedSPCOLMAPIndex:
             "point_ids_bytes": int(getattr(self.point_ids, "nbytes", 0)),
             "point_obs_offsets_bytes": int(getattr(self.point_obs_offsets, "nbytes", 0)),
             "point_obs_frame_ids_bytes": int(getattr(self.point_obs_frame_ids, "nbytes", 0)),
+            "point_obs_uvs_bytes": int(getattr(self.point_obs_uvs, "nbytes", 0)) if self.point_obs_uvs is not None else 0,
+            "point_obs_scores_bytes": int(getattr(self.point_obs_scores, "nbytes", 0)) if self.point_obs_scores is not None else 0,
+            "point_obs_attach_dist_bytes": (
+                int(getattr(self.point_obs_attach_dist, "nbytes", 0)) if self.point_obs_attach_dist is not None else 0
+            ),
+            "point_obs_reproj_error_bytes": (
+                int(getattr(self.point_obs_reproj_error, "nbytes", 0)) if self.point_obs_reproj_error is not None else 0
+            ),
             "point_reliability_bytes": int(getattr(self.point_reliability, "nbytes", 0)),
             "point_num_observations_bytes": int(getattr(self.point_num_observations, "nbytes", 0)),
             "point_num_source_frames_bytes": int(getattr(self.point_num_source_frames, "nbytes", 0)),
@@ -1186,6 +1460,180 @@ def _farthest_seed_indices(features: np.ndarray, k: int) -> np.ndarray:
     return np.asarray(selected, dtype=np.int64)
 
 
+def compute_obs_weights(
+    detector_scores: np.ndarray | None,
+    attach_dist: np.ndarray | None = None,
+    reproj_error: np.ndarray | None = None,
+    sigma_attach: float = 2.0,
+    sigma_reproj: float = 4.0,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    if detector_scores is None:
+        n = 0
+        if attach_dist is not None:
+            n = int(np.asarray(attach_dist).reshape(-1).shape[0])
+        elif reproj_error is not None:
+            n = int(np.asarray(reproj_error).reshape(-1).shape[0])
+        scores = np.ones((n,), dtype=np.float32)
+    else:
+        scores = np.asarray(detector_scores, dtype=np.float32).reshape(-1)
+    n = int(scores.shape[0])
+    if n <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    finite = np.isfinite(scores)
+    if not np.any(finite):
+        weights = np.ones((n,), dtype=np.float32)
+    else:
+        clean = np.where(finite, scores, 0.0).astype(np.float32, copy=False)
+        clean = np.maximum(clean, 0.0)
+        max_score = float(np.max(clean)) if clean.size else 0.0
+        weights = clean / max(max_score, float(eps)) if max_score > float(eps) else np.ones((n,), dtype=np.float32)
+
+    if attach_dist is not None and float(sigma_attach) > 0.0:
+        dist = np.asarray(attach_dist, dtype=np.float32).reshape(-1)[:n]
+        valid = np.isfinite(dist)
+        penalty = np.ones((n,), dtype=np.float32)
+        penalty[valid] = np.exp(-(dist[valid] ** 2) / (2.0 * float(sigma_attach) ** 2)).astype(np.float32, copy=False)
+        weights *= penalty
+    if reproj_error is not None and float(sigma_reproj) > 0.0:
+        err = np.asarray(reproj_error, dtype=np.float32).reshape(-1)[:n]
+        valid = np.isfinite(err)
+        penalty = np.ones((n,), dtype=np.float32)
+        penalty[valid] = np.exp(-(err[valid] ** 2) / (2.0 * float(sigma_reproj) ** 2)).astype(np.float32, copy=False)
+        weights *= penalty
+
+    weights = np.maximum(weights.astype(np.float32, copy=False), float(eps))
+    total = float(np.sum(weights, dtype=np.float64))
+    if total <= float(eps) or not np.isfinite(total):
+        return np.full((n,), 1.0 / max(1, n), dtype=np.float32)
+    return (weights / total).astype(np.float32, copy=False)
+
+
+def _observation_view_dirs(
+    *,
+    point_xyz: np.ndarray | None,
+    obs_frame_ids: np.ndarray | None,
+    frame_centers_by_frame_id: dict[int, np.ndarray] | None,
+) -> np.ndarray | None:
+    if point_xyz is None or obs_frame_ids is None or frame_centers_by_frame_id is None:
+        return None
+    frame_ids = np.asarray(obs_frame_ids, dtype=np.int32).reshape(-1)
+    if frame_ids.shape[0] <= 0:
+        return None
+    xyz = np.asarray(point_xyz, dtype=np.float32).reshape(3)
+    view_dirs = np.zeros((int(frame_ids.shape[0]), 3), dtype=np.float32)
+    for obs_idx, frame_id in enumerate(frame_ids.tolist()):
+        center = frame_centers_by_frame_id.get(int(frame_id))
+        if center is None:
+            return None
+        view_dirs[int(obs_idx)] = np.asarray(center, dtype=np.float32).reshape(3) - xyz
+    view_dirs = _normalise_descriptors(view_dirs)
+    if view_dirs.shape[0] != frame_ids.shape[0] or view_dirs.shape[1] != 3:
+        return None
+    return view_dirs.astype(np.float32, copy=False)
+
+
+def adaptive_cover_select(
+    descs: np.ndarray,
+    weights: np.ndarray | None = None,
+    view_dirs: np.ndarray | None = None,
+    k_min: int = 1,
+    k_max: int = 32,
+    min_gain: float = 0.005,
+    view_weight: float = 0.0,
+) -> np.ndarray:
+    descs = _normalise_descriptors(np.asarray(descs, dtype=np.float32))
+    n_obs = int(descs.shape[0])
+    if n_obs <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    k_min = max(1, int(k_min))
+    k_max = max(k_min, int(k_max))
+    limit = min(k_max, n_obs)
+    if n_obs <= k_min:
+        return np.arange(n_obs, dtype=np.int64)
+    if weights is None:
+        w = np.full((n_obs,), 1.0 / float(n_obs), dtype=np.float32)
+    else:
+        w = np.asarray(weights, dtype=np.float32).reshape(-1)[:n_obs]
+        if int(w.shape[0]) < n_obs:
+            padded = np.ones((n_obs,), dtype=np.float32)
+            padded[: int(w.shape[0])] = w
+            w = padded
+        w = np.maximum(np.where(np.isfinite(w), w, 0.0), 1e-6).astype(np.float32, copy=False)
+        w = (w / max(float(np.sum(w, dtype=np.float64)), 1e-6)).astype(np.float32, copy=False)
+
+    sim = (0.5 * (descs @ descs.T + 1.0)).astype(np.float32, copy=False)
+    vw = min(1.0, max(0.0, float(view_weight)))
+    if vw > 0.0 and view_dirs is not None:
+        v = _normalise_descriptors(np.asarray(view_dirs, dtype=np.float32))
+        if v.ndim == 2 and int(v.shape[0]) == n_obs and int(v.shape[1]) == 3:
+            view_sim = (0.5 * (v @ v.T + 1.0)).astype(np.float32, copy=False)
+            sim = ((1.0 - vw) * sim + vw * view_sim).astype(np.float32, copy=False)
+    centrality = sim.T @ w
+    first = int(np.argmax(centrality))
+    selected = [first]
+    selected_mask = np.zeros((n_obs,), dtype=bool)
+    selected_mask[first] = True
+    covered = sim[:, first].astype(np.float32, copy=True)
+    while len(selected) < limit:
+        gains = np.sum(w.reshape(-1, 1) * np.maximum(0.0, sim - covered.reshape(-1, 1)), axis=0)
+        gains[selected_mask] = -np.inf
+        best = int(np.argmax(gains))
+        best_gain = float(gains[best])
+        if len(selected) >= k_min and best_gain < float(min_gain):
+            break
+        if selected_mask[best] or not np.isfinite(best_gain):
+            break
+        selected.append(best)
+        selected_mask[best] = True
+        covered = np.maximum(covered, sim[:, best])
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _selection_budget_summary(
+    *,
+    mode: str,
+    budgets: np.ndarray,
+    original_counts: np.ndarray,
+    max_obs: int,
+    adaptive_k_min: int,
+    adaptive_k_max: int,
+    adaptive_min_gain: float,
+    adaptive_sigma_attach: float,
+    adaptive_sigma_reproj: float,
+    adaptive_view_weight: float,
+) -> dict[str, object]:
+    budgets = np.asarray(budgets, dtype=np.int64).reshape(-1)
+    original_counts = np.asarray(original_counts, dtype=np.int64).reshape(-1)
+    nonempty = budgets[original_counts[: budgets.shape[0]] > 0] if budgets.shape[0] > 0 else budgets
+    arr = nonempty.astype(np.float64, copy=False)
+    total_landmarks = int(budgets.shape[0])
+    total_original = int(np.sum(original_counts, dtype=np.int64)) if original_counts.size > 0 else 0
+    total_selected = int(np.sum(budgets, dtype=np.int64)) if budgets.size > 0 else 0
+    return {
+        "selection_mode": str(mode),
+        "point_memory_max_obs": int(max_obs),
+        "k_min": int(adaptive_k_min),
+        "k_max": int(adaptive_k_max),
+        "min_gain": float(adaptive_min_gain),
+        "sigma_attach": float(adaptive_sigma_attach),
+        "sigma_reproj": float(adaptive_sigma_reproj),
+        "view_weight": float(adaptive_view_weight),
+        "total_landmarks": total_landmarks,
+        "total_original_observations": total_original,
+        "total_selected_observations": total_selected,
+        "mean_K_p": float(np.mean(arr)) if arr.size > 0 else 0.0,
+        "median_K_p": float(np.median(arr)) if arr.size > 0 else 0.0,
+        "p75_K_p": float(np.percentile(arr, 75)) if arr.size > 0 else 0.0,
+        "p90_K_p": float(np.percentile(arr, 90)) if arr.size > 0 else 0.0,
+        "p95_K_p": float(np.percentile(arr, 95)) if arr.size > 0 else 0.0,
+        "max_K_p": int(np.max(budgets)) if budgets.size > 0 else 0,
+        "fraction_K_p_eq_1": float(np.mean(arr == 1.0)) if arr.size > 0 else 0.0,
+        "fraction_K_p_ge_16": float(np.mean(arr >= 16.0)) if arr.size > 0 else 0.0,
+        "fraction_K_p_ge_32": float(np.mean(arr >= 32.0)) if arr.size > 0 else 0.0,
+    }
+
+
 def _select_point_observation_indices(
     descs_source: np.ndarray,
     start: int,
@@ -1193,21 +1641,66 @@ def _select_point_observation_indices(
     *,
     max_obs: int,
     obs_select: str,
+    detector_scores: np.ndarray | None = None,
+    attach_dist: np.ndarray | None = None,
+    reproj_error: np.ndarray | None = None,
+    adaptive_k_min: int = 1,
+    adaptive_k_max: int = 32,
+    adaptive_min_gain: float = 0.005,
+    adaptive_sigma_attach: float = 2.0,
+    adaptive_sigma_reproj: float = 4.0,
+    point_xyz: np.ndarray | None = None,
+    obs_frame_ids: np.ndarray | None = None,
+    frame_centers_by_frame_id: dict[int, np.ndarray] | None = None,
+    adaptive_view_weight: float = 0.0,
 ) -> np.ndarray:
     start = int(start)
     end = int(end)
     count = max(0, end - start)
     if count <= 0:
         return np.zeros((0,), dtype=np.int64)
+    mode = str(obs_select)
+    if mode == "adaptive_cover":
+        descs = np.asarray(descs_source[start:end], dtype=np.float32)
+        scores = detector_scores[start:end] if detector_scores is not None and int(np.asarray(detector_scores).shape[0]) >= end else None
+        attach = attach_dist[start:end] if attach_dist is not None and int(np.asarray(attach_dist).shape[0]) >= end else None
+        reproj = reproj_error[start:end] if reproj_error is not None and int(np.asarray(reproj_error).shape[0]) >= end else None
+        weights = compute_obs_weights(
+            scores,
+            attach_dist=attach,
+            reproj_error=reproj,
+            sigma_attach=float(adaptive_sigma_attach),
+            sigma_reproj=float(adaptive_sigma_reproj),
+        )
+        view_dirs = _observation_view_dirs(
+            point_xyz=point_xyz,
+            obs_frame_ids=obs_frame_ids,
+            frame_centers_by_frame_id=frame_centers_by_frame_id,
+        )
+        local = adaptive_cover_select(
+            descs,
+            weights=weights,
+            view_dirs=view_dirs,
+            k_min=int(adaptive_k_min),
+            k_max=int(adaptive_k_max),
+            min_gain=float(adaptive_min_gain),
+            view_weight=float(adaptive_view_weight),
+        )
+        return start + local.astype(np.int64, copy=False)
     max_obs = int(max_obs)
-    if max_obs <= 0 or count <= max_obs:
+    if mode == "all" or max_obs <= 0 or count <= max_obs:
         return np.arange(start, end, dtype=np.int64)
     max_obs = max(1, min(max_obs, count))
-    mode = str(obs_select)
     if mode == "uniform":
         local = np.linspace(0, count - 1, num=max_obs).astype(np.int64)
         return start + local
-    if mode == "diverse_desc":
+    if mode == "random":
+        seed = (int(start) * 1000003 + int(end) * 9176 + int(max_obs) * 37) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        local = rng.choice(count, size=max_obs, replace=False).astype(np.int64, copy=False)
+        local.sort()
+        return start + local
+    if mode in {"diverse_desc", "fixed_fps"}:
         descs = np.asarray(descs_source[start:end], dtype=np.float32)
         local = _farthest_seed_indices(descs, k=max_obs)
         return start + local.astype(np.int64, copy=False)
@@ -1815,8 +2308,8 @@ def _lifted_hloc_nn_for_image(
     keypoint, no ratio/distance threshold, then a mutual nearest-neighbor check.
     For appearance-change sweeps, mnn_topk > 1 relaxes the reverse check to
     symmetric top-k while preserving the query-to-memory top-1 assignment.
-    When full DB descriptors are available, reverse competition is performed
-    over all DB keypoints first and only then filtered to triangulated PLM rows.
+    When full DB descriptors are available, mutual competition is performed over
+    all DB keypoints first and only then filtered to triangulated PLM rows.
     """
     if q_descs.shape[0] == 0:
         return []
@@ -2704,6 +3197,12 @@ def _lifted_point_landmark_nn_exact(
     support_info: dict[int, dict[str, object]] | None = None,
     point_search_top_obs: int = 0,
     point_memory_obs_select: str = "first",
+    point_memory_adaptive_k_min: int = 1,
+    point_memory_adaptive_k_max: int = 32,
+    point_memory_adaptive_min_gain: float = 0.005,
+    point_memory_adaptive_sigma_attach: float = 2.0,
+    point_memory_adaptive_sigma_reproj: float = 4.0,
+    point_memory_adaptive_view_weight: float = 0.0,
 ) -> list[LiftedHypothesis]:
     """Lift query descriptors by matching directly against point-level memory."""
     mode = str(mode)
@@ -2896,12 +3395,17 @@ def _lifted_point_landmark_nn_exact(
         obs_end = int(offsets[point_idx + 1])
         if obs_end <= obs_start:
             continue
-        selected = _select_point_observation_indices(
-            index.contextual_point_obs_descs(),
-            obs_start,
-            obs_end,
+        selected = index.selected_point_observation_indices(
+            point_idx,
             max_obs=int(point_memory_max_obs),
             obs_select=str(point_memory_obs_select),
+            adaptive_k_min=int(point_memory_adaptive_k_min),
+            adaptive_k_max=int(point_memory_adaptive_k_max),
+            adaptive_min_gain=float(point_memory_adaptive_min_gain),
+            adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+            adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+            adaptive_view_weight=float(point_memory_adaptive_view_weight),
+            frame_centers_by_frame_id=point_viewproto_frame_centers,
         )
         if selected.shape[0] == 0:
             continue
@@ -2976,6 +3480,13 @@ def _lifted_point_landmark_hloc_nn(
     support_info: dict[int, dict[str, object]] | None = None,
     mnn_topk: int = 1,
     mnn_min_similarity: float = -1.0,
+    point_memory_adaptive_k_min: int = 1,
+    point_memory_adaptive_k_max: int = 32,
+    point_memory_adaptive_min_gain: float = 0.005,
+    point_memory_adaptive_sigma_attach: float = 2.0,
+    point_memory_adaptive_sigma_reproj: float = 4.0,
+    point_memory_adaptive_view_weight: float = 0.0,
+    point_memory_frame_centers: dict[int, np.ndarray] | None = None,
 ) -> list[LiftedHypothesis]:
     """Point-level memory matching with strict or symmetric top-k MNN semantics."""
     mode = str(mode)
@@ -3013,12 +3524,17 @@ def _lifted_point_landmark_hloc_nn(
             obs_end = int(offsets[point_idx + 1])
             if obs_end <= obs_start:
                 continue
-            selected = _select_point_observation_indices(
-                memory_descs,
-                obs_start,
-                obs_end,
+            selected = index.selected_point_observation_indices(
+                point_idx,
                 max_obs=int(point_memory_max_obs),
                 obs_select=str(point_memory_obs_select),
+                adaptive_k_min=int(point_memory_adaptive_k_min),
+                adaptive_k_max=int(point_memory_adaptive_k_max),
+                adaptive_min_gain=float(point_memory_adaptive_min_gain),
+                adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+                adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+                adaptive_view_weight=float(point_memory_adaptive_view_weight),
+                frame_centers_by_frame_id=point_memory_frame_centers,
             )
             if selected.shape[0] == 0:
                 continue
@@ -3039,34 +3555,50 @@ def _lifted_point_landmark_hloc_nn(
     mnn_topk = max(1, int(mnn_topk))
     best_item = np.full((int(q_descs.shape[0]),), -1, dtype=np.int64)
     best_score = np.full((int(q_descs.shape[0]),), -np.inf, dtype=np.float32)
-    top_q_for_item = np.full((mnn_topk, int(item_descs.shape[0])), -1, dtype=np.int64)
-    top_score_for_item = np.full((mnn_topk, int(item_descs.shape[0])), -np.inf, dtype=np.float32)
+    if mnn_topk == 1:
+        best_q_for_item = np.full((int(item_descs.shape[0]),), -1, dtype=np.int64)
+        best_item_score = np.full((int(item_descs.shape[0]),), -np.inf, dtype=np.float32)
 
-    for start in range(0, int(q_descs.shape[0]), batch_size):
-        end = min(int(q_descs.shape[0]), start + batch_size)
-        sims = q_descs[start:end] @ item_descs.T
-        local_best = np.argmax(sims, axis=1).astype(np.int64, copy=False)
-        local_scores = sims[np.arange(int(sims.shape[0]), dtype=np.int64), local_best].astype(np.float32, copy=False)
-        best_item[start:end] = local_best
-        best_score[start:end] = local_scores
-        local_k = min(mnn_topk, int(sims.shape[0]))
-        if local_k <= 1:
-            local_q = np.argmax(sims, axis=0).astype(np.int64, copy=False).reshape(1, -1)
-        elif local_k == int(sims.shape[0]):
-            local_q = np.argsort(-sims, axis=0)[:local_k].astype(np.int64, copy=False)
-        else:
-            local_q = np.argpartition(-sims, kth=local_k - 1, axis=0)[:local_k].astype(np.int64, copy=False)
-            vals = np.take_along_axis(sims, local_q, axis=0)
-            order = np.argsort(-vals, axis=0)
-            local_q = np.take_along_axis(local_q, order, axis=0).astype(np.int64, copy=False)
-        local_item_scores = np.take_along_axis(sims, local_q, axis=0).astype(np.float32, copy=False)
-        local_item_q = local_q + int(start)
-        combined_scores = np.concatenate([top_score_for_item, local_item_scores], axis=0)
-        combined_q = np.concatenate([top_q_for_item, local_item_q], axis=0)
-        if combined_scores.shape[0] <= mnn_topk:
-            top_score_for_item = combined_scores.astype(np.float32, copy=False)
-            top_q_for_item = combined_q.astype(np.int64, copy=False)
-        else:
+        for start in range(0, int(q_descs.shape[0]), batch_size):
+            end = min(int(q_descs.shape[0]), start + batch_size)
+            sims = q_descs[start:end] @ item_descs.T
+            local_best = np.argmax(sims, axis=1).astype(np.int64, copy=False)
+            local_scores = sims[np.arange(int(sims.shape[0]), dtype=np.int64), local_best].astype(np.float32, copy=False)
+            best_item[start:end] = local_best
+            best_score[start:end] = local_scores
+            local_item_best_q = np.argmax(sims, axis=0).astype(np.int64, copy=False) + int(start)
+            local_item_scores = np.max(sims, axis=0).astype(np.float32, copy=False)
+            improve = local_item_scores > best_item_score
+            if np.any(improve):
+                best_item_score[improve] = local_item_scores[improve]
+                best_q_for_item[improve] = local_item_best_q[improve]
+
+        rows = np.arange(int(q_descs.shape[0]), dtype=np.int64)
+        keep = (best_item >= 0) & (best_q_for_item[best_item] == rows)
+        keep &= best_score >= float(mnn_min_similarity)
+    else:
+        top_q_for_item = np.full((mnn_topk, int(item_descs.shape[0])), -1, dtype=np.int64)
+        top_score_for_item = np.full((mnn_topk, int(item_descs.shape[0])), -np.inf, dtype=np.float32)
+
+        for start in range(0, int(q_descs.shape[0]), batch_size):
+            end = min(int(q_descs.shape[0]), start + batch_size)
+            sims = q_descs[start:end] @ item_descs.T
+            local_best = np.argmax(sims, axis=1).astype(np.int64, copy=False)
+            local_scores = sims[np.arange(int(sims.shape[0]), dtype=np.int64), local_best].astype(np.float32, copy=False)
+            best_item[start:end] = local_best
+            best_score[start:end] = local_scores
+            local_k = min(mnn_topk, int(sims.shape[0]))
+            if local_k == int(sims.shape[0]):
+                local_q = np.argsort(-sims, axis=0)[:local_k].astype(np.int64, copy=False)
+            else:
+                local_q = np.argpartition(-sims, kth=local_k - 1, axis=0)[:local_k].astype(np.int64, copy=False)
+                vals = np.take_along_axis(sims, local_q, axis=0)
+                order = np.argsort(-vals, axis=0)
+                local_q = np.take_along_axis(local_q, order, axis=0).astype(np.int64, copy=False)
+            local_item_scores = np.take_along_axis(sims, local_q, axis=0).astype(np.float32, copy=False)
+            local_item_q = local_q + int(start)
+            combined_scores = np.concatenate([top_score_for_item, local_item_scores], axis=0)
+            combined_q = np.concatenate([top_q_for_item, local_item_q], axis=0)
             top_idx = np.argpartition(-combined_scores, kth=mnn_topk - 1, axis=0)[:mnn_topk]
             vals = np.take_along_axis(combined_scores, top_idx, axis=0)
             order = np.argsort(-vals, axis=0)
@@ -3074,16 +3606,17 @@ def _lifted_point_landmark_hloc_nn(
             top_score_for_item = np.take_along_axis(combined_scores, top_idx, axis=0).astype(np.float32, copy=False)
             top_q_for_item = np.take_along_axis(combined_q, top_idx, axis=0).astype(np.int64, copy=False)
 
+        rows = np.arange(int(q_descs.shape[0]), dtype=np.int64)
+        keep = best_item >= 0
+        valid_rows = np.flatnonzero(keep)
+        if valid_rows.shape[0] > 0:
+            keep[valid_rows] = np.any(
+                top_q_for_item[:, best_item[valid_rows]] == valid_rows.reshape(1, -1),
+                axis=0,
+            )
+        keep &= best_score >= float(mnn_min_similarity)
+
     out: list[LiftedHypothesis] = []
-    rows = np.arange(int(q_descs.shape[0]), dtype=np.int64)
-    keep = best_item >= 0
-    valid_rows = np.flatnonzero(keep)
-    if valid_rows.shape[0] > 0:
-        keep[valid_rows] = np.any(
-            top_q_for_item[:, best_item[valid_rows]] == valid_rows.reshape(1, -1),
-            axis=0,
-        )
-    keep &= best_score >= float(mnn_min_similarity)
     for q_idx in np.flatnonzero(keep).tolist():
         item_idx = int(best_item[int(q_idx)])
         local_point_idx = int(item_point_local[item_idx])
@@ -3134,6 +3667,12 @@ def _lifted_point_landmark_nn_vocab(
     support_info: dict[int, dict[str, object]] | None = None,
     point_search_top_obs: int = 0,
     point_memory_obs_select: str = "first",
+    point_memory_adaptive_k_min: int = 1,
+    point_memory_adaptive_k_max: int = 32,
+    point_memory_adaptive_min_gain: float = 0.005,
+    point_memory_adaptive_sigma_attach: float = 2.0,
+    point_memory_adaptive_sigma_reproj: float = 4.0,
+    point_memory_adaptive_view_weight: float = 0.0,
     search_stats: dict[str, object] | None = None,
     diagnostic_exact_point_by_q: dict[int, int] | None = None,
     diagnostic_vocab_point_by_q: dict[int, int] | None = None,
@@ -3213,18 +3752,23 @@ def _lifted_point_landmark_nn_vocab(
     elif mode in {"point_memory", "point_memory_support"}:
         desc_source = index.contextual_point_obs_descs()
         offsets = np.asarray(index.point_obs_offsets, dtype=np.int64)
-        if int(point_memory_max_obs) > 0:
+        if int(point_memory_max_obs) > 0 or str(point_memory_obs_select) == "adaptive_cover":
             allowed_items: list[int] = []
             for point_idx in point_indices.tolist():
                 point_idx = int(point_idx)
                 if point_idx < 0 or point_idx + 1 >= int(offsets.shape[0]):
                     continue
-                selected = _select_point_observation_indices(
-                    index.contextual_point_obs_descs(),
-                    int(offsets[point_idx]),
-                    int(offsets[point_idx + 1]),
+                selected = index.selected_point_observation_indices(
+                    point_idx,
                     max_obs=int(point_memory_max_obs),
                     obs_select=str(point_memory_obs_select),
+                    adaptive_k_min=int(point_memory_adaptive_k_min),
+                    adaptive_k_max=int(point_memory_adaptive_k_max),
+                    adaptive_min_gain=float(point_memory_adaptive_min_gain),
+                    adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+                    adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+                    adaptive_view_weight=float(point_memory_adaptive_view_weight),
+                    frame_centers_by_frame_id=point_viewproto_frame_centers,
                 )
                 if selected.shape[0] > 0:
                     allowed_items.extend(int(x) for x in selected.tolist())
@@ -3378,6 +3922,12 @@ def _exact_top1_by_query_for_diagnostic(
     support_info: dict[int, dict[str, object]] | None,
     point_search_top_obs: int,
     point_memory_obs_select: str,
+    point_memory_adaptive_k_min: int,
+    point_memory_adaptive_k_max: int,
+    point_memory_adaptive_min_gain: float,
+    point_memory_adaptive_sigma_attach: float,
+    point_memory_adaptive_sigma_reproj: float,
+    point_memory_adaptive_view_weight: float,
 ) -> dict[int, int]:
     hyps = _lifted_point_landmark_nn_exact(
         q_kpts=q_kpts,
@@ -3398,6 +3948,12 @@ def _exact_top1_by_query_for_diagnostic(
         support_info=support_info,
         point_search_top_obs=point_search_top_obs,
         point_memory_obs_select=point_memory_obs_select,
+        point_memory_adaptive_k_min=int(point_memory_adaptive_k_min),
+        point_memory_adaptive_k_max=int(point_memory_adaptive_k_max),
+        point_memory_adaptive_min_gain=float(point_memory_adaptive_min_gain),
+        point_memory_adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+        point_memory_adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+        point_memory_adaptive_view_weight=float(point_memory_adaptive_view_weight),
     )
     return _hypotheses_by_query(hyps)
 
@@ -3431,6 +3987,12 @@ def _lifted_point_landmark_nn(
     search_stats: dict[str, object] | None = None,
     mnn_topk: int = 1,
     mnn_min_similarity: float = -1.0,
+    point_memory_adaptive_k_min: int = 1,
+    point_memory_adaptive_k_max: int = 32,
+    point_memory_adaptive_min_gain: float = 0.005,
+    point_memory_adaptive_sigma_attach: float = 2.0,
+    point_memory_adaptive_sigma_reproj: float = 4.0,
+    point_memory_adaptive_view_weight: float = 0.0,
 ) -> list[LiftedHypothesis]:
     mode = str(mode)
     if mode in {"point_mean_hloc_nn", "point_memory_hloc_nn"}:
@@ -3448,6 +4010,13 @@ def _lifted_point_landmark_nn(
             support_info=support_info,
             mnn_topk=int(mnn_topk),
             mnn_min_similarity=float(mnn_min_similarity),
+            point_memory_adaptive_k_min=int(point_memory_adaptive_k_min),
+            point_memory_adaptive_k_max=int(point_memory_adaptive_k_max),
+            point_memory_adaptive_min_gain=float(point_memory_adaptive_min_gain),
+            point_memory_adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+            point_memory_adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+            point_memory_adaptive_view_weight=float(point_memory_adaptive_view_weight),
+            point_memory_frame_centers=point_viewproto_frame_centers,
         )
     backend = str(memory_search_backend)
     if backend not in {"exact", "vocab"}:
@@ -3474,6 +4043,12 @@ def _lifted_point_landmark_nn(
             support_info=support_info,
             point_search_top_obs=point_search_top_obs,
             point_memory_obs_select=point_memory_obs_select,
+            point_memory_adaptive_k_min=int(point_memory_adaptive_k_min),
+            point_memory_adaptive_k_max=int(point_memory_adaptive_k_max),
+            point_memory_adaptive_min_gain=float(point_memory_adaptive_min_gain),
+            point_memory_adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+            point_memory_adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+            point_memory_adaptive_view_weight=float(point_memory_adaptive_view_weight),
         )
         if backend == "exact" and not bool(vocab_compare_exact):
             return exact_hyps
@@ -3500,6 +4075,12 @@ def _lifted_point_landmark_nn(
             support_info=support_info,
             point_search_top_obs=point_search_top_obs,
             point_memory_obs_select=point_memory_obs_select,
+            point_memory_adaptive_k_min=int(point_memory_adaptive_k_min),
+            point_memory_adaptive_k_max=int(point_memory_adaptive_k_max),
+            point_memory_adaptive_min_gain=float(point_memory_adaptive_min_gain),
+            point_memory_adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+            point_memory_adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+            point_memory_adaptive_view_weight=float(point_memory_adaptive_view_weight),
         )
         if bool(vocab_compare_exact)
         else None
@@ -3528,6 +4109,12 @@ def _lifted_point_landmark_nn(
         support_info=support_info,
         point_search_top_obs=point_search_top_obs,
         point_memory_obs_select=point_memory_obs_select,
+        point_memory_adaptive_k_min=int(point_memory_adaptive_k_min),
+        point_memory_adaptive_k_max=int(point_memory_adaptive_k_max),
+        point_memory_adaptive_min_gain=float(point_memory_adaptive_min_gain),
+        point_memory_adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+        point_memory_adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+        point_memory_adaptive_view_weight=float(point_memory_adaptive_view_weight),
         search_stats=local_stats,
         diagnostic_exact_point_by_q=exact_by_q,
         diagnostic_vocab_point_by_q=vocab_top1_by_q if bool(vocab_compare_exact) else None,
@@ -3580,6 +4167,13 @@ def _vectorized_point_memory_scores(
     point_memory: AttachedSPCOLMAPIndex,
     max_obs: int,
     obs_select: str,
+    adaptive_k_min: int = 1,
+    adaptive_k_max: int = 32,
+    adaptive_min_gain: float = 0.005,
+    adaptive_sigma_attach: float = 2.0,
+    adaptive_sigma_reproj: float = 4.0,
+    adaptive_view_weight: float = 0.0,
+    frame_centers_by_frame_id: dict[int, np.ndarray] | None = None,
 ) -> np.ndarray:
     n = int(len(selected))
     max_obs = int(max_obs)
@@ -3597,12 +4191,17 @@ def _vectorized_point_memory_scores(
             continue
         start = int(offsets[point_idx])
         end = int(offsets[point_idx + 1])
-        selected_obs = _select_point_observation_indices(
-            point_memory.contextual_point_obs_descs(),
-            start,
-            end,
+        selected_obs = point_memory.selected_point_observation_indices(
+            point_idx,
             max_obs=max_obs,
             obs_select=str(obs_select),
+            adaptive_k_min=int(adaptive_k_min),
+            adaptive_k_max=int(adaptive_k_max),
+            adaptive_min_gain=float(adaptive_min_gain),
+            adaptive_sigma_attach=float(adaptive_sigma_attach),
+            adaptive_sigma_reproj=float(adaptive_sigma_reproj),
+            adaptive_view_weight=float(adaptive_view_weight),
+            frame_centers_by_frame_id=frame_centers_by_frame_id,
         )
         if selected_obs.shape[0] == 0:
             continue
@@ -3630,10 +4229,17 @@ def _selective_memory_rerank(
     memory_score_mode: str,
     point_memory_max_obs: int,
     point_memory_obs_select: str,
+    point_memory_adaptive_k_min: int,
+    point_memory_adaptive_k_max: int,
+    point_memory_adaptive_min_gain: float,
+    point_memory_adaptive_sigma_attach: float,
+    point_memory_adaptive_sigma_reproj: float,
+    point_memory_adaptive_view_weight: float,
     point_viewproto_k: int,
     point_viewproto_min_obs: int,
     point_viewproto_method: str,
     point_viewproto_frame_centers: dict[int, np.ndarray] | None,
+    point_memory_frame_centers: dict[int, np.ndarray] | None,
     top_per_query: int,
     top_global: int,
     vectorized: bool,
@@ -3674,6 +4280,7 @@ def _selective_memory_rerank(
         bool(vectorized)
         and str(memory_score_mode) == "point_memory"
         and int(point_memory_max_obs) > 0
+        and str(point_memory_obs_select) != "adaptive_cover"
     ):
         scores = _vectorized_point_memory_scores(
             selected_cands,
@@ -3681,6 +4288,13 @@ def _selective_memory_rerank(
             point_memory=point_memory,
             max_obs=int(point_memory_max_obs),
             obs_select=str(point_memory_obs_select),
+            adaptive_k_min=int(point_memory_adaptive_k_min),
+            adaptive_k_max=int(point_memory_adaptive_k_max),
+            adaptive_min_gain=float(point_memory_adaptive_min_gain),
+            adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+            adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+            adaptive_view_weight=float(point_memory_adaptive_view_weight),
+            frame_centers_by_frame_id=point_memory_frame_centers,
         )
         for idx, score in zip(valid_idxs, scores.tolist(), strict=True):
             cand = candidates[int(idx)]
@@ -3704,6 +4318,13 @@ def _selective_memory_rerank(
                     int(cand.point_id),
                     max_obs=int(point_memory_max_obs),
                     obs_select=str(point_memory_obs_select),
+                    adaptive_k_min=int(point_memory_adaptive_k_min),
+                    adaptive_k_max=int(point_memory_adaptive_k_max),
+                    adaptive_min_gain=float(point_memory_adaptive_min_gain),
+                    adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+                    adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+                    adaptive_view_weight=float(point_memory_adaptive_view_weight),
+                    frame_centers_by_frame_id=point_memory_frame_centers,
                 )
             cand.memory_score = float(memory_score)
             cand.score = float(cand.score) + float(memory_score_weight) * float(memory_score)
@@ -3736,6 +4357,12 @@ def _aggregate_hypotheses(
     prototype_support_weight: float = 0.0,
     memory_score_mode: str = "point_memory",
     point_memory_obs_select: str = "first",
+    point_memory_adaptive_k_min: int = 1,
+    point_memory_adaptive_k_max: int = 32,
+    point_memory_adaptive_min_gain: float = 0.005,
+    point_memory_adaptive_sigma_attach: float = 2.0,
+    point_memory_adaptive_sigma_reproj: float = 4.0,
+    point_memory_adaptive_view_weight: float = 0.0,
     point_viewproto_k: int = 4,
     point_viewproto_min_obs: int = 2,
     point_viewproto_method: str = "descriptor_kmeans",
@@ -3834,10 +4461,17 @@ def _aggregate_hypotheses(
         memory_score_mode=str(memory_score_mode),
         point_memory_max_obs=int(point_memory_max_obs),
         point_memory_obs_select=str(point_memory_obs_select),
+        point_memory_adaptive_k_min=int(point_memory_adaptive_k_min),
+        point_memory_adaptive_k_max=int(point_memory_adaptive_k_max),
+        point_memory_adaptive_min_gain=float(point_memory_adaptive_min_gain),
+        point_memory_adaptive_sigma_attach=float(point_memory_adaptive_sigma_attach),
+        point_memory_adaptive_sigma_reproj=float(point_memory_adaptive_sigma_reproj),
+        point_memory_adaptive_view_weight=float(point_memory_adaptive_view_weight),
         point_viewproto_k=int(point_viewproto_k),
         point_viewproto_min_obs=int(point_viewproto_min_obs),
         point_viewproto_method=str(point_viewproto_method),
         point_viewproto_frame_centers=point_viewproto_frame_centers,
+        point_memory_frame_centers=point_viewproto_frame_centers,
         top_per_query=int(memory_rerank_top_per_query),
         top_global=int(memory_rerank_top_global),
         vectorized=bool(memory_rerank_vectorized),
@@ -4686,6 +5320,7 @@ def _summarize_metrics(metrics: list[dict], *, thresholds: object | None = None)
         "not_in_memory_count",
         "oracle_time_s",
         "matching_time_s",
+        "pnp_time_s",
         "query_time_s",
     ):
         vals = [float(m[key]) for m in metrics if key in m and m[key] is not None]
@@ -4940,6 +5575,7 @@ def _localize_one_query(
     vocab_memory_index = cfg.get("vocab_memory_index")
     vocab_stats = _new_vocab_search_stats()
     matching_time_s = 0.0
+    pnp_time_s = 0.0
 
     def _memory_search_fields(*, matching_time_s_value: float = 0.0) -> dict[str, object]:
         fields: dict[str, object] = {
@@ -4948,6 +5584,7 @@ def _localize_one_query(
             "num_words": int(vocab_memory_index.num_words) if isinstance(vocab_memory_index, PLMVisualVocabularyIndex) else 0,
             "vocab_top_words": int(cfg.get("vocab_top_words", 0) or 0),
             "matching_time_s": float(matching_time_s_value),
+            "pnp_time_s": float(pnp_time_s),
         }
         counts = vocab_stats.get("candidate_counts", [])
         if isinstance(counts, list) and counts:
@@ -5324,7 +5961,18 @@ def _localize_one_query(
         oracle_candidate_point_ids = np.asarray(candidate_point_ids_all, dtype=np.int64)
         num_candidate_points = int(candidate_point_ids_all.shape[0])
         num_candidate_observations = int(
-            index.num_observations_for_points(candidate_point_ids_all, max_obs=int(cfg["point_memory_max_obs"]))
+            index.num_observations_for_points(
+                candidate_point_ids_all,
+                max_obs=int(cfg["point_memory_max_obs"]),
+                obs_select=str(cfg["point_memory_obs_select"]),
+                adaptive_k_min=int(cfg["point_memory_adaptive_k_min"]),
+                adaptive_k_max=int(cfg["point_memory_adaptive_k_max"]),
+                adaptive_min_gain=float(cfg["point_memory_adaptive_min_gain"]),
+                adaptive_sigma_attach=float(cfg["point_memory_adaptive_sigma_attach"]),
+                adaptive_sigma_reproj=float(cfg["point_memory_adaptive_sigma_reproj"]),
+                adaptive_view_weight=float(cfg["point_memory_adaptive_view_weight"]),
+                frame_centers_by_frame_id=cfg.get("frame_centers_by_frame_id"),
+            )
         )
         if use_viewproto and num_candidate_points > 0:
             proto_cache = index.point_viewproto_cache(
@@ -5569,6 +6217,12 @@ def _localize_one_query(
                 support_info=support_info,
                 point_search_top_obs=int(cfg["point_search_top_obs"]),
                 point_memory_obs_select=str(cfg["point_memory_obs_select"]),
+                point_memory_adaptive_k_min=int(cfg["point_memory_adaptive_k_min"]),
+                point_memory_adaptive_k_max=int(cfg["point_memory_adaptive_k_max"]),
+                point_memory_adaptive_min_gain=float(cfg["point_memory_adaptive_min_gain"]),
+                point_memory_adaptive_sigma_attach=float(cfg["point_memory_adaptive_sigma_attach"]),
+                point_memory_adaptive_sigma_reproj=float(cfg["point_memory_adaptive_sigma_reproj"]),
+                point_memory_adaptive_view_weight=float(cfg["point_memory_adaptive_view_weight"]),
                 memory_search_backend=memory_search_backend,
                 vocab_index=vocab_memory_index if isinstance(vocab_memory_index, PLMVisualVocabularyIndex) else None,
                 vocab_top_words=int(cfg["vocab_top_words"]),
@@ -5604,6 +6258,12 @@ def _localize_one_query(
                 prototype_support_weight=float(cfg["prototype_support_weight"]),
                 memory_score_mode=memory_score_mode,
                 point_memory_obs_select=str(cfg["point_memory_obs_select"]),
+                point_memory_adaptive_k_min=int(cfg["point_memory_adaptive_k_min"]),
+                point_memory_adaptive_k_max=int(cfg["point_memory_adaptive_k_max"]),
+                point_memory_adaptive_min_gain=float(cfg["point_memory_adaptive_min_gain"]),
+                point_memory_adaptive_sigma_attach=float(cfg["point_memory_adaptive_sigma_attach"]),
+                point_memory_adaptive_sigma_reproj=float(cfg["point_memory_adaptive_sigma_reproj"]),
+                point_memory_adaptive_view_weight=float(cfg["point_memory_adaptive_view_weight"]),
                 point_viewproto_k=int(cfg["point_viewproto_k"]),
                 point_viewproto_min_obs=int(cfg["point_viewproto_min_obs"]),
                 point_viewproto_method=str(cfg["point_viewproto_method"]),
@@ -5624,6 +6284,7 @@ def _localize_one_query(
         if len(matches_for_pnp) < 4:
             continue
         clusters_tested += 1
+        t_pnp0 = time.perf_counter()
         pose, used_matches, stage = _run_two_stage_pose(
             matches_for_pnp,
             intr,
@@ -5640,6 +6301,7 @@ def _localize_one_query(
             rgbd_depth_window=int(cfg["rgbd_depth_window"]),
             min_final_inliers=int(cfg["min_final_inliers"]),
         )
+        pnp_time_s += float(time.perf_counter() - t_pnp0)
         quality = _pose_quality(
             pose,
             used_matches,
@@ -5706,6 +6368,12 @@ def _localize_one_query(
                 prototype_support_weight=float(cfg["prototype_support_weight"]),
                 memory_score_mode=memory_score_mode,
                 point_memory_obs_select=str(cfg["point_memory_obs_select"]),
+                point_memory_adaptive_k_min=int(cfg["point_memory_adaptive_k_min"]),
+                point_memory_adaptive_k_max=int(cfg["point_memory_adaptive_k_max"]),
+                point_memory_adaptive_min_gain=float(cfg["point_memory_adaptive_min_gain"]),
+                point_memory_adaptive_sigma_attach=float(cfg["point_memory_adaptive_sigma_attach"]),
+                point_memory_adaptive_sigma_reproj=float(cfg["point_memory_adaptive_sigma_reproj"]),
+                point_memory_adaptive_view_weight=float(cfg["point_memory_adaptive_view_weight"]),
                 point_viewproto_k=int(cfg["point_viewproto_k"]),
                 point_viewproto_min_obs=int(cfg["point_viewproto_min_obs"]),
                 point_viewproto_method=str(cfg["point_viewproto_method"]),
@@ -5721,6 +6389,7 @@ def _localize_one_query(
                     float(pg_aggregate_stats.get("mean_memory_rerank_candidates_per_query", 0.0))
                 )
             if len(pg_matches) >= 4:
+                t_pnp0 = time.perf_counter()
                 pg_pose, pg_used_matches, pg_stage = _run_two_stage_pose(
                     pg_matches,
                     intr,
@@ -5737,6 +6406,7 @@ def _localize_one_query(
                     rgbd_depth_window=int(cfg["rgbd_depth_window"]),
                     min_final_inliers=int(cfg["min_pose_guided_inliers"]),
                 )
+                pnp_time_s += float(time.perf_counter() - t_pnp0)
                 pg_quality = _pose_quality(
                     pg_pose,
                     pg_used_matches,
@@ -5870,6 +6540,13 @@ def _localize_one_query(
                         int(cand.point_id),
                         max_obs=int(cfg["point_memory_max_obs"]),
                         obs_select=str(cfg["point_memory_obs_select"]),
+                        adaptive_k_min=int(cfg["point_memory_adaptive_k_min"]),
+                        adaptive_k_max=int(cfg["point_memory_adaptive_k_max"]),
+                        adaptive_min_gain=float(cfg["point_memory_adaptive_min_gain"]),
+                        adaptive_sigma_attach=float(cfg["point_memory_adaptive_sigma_attach"]),
+                        adaptive_sigma_reproj=float(cfg["point_memory_adaptive_sigma_reproj"]),
+                        adaptive_view_weight=float(cfg["point_memory_adaptive_view_weight"]),
+                        frame_centers_by_frame_id=cfg.get("frame_centers_by_frame_id"),
                     )
                 if np.isfinite(score):
                     memory_scores.append(float(score))
@@ -6101,6 +6778,36 @@ def _runtime_cfg(cfg: dict, args: argparse.Namespace) -> dict[str, object]:
             getattr(args, "point_memory_obs_select", None)
             if getattr(args, "point_memory_obs_select", None) is not None
             else lnn_cfg.get("point_memory_obs_select", "first")
+        ),
+        "point_memory_adaptive_k_min": int(
+            getattr(args, "point_memory_adaptive_k_min", None)
+            if getattr(args, "point_memory_adaptive_k_min", None) is not None
+            else lnn_cfg.get("point_memory_adaptive_k_min", 1)
+        ),
+        "point_memory_adaptive_k_max": int(
+            getattr(args, "point_memory_adaptive_k_max", None)
+            if getattr(args, "point_memory_adaptive_k_max", None) is not None
+            else lnn_cfg.get("point_memory_adaptive_k_max", 32)
+        ),
+        "point_memory_adaptive_min_gain": float(
+            getattr(args, "point_memory_adaptive_min_gain", None)
+            if getattr(args, "point_memory_adaptive_min_gain", None) is not None
+            else lnn_cfg.get("point_memory_adaptive_min_gain", 0.005)
+        ),
+        "point_memory_adaptive_sigma_attach": float(
+            getattr(args, "point_memory_adaptive_sigma_attach", None)
+            if getattr(args, "point_memory_adaptive_sigma_attach", None) is not None
+            else lnn_cfg.get("point_memory_adaptive_sigma_attach", 2.0)
+        ),
+        "point_memory_adaptive_sigma_reproj": float(
+            getattr(args, "point_memory_adaptive_sigma_reproj", None)
+            if getattr(args, "point_memory_adaptive_sigma_reproj", None) is not None
+            else lnn_cfg.get("point_memory_adaptive_sigma_reproj", 4.0)
+        ),
+        "point_memory_adaptive_view_weight": float(
+            getattr(args, "point_memory_adaptive_view_weight", None)
+            if getattr(args, "point_memory_adaptive_view_weight", None) is not None
+            else lnn_cfg.get("point_memory_adaptive_view_weight", 0.0)
         ),
         "point_memory_batch_size": int(
             getattr(args, "point_memory_batch_size", None)
@@ -6434,6 +7141,28 @@ def run(args: argparse.Namespace) -> dict:
         raise ValueError(f"Unsupported pose_backend: {runtime_cfg['pose_backend']}")
     if str(runtime_cfg["sequence_activation"]) not in {"off", "prev_pose", "window_retrieval"}:
         raise ValueError(f"Unsupported sequence_activation: {runtime_cfg['sequence_activation']}")
+    if str(runtime_cfg["point_memory_obs_select"]) not in {
+        "all",
+        "first",
+        "uniform",
+        "random",
+        "diverse_desc",
+        "fixed_fps",
+        "adaptive_cover",
+    }:
+        raise ValueError(f"Unsupported point_memory_obs_select: {runtime_cfg['point_memory_obs_select']}")
+    runtime_cfg["point_memory_adaptive_k_min"] = max(1, int(runtime_cfg["point_memory_adaptive_k_min"]))
+    runtime_cfg["point_memory_adaptive_k_max"] = max(
+        int(runtime_cfg["point_memory_adaptive_k_min"]),
+        int(runtime_cfg["point_memory_adaptive_k_max"]),
+    )
+    runtime_cfg["point_memory_adaptive_min_gain"] = max(0.0, float(runtime_cfg["point_memory_adaptive_min_gain"]))
+    runtime_cfg["point_memory_adaptive_sigma_attach"] = max(0.0, float(runtime_cfg["point_memory_adaptive_sigma_attach"]))
+    runtime_cfg["point_memory_adaptive_sigma_reproj"] = max(0.0, float(runtime_cfg["point_memory_adaptive_sigma_reproj"]))
+    runtime_cfg["point_memory_adaptive_view_weight"] = min(
+        1.0,
+        max(0.0, float(runtime_cfg["point_memory_adaptive_view_weight"])),
+    )
     global_store: GlobalDescriptorStore | None = None
     descriptor_context = str(runtime_cfg.get("descriptor_context", "none"))
     if descriptor_context not in {"none", "global_fusion"}:
@@ -6560,7 +7289,19 @@ def run(args: argparse.Namespace) -> dict:
         and str(runtime_cfg.get("landmark_match_mode", "")) in {"point_viewproto", "point_viewproto_support"}
     ):
         runtime_cfg["memory_score_mode"] = "point_viewproto"
-    needs_frame_centers = (
+    needs_adaptive_view_centers = (
+        str(runtime_cfg.get("point_memory_obs_select", "")) == "adaptive_cover"
+        and float(runtime_cfg.get("point_memory_adaptive_view_weight", 0.0)) > 0.0
+        and (
+            str(runtime_cfg.get("landmark_match_mode", ""))
+            in {"point_memory", "point_memory_hloc_nn", "point_memory_support"}
+            or (
+                (float(runtime_cfg.get("memory_score_weight", 0.0)) != 0.0 or bool(runtime_cfg.get("log_memory_scores", False)))
+                and str(runtime_cfg.get("memory_score_mode", "point_memory")) == "point_memory"
+            )
+        )
+    )
+    needs_frame_centers = needs_adaptive_view_centers or (
         str(runtime_cfg.get("point_viewproto_method", "descriptor_kmeans")) == "viewdir_kmeans"
         and (
             str(runtime_cfg.get("landmark_match_mode", "")) in {"image_obs_c2f", "point_viewproto", "point_viewproto_support"}
@@ -6681,6 +7422,40 @@ def run(args: argparse.Namespace) -> dict:
         if proto_offsets_all.shape[0] > 1:
             proto_counts_all = (proto_offsets_all[1:] - proto_offsets_all[:-1]).astype(np.int64, copy=False)
     memory_summary = index.memory_summary(prebuilt_proto_cache)
+    point_memory_selection_summary: dict[str, object] = {}
+    if (
+        str(runtime_cfg["point_memory_obs_select"]) == "adaptive_cover"
+        and str(runtime_cfg["landmark_match_mode"])
+        in {"point_memory", "point_memory_hloc_nn", "point_memory_support"}
+    ):
+        if float(runtime_cfg["point_memory_adaptive_view_weight"]) > 0.0:
+            point_memory_selection_summary = {
+                "selection_mode": str(runtime_cfg["point_memory_obs_select"]),
+                "point_memory_max_obs": int(runtime_cfg["point_memory_max_obs"]),
+                "k_min": int(runtime_cfg["point_memory_adaptive_k_min"]),
+                "k_max": int(runtime_cfg["point_memory_adaptive_k_max"]),
+                "min_gain": float(runtime_cfg["point_memory_adaptive_min_gain"]),
+                "sigma_attach": float(runtime_cfg["point_memory_adaptive_sigma_attach"]),
+                "sigma_reproj": float(runtime_cfg["point_memory_adaptive_sigma_reproj"]),
+                "view_weight": float(runtime_cfg["point_memory_adaptive_view_weight"]),
+                "summary_skipped": True,
+                "skip_reason": "view-weighted adaptive selection is evaluated lazily per active landmark",
+            }
+        else:
+            selection_cache = index.selected_observation_cache(
+                max_obs=int(runtime_cfg["point_memory_max_obs"]),
+                obs_select=str(runtime_cfg["point_memory_obs_select"]),
+                adaptive_k_min=int(runtime_cfg["point_memory_adaptive_k_min"]),
+                adaptive_k_max=int(runtime_cfg["point_memory_adaptive_k_max"]),
+                adaptive_min_gain=float(runtime_cfg["point_memory_adaptive_min_gain"]),
+                adaptive_sigma_attach=float(runtime_cfg["point_memory_adaptive_sigma_attach"]),
+                adaptive_sigma_reproj=float(runtime_cfg["point_memory_adaptive_sigma_reproj"]),
+                adaptive_view_weight=float(runtime_cfg["point_memory_adaptive_view_weight"]),
+                frame_centers_by_frame_id=runtime_cfg.get("frame_centers_by_frame_id"),
+            )
+            point_memory_selection_summary = dict(selection_cache.summary)
+        write_json(out_dir / "point_memory_selection_summary.json", point_memory_selection_summary)
+        print("Point-memory selection summary:", json.dumps(point_memory_selection_summary, sort_keys=True))
     memory_backend_requested = str(runtime_cfg["memory_search_backend"])
     memory_backend_effective = "vocab" if memory_backend_requested == "vocab" else "exact"
     loaded_vocab = runtime_cfg.get("vocab_memory_index")
@@ -6771,6 +7546,13 @@ def run(args: argparse.Namespace) -> dict:
             "point_memory_batch_size": int(runtime_cfg["point_memory_batch_size"]),
             "point_memory_max_obs": int(runtime_cfg["point_memory_max_obs"]),
             "point_memory_obs_select": str(runtime_cfg["point_memory_obs_select"]),
+            "point_memory_adaptive_k_min": int(runtime_cfg["point_memory_adaptive_k_min"]),
+            "point_memory_adaptive_k_max": int(runtime_cfg["point_memory_adaptive_k_max"]),
+            "point_memory_adaptive_min_gain": float(runtime_cfg["point_memory_adaptive_min_gain"]),
+            "point_memory_adaptive_sigma_attach": float(runtime_cfg["point_memory_adaptive_sigma_attach"]),
+            "point_memory_adaptive_sigma_reproj": float(runtime_cfg["point_memory_adaptive_sigma_reproj"]),
+            "point_memory_adaptive_view_weight": float(runtime_cfg["point_memory_adaptive_view_weight"]),
+            "point_memory_selection_summary": point_memory_selection_summary,
             "point_search_top_obs": int(runtime_cfg["point_search_top_obs"]),
             "point_search_exact": int(runtime_cfg["point_search_top_obs"]) == 0,
             "memory_search_backend": memory_backend_requested,
@@ -6783,6 +7565,7 @@ def run(args: argparse.Namespace) -> dict:
             "vocab_min_candidates": int(runtime_cfg["vocab_min_candidates"]),
             "vocab_compare_exact": bool(runtime_cfg["vocab_compare_exact"]),
             "matching_time_s": float(sum(float(m.get("matching_time_s", 0.0) or 0.0) for m in metrics)),
+            "pnp_time_s": float(sum(float(m.get("pnp_time_s", 0.0) or 0.0) for m in metrics)),
             "vocab_summary": vocab_summary,
             "point_viewproto_k": int(runtime_cfg["point_viewproto_k"]),
             "point_viewproto_min_obs": int(runtime_cfg["point_viewproto_min_obs"]),
@@ -6919,7 +7702,17 @@ def main() -> None:
         help="Ablation mode: current image observation matching or explicit point-level landmark memory matching.",
     )
     parser.add_argument("--point_memory_max_obs", type=int, default=None)
-    parser.add_argument("--point_memory_obs_select", choices=("first", "uniform", "diverse_desc"), default=None)
+    parser.add_argument(
+        "--point_memory_obs_select",
+        choices=("all", "first", "uniform", "random", "diverse_desc", "fixed_fps", "adaptive_cover"),
+        default=None,
+    )
+    parser.add_argument("--point_memory_adaptive_k_min", type=int, default=None)
+    parser.add_argument("--point_memory_adaptive_k_max", type=int, default=None)
+    parser.add_argument("--point_memory_adaptive_min_gain", type=float, default=None)
+    parser.add_argument("--point_memory_adaptive_sigma_attach", type=float, default=None)
+    parser.add_argument("--point_memory_adaptive_sigma_reproj", type=float, default=None)
+    parser.add_argument("--point_memory_adaptive_view_weight", type=float, default=None)
     parser.add_argument("--point_memory_batch_size", type=int, default=None)
     parser.add_argument("--point_search_top_obs", type=int, default=None)
     parser.add_argument("--memory_search_backend", choices=("exact", "vocab"), default=None)

@@ -47,7 +47,11 @@ def main() -> None:
     parser.add_argument("--query_retrieval_file", required=True, type=Path)
     parser.add_argument("--reference_model", type=Path, default=None)
     parser.add_argument("--hloc_root", type=Path, default=None)
-    parser.add_argument("--retrieval_method", default="netvlad")
+    parser.add_argument(
+        "--retrieval_method",
+        default="netvlad",
+        help="DB-DB pairing method for native SfM. Use 'covis' to use reference-model covisibility pairs.",
+    )
     parser.add_argument("--db_pair_topk", type=int, default=50)
     parser.add_argument("--max_keypoints", type=int, default=4096)
     parser.add_argument("--resize_max", type=int, default=1024)
@@ -59,7 +63,7 @@ def main() -> None:
     )
     parser.add_argument("--alignment_offset_px", type=float, default=0.5)
     parser.add_argument("--alignment_tolerance_px", type=float, default=0.75)
-    parser.add_argument("--num_covis", type=int, default=50, help="Kept only for summary compatibility.")
+    parser.add_argument("--num_covis", type=int, default=50, help="Number of covisible DB images when --retrieval_method=covis.")
     parser.add_argument("--features_dir", type=Path, default=None)
     parser.add_argument("--db_pairs_dir", type=Path, default=None)
     parser.add_argument("--native_sfm_dir", type=Path, default=None)
@@ -83,37 +87,49 @@ def main() -> None:
 
     base_dir = args.base_dir
     features_dir = args.features_dir or base_dir / "aliked_features"
-    db_pairs_dir = args.db_pairs_dir or base_dir / f"retrieval_db_{args.retrieval_method}{int(args.db_pair_topk)}"
-    native_sfm_dir = args.native_sfm_dir or base_dir / f"aliked_native_{args.retrieval_method}_sfm"
-    attached_index = args.attached_index or base_dir / f"aliked_native_{args.retrieval_method}_index_aligned"
-    eval_dir = args.eval_dir or base_dir / f"aliked_native_{args.retrieval_method}_plm_eval"
-    db_pairs = db_pairs_dir / f"pairs-db-{args.retrieval_method}{int(args.db_pair_topk)}.txt"
+    retrieval_method = str(args.retrieval_method).lower()
+    use_covis_pairs = retrieval_method in {"covis", "covisibility"}
+    pair_tag = f"covis{int(args.num_covis)}" if use_covis_pairs else str(args.retrieval_method)
+    db_pairs_dir = args.db_pairs_dir or base_dir / (
+        f"retrieval_db_covis{int(args.num_covis)}"
+        if use_covis_pairs
+        else f"retrieval_db_{args.retrieval_method}{int(args.db_pair_topk)}"
+    )
+    native_sfm_dir = args.native_sfm_dir or base_dir / f"aliked_native_{pair_tag}_sfm"
+    attached_index = args.attached_index or base_dir / f"aliked_native_{pair_tag}_index_aligned"
+    eval_dir = args.eval_dir or base_dir / f"aliked_native_{pair_tag}_plm_eval"
+    db_pairs = db_pairs_dir / (
+        f"pairs-db-covis{int(args.num_covis)}.txt"
+        if use_covis_pairs
+        else f"pairs-db-{args.retrieval_method}{int(args.db_pair_topk)}.txt"
+    )
     native_config = native_sfm_dir / "config_aliked_native.yaml"
     db_features = features_dir / "db.h5"
     query_features = features_dir / "query.h5"
     pipeline_summary_path = base_dir / f"native_aliked_{args.retrieval_method}_plm_pipeline_summary.json"
 
     if not args.skip_sfm:
-        retrieval_cmd = [
-            _python(),
-            "tools/generate_db_retrieval_pairs.py",
-            "--config",
-            str(args.config),
-            "--split_json",
-            str(args.split_json),
-            "--dataset_root",
-            str(args.dataset_root),
-            "--out_dir",
-            str(db_pairs_dir),
-            "--method",
-            str(args.retrieval_method),
-            "--topk",
-            str(args.db_pair_topk),
-        ]
-        _maybe_flag(retrieval_cmd, "--hloc_root", args.hloc_root)
-        if args.overwrite_pairs:
-            retrieval_cmd.append("--overwrite")
-        _run(retrieval_cmd, dry_run=bool(args.dry_run))
+        if not use_covis_pairs:
+            retrieval_cmd = [
+                _python(),
+                "tools/generate_db_retrieval_pairs.py",
+                "--config",
+                str(args.config),
+                "--split_json",
+                str(args.split_json),
+                "--dataset_root",
+                str(args.dataset_root),
+                "--out_dir",
+                str(db_pairs_dir),
+                "--method",
+                str(args.retrieval_method),
+                "--topk",
+                str(args.db_pair_topk),
+            ]
+            _maybe_flag(retrieval_cmd, "--hloc_root", args.hloc_root)
+            if args.overwrite_pairs:
+                retrieval_cmd.append("--overwrite")
+            _run(retrieval_cmd, dry_run=bool(args.dry_run))
 
         sfm_cmd = [
             _python(),
@@ -130,8 +146,6 @@ def main() -> None:
             str(native_sfm_dir),
             "--features_dir",
             str(features_dir),
-            "--pairs_path",
-            str(db_pairs),
             "--matcher_conf",
             "aliked+lightglue",
             "--reference_model_coordinate_mode",
@@ -140,7 +154,11 @@ def main() -> None:
             str(args.resize_max),
             "--max_keypoints",
             str(args.max_keypoints),
+            "--num_covis",
+            str(args.num_covis),
         ]
+        if not use_covis_pairs:
+            sfm_cmd.extend(["--pairs_path", str(db_pairs)])
         _maybe_flag(sfm_cmd, "--reference_model", args.reference_model)
         _maybe_flag(sfm_cmd, "--hloc_root", args.hloc_root)
         if args.overwrite_features:
@@ -307,7 +325,8 @@ def main() -> None:
             "features_dir": str(features_dir),
             "db_features_path": str(db_features),
             "query_features_path": str(query_features),
-            "db_retrieval_pairs": str(db_pairs),
+            "db_pair_source": "covisibility" if use_covis_pairs else str(args.retrieval_method),
+            "db_retrieval_pairs": None if use_covis_pairs else str(db_pairs),
             "native_sfm": str(native_sfm_dir / "sfm_aliked_lightglue"),
             "native_config": str(native_config),
             "attached_index": str(attached_index),

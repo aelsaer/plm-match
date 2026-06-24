@@ -27,8 +27,6 @@ HLOC_ROOT=${HLOC_ROOT:-$ROOT/external/Hierarchical-Localization}
 RETRIEVAL=${RETRIEVAL:-mixvpr}
 TOPK=${TOPK:-}
 QUERY_TOPK=${QUERY_TOPK:-4096}
-MNN_TOPK=${MNN_TOPK:-1}
-MNN_MIN_SIMILARITY=${MNN_MIN_SIMILARITY:--1.0}
 MIXVPR_BATCH_SIZE=${MIXVPR_BATCH_SIZE:-16}
 MIXVPR_DEVICE=${MIXVPR_DEVICE:-cuda}
 MAX_QUERIES=${MAX_QUERIES:-}
@@ -36,6 +34,15 @@ SPLIT_SELECTION=${SPLIT_SELECTION:-stride}
 RUN_HLOC=${RUN_HLOC:-0}
 OVERWRITE=${OVERWRITE:-0}
 DOWNLOAD=${DOWNLOAD:-auto}
+POINT_MEMORY_MAX_OBS=${POINT_MEMORY_MAX_OBS:-16}
+POINT_MEMORY_OBS_SELECT=${POINT_MEMORY_OBS_SELECT:-diverse_desc}
+POINT_MEMORY_ADAPTIVE_K_MIN=${POINT_MEMORY_ADAPTIVE_K_MIN:-1}
+POINT_MEMORY_ADAPTIVE_K_MAX=${POINT_MEMORY_ADAPTIVE_K_MAX:-32}
+POINT_MEMORY_ADAPTIVE_MIN_GAIN=${POINT_MEMORY_ADAPTIVE_MIN_GAIN:-0.005}
+POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH=${POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH:-2.0}
+POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ=${POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ:-4.0}
+POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT=${POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT:-0.0}
+RESULT_NAME=${RESULT_NAME:-point_memory_hloc_nn_obs${POINT_MEMORY_MAX_OBS}_${POINT_MEMORY_OBS_SELECT}}
 
 CFG=$BASE/config_aachen_loo${LOO_NUM_QUERIES}_sp_sg.yaml
 SPLIT=$BASE/split/split.json
@@ -264,13 +271,7 @@ if [[ -n "$MAX_QUERIES" ]]; then
   max_query_args+=(--max_queries "$MAX_QUERIES")
 fi
 
-MNN_TAG=${MNN_TAG:-}
-if [[ -z "$MNN_TAG" && ( "$MNN_TOPK" != "1" || "$MNN_MIN_SIMILARITY" != "-1.0" ) ]]; then
-  sim_tag=${MNN_MIN_SIMILARITY//./p}
-  sim_tag=${sim_tag//-/m}
-  MNN_TAG="_mnnk${MNN_TOPK}_sim${sim_tag}"
-fi
-RESULT_DIR=$BASE/results/${RETRIEVAL}${TOPK}/point_memory_hloc_nn_obs16_diverse${MNN_TAG}
+RESULT_DIR=$BASE/results/${RETRIEVAL}${TOPK}/$RESULT_NAME
 "$PY" -m plm_match.pipelines.lifted_nn_localize \
   --config "$CFG" \
   --dataset_root "$DATASET" \
@@ -283,11 +284,15 @@ RESULT_DIR=$BASE/results/${RETRIEVAL}${TOPK}/point_memory_hloc_nn_obs16_diverse$
   --db_features_path "$DB_FEATURES" \
   --query_features_path "$QUERY_FEATURES" \
   --landmark_match_mode point_memory_hloc_nn \
-  --point_memory_max_obs 16 \
-  --point_memory_obs_select diverse_desc \
+  --point_memory_max_obs "$POINT_MEMORY_MAX_OBS" \
+  --point_memory_obs_select "$POINT_MEMORY_OBS_SELECT" \
+  --point_memory_adaptive_k_min "$POINT_MEMORY_ADAPTIVE_K_MIN" \
+  --point_memory_adaptive_k_max "$POINT_MEMORY_ADAPTIVE_K_MAX" \
+  --point_memory_adaptive_min_gain "$POINT_MEMORY_ADAPTIVE_MIN_GAIN" \
+  --point_memory_adaptive_sigma_attach "$POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH" \
+  --point_memory_adaptive_sigma_reproj "$POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ" \
+  --point_memory_adaptive_view_weight "$POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT" \
   --memory_search_backend exact \
-  --mnn_topk "$MNN_TOPK" \
-  --mnn_min_similarity "$MNN_MIN_SIMILARITY" \
   --topk "$TOPK" \
   --query_topk "$QUERY_TOPK" \
   --metric_thresholds 0.25/2,0.5/5,5/10 \

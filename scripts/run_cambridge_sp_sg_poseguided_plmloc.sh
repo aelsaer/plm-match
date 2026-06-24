@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # Examples:
 #   bash scripts/run_cambridge_sp_sg_poseguided_plmloc.sh
-#   RETRIEVALS="netvlad mixvpr" bash scripts/run_cambridge_sp_sg_poseguided_plmloc.sh
+#   RETRIEVALS="netvlad mixvpr salad" bash scripts/run_cambridge_sp_sg_poseguided_plmloc.sh
 #   SCENES="shopfacade greatcourt" SKIP_EXISTING=0 bash scripts/run_cambridge_sp_sg_poseguided_plmloc.sh
 
 PY=${PY:-/home/andreas/anaconda3/envs/sam3/bin/python}
@@ -27,9 +27,16 @@ POSE_SCORE=${POSE_SCORE:-0.1}
 POSE_REPROJ_PENALTY=${POSE_REPROJ_PENALTY:-0.02}
 POSE_MAX_DESCS_PER_POINT=${POSE_MAX_DESCS_PER_POINT:-8}
 MIN_POSE_GUIDED_INLIERS=${MIN_POSE_GUIDED_INLIERS:-12}
+TOPK=${TOPK:-10}
 
 score_label="${POSE_SCORE//./p}"
-RUN_NAME=${RUN_NAME:-point_memory_hloc_nn_obs16_diverse_poseguided_r${POSE_RADIUS}_s${score_label}}
+if [[ -z "${RUN_NAME:-}" ]]; then
+  if [[ "$TOPK" == "10" ]]; then
+    RUN_NAME=point_memory_hloc_nn_obs16_diverse_poseguided_r${POSE_RADIUS}_s${score_label}
+  else
+    RUN_NAME=point_memory_hloc_nn_obs16_diverse_topk${TOPK}_poseguided_r${POSE_RADIUS}_s${score_label}
+  fi
+fi
 RESULT_TAG=${RESULT_TAG:-plm_hlocnn_poseguided_sp_sg}
 
 SCENE_KEYS=(
@@ -104,6 +111,14 @@ MIXVPR_RETRIEVALS=(
   outputs/cambridge_greatcourt_lifted/retrieval_mixvpr/pairs-loo-mixvpr10.txt
 )
 
+SALAD_RETRIEVALS=(
+  outputs/cambridge_kingscollege_lifted/retrieval_salad/pairs-loo-salad10.txt
+  outputs/cambridge_oldhospital_lifted/retrieval_salad/pairs-loo-salad10.txt
+  outputs/cambridge_shopfacade_official/retrieval_salad/pairs-loo-salad10.txt
+  outputs/cambridge_stmaryschurch_lifted/retrieval_salad/pairs-loo-salad10.txt
+  outputs/cambridge_greatcourt_lifted/retrieval_salad/pairs-loo-salad10.txt
+)
+
 contains_word() {
   local needle=$1
   local haystack=$2
@@ -121,8 +136,14 @@ run_scene() {
   case "$retrieval" in
     netvlad) retrieval_file="${NETVLAD_RETRIEVALS[$i]}" ;;
     mixvpr) retrieval_file="${MIXVPR_RETRIEVALS[$i]}" ;;
+    salad) retrieval_file="${SALAD_RETRIEVALS[$i]}" ;;
     *) echo "Unsupported retrieval: $retrieval" >&2; exit 2 ;;
   esac
+
+  if [[ ! -f "$retrieval_file" ]]; then
+    echo "Missing retrieval file: $retrieval_file" >&2
+    exit 1
+  fi
 
   local out_dir="${OUTPUT_DIRS[$i]}/${RESULT_TAG}/${retrieval}/${RUN_NAME}"
   if [[ "$SKIP_EXISTING" == "1" && -f "$out_dir/run_summary.json" ]]; then
@@ -150,7 +171,7 @@ run_scene() {
     --retrieval_prior_mode rank \
     --memory_score_weight 0.0 \
     --memory_search_backend exact \
-    --topk 10 \
+    --topk "$TOPK" \
     --query_topk 4096 \
     --metric_thresholds 0.05/5,0.25/2,0.5/5 \
     --support_weight 0.0 \
@@ -185,8 +206,10 @@ done
 
 SUMMARY_DIR=outputs/cambridge_landmarks_final_netvlad_sp_plm_hloc_nn
 mkdir -p "$SUMMARY_DIR"
+export RESULT_TAG RUN_NAME TOPK POSE_RADIUS POSE_SCORE
 "$PY" - <<'PY'
 import csv
+import os
 import json
 from pathlib import Path
 
@@ -197,12 +220,12 @@ scenes = [
     ("StMarysChurch", Path("outputs/cambridge_stmaryschurch_lifted")),
     ("GreatCourt", Path("outputs/cambridge_greatcourt_lifted")),
 ]
-tag = "plm_hlocnn_poseguided_sp_sg"
-run_name = "point_memory_hloc_nn_obs16_diverse_poseguided_r10_s0p1"
+tag = os.environ.get("RESULT_TAG", "plm_hlocnn_poseguided_sp_sg")
+run_name = os.environ.get("RUN_NAME", "point_memory_hloc_nn_obs16_diverse_poseguided_r10_s0p1")
 out_dir = Path("outputs/cambridge_landmarks_final_netvlad_sp_plm_hloc_nn")
 rows = []
 for scene, base in scenes:
-    for retrieval in ("netvlad", "mixvpr"):
+    for retrieval in ("netvlad", "mixvpr", "salad"):
         path = base / tag / retrieval / run_name / "run_summary.json"
         row = {
             "scene": scene,
@@ -228,8 +251,9 @@ for scene, base in scenes:
             )
         rows.append(row)
 
-csv_path = out_dir / "cambridge_sp_sg_poseguided_r10_s0p1.csv"
-md_path = out_dir / "cambridge_sp_sg_poseguided_r10_s0p1.md"
+safe_run_name = run_name.replace("/", "_")
+csv_path = out_dir / f"cambridge_sp_sg_{safe_run_name}.csv"
+md_path = out_dir / f"cambridge_sp_sg_{safe_run_name}.md"
 fieldnames = [
     "scene",
     "retrieval",
@@ -252,7 +276,7 @@ with csv_path.open("w", newline="") as f:
         writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 lines = [
-    "# Cambridge SP+SG PLMLoc Pose-Guided r10 s0.1",
+    f"# Cambridge SP+SG PLMLoc {run_name}",
     "",
     "| Scene | Retrieval | Status | Median cm | Median deg | 5cm/5deg | 25cm/2deg | 50cm/5deg | FPS | Pose hyp |",
     "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",

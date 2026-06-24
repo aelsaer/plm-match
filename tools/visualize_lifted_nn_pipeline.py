@@ -747,12 +747,13 @@ def _debug_query(
                 cluster_hyps.extend(hypotheses_by_image.get(str(image_name), ()))
             if not cluster_hyps:
                 continue
-            matches, aggregated = lnn._aggregate_hypotheses(
+            matches, aggregated, _aggregate_stats = lnn._aggregate_hypotheses(
                 cluster_hyps,
                 support_weight=float(runtime_cfg["support_weight"]),
                 rank_weight=float(runtime_cfg["rank_weight"]),
                 attach_dist_weight=float(runtime_cfg["attach_dist_weight"]),
                 point_support_weight=float(runtime_cfg["point_support_weight"]),
+                landmark_reliability_weight=float(runtime_cfg.get("landmark_reliability_weight", 0.0)),
                 memory_score_weight=float(runtime_cfg["memory_score_weight"]),
                 q_descs=q_descs,
                 point_memory=index,
@@ -819,12 +820,13 @@ def _debug_query(
                 aggregated=first_best.aggregated,
             )
             combined = lnn._inlier_hypotheses_from_pose(tmp) + pose_guided_hyps
-            pg_matches, pg_aggregated = lnn._aggregate_hypotheses(
+            pg_matches, pg_aggregated, _pg_aggregate_stats = lnn._aggregate_hypotheses(
                 combined,
                 support_weight=float(runtime_cfg["support_weight"]),
                 rank_weight=float(runtime_cfg["rank_weight"]),
                 attach_dist_weight=float(runtime_cfg["attach_dist_weight"]),
                 point_support_weight=float(runtime_cfg["point_support_weight"]),
+                landmark_reliability_weight=float(runtime_cfg.get("landmark_reliability_weight", 0.0)),
                 memory_score_weight=float(runtime_cfg["memory_score_weight"]),
                 q_descs=q_descs,
                 point_memory=index,

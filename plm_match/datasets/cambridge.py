@@ -29,6 +29,7 @@ class CambridgeLandmarksDataset(BaseDatasetAdapter):
         self.query_model_path = self._resolve_path(cfg.get("query_model_path", "empty_all"), base=self.sfm_dir)
         self.db_list_path = self._resolve_path(cfg.get("db_list", "list_db.txt"), base=self.sfm_dir)
         self.query_list_path = self._resolve_path(cfg.get("query_list", "list_query.txt"), base=self.sfm_dir)
+        self.trust_colmap_image_size = bool(cfg.get("trust_colmap_image_size", False))
 
         self.cameras, self.images, self.points3d = load_colmap_model(self.model_path)
         self.load_query_model = bool(cfg.get("load_query_model", True))
@@ -48,10 +49,13 @@ class CambridgeLandmarksDataset(BaseDatasetAdapter):
     def _scaled_intrinsics_and_xys(self, camera, image_name: str, xys=None):
         intr = camera_to_intrinsics(camera)
         image_path = self.image_root / image_name
-        img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(f"Could not read Cambridge image: {image_path}")
-        h_orig, w_orig = img.shape[:2]
+        if self.trust_colmap_image_size:
+            w_orig, h_orig = int(camera.width), int(camera.height)
+        else:
+            img = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                raise FileNotFoundError(f"Could not read Cambridge image: {image_path}")
+            h_orig, w_orig = img.shape[:2]
         sx = float(w_orig) / float(camera.width)
         sy = float(h_orig) / float(camera.height)
         if abs(sx - 1.0) > 1e-9 or abs(sy - 1.0) > 1e-9:

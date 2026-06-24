@@ -355,7 +355,10 @@ class LocalPatchDescriptor:
             import h5py
         except Exception as exc:
             raise RuntimeError('H5 local descriptor mode requires h5py.') from exc
-        f = h5py.File(path, 'r')
+        try:
+            f = h5py.File(path, 'r')
+        except OSError as exc:
+            raise OSError(f'Unable to open H5 local feature file {path}: {exc}') from exc
         self._h5_files[path] = f
         return f
 
