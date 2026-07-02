@@ -466,7 +466,11 @@ def run(args: argparse.Namespace) -> dict:
         extractor_conf["preprocessing"]["resize_max"] = int(args.resize_max)
     if args.max_keypoints is not None:
         extractor_conf.setdefault("model", {})
-        extractor_conf["model"]["max_keypoints"] = int(args.max_keypoints)
+        extractor_name = str(extractor_conf["model"].get("name", extractor_conf_name)).lower()
+        if extractor_name == "aliked":
+            extractor_conf["model"]["max_num_keypoints"] = int(args.max_keypoints)
+        else:
+            extractor_conf["model"]["max_keypoints"] = int(args.max_keypoints)
     if args.match_threshold is not None:
         matcher_conf.setdefault("model", {})
         matcher_conf["model"]["match_threshold"] = float(args.match_threshold)

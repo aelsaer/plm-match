@@ -16,10 +16,26 @@ DATASET_ROOT=${DATASET_ROOT:-$ROOT}
 IMAGE_ROOT=${IMAGE_ROOT:-$ROOT/datasets/RobotCar-Seasons/images}
 MODEL_DIR=${MODEL_DIR:-$ROOT/outputs/robotcar_seasons_v2_train/colmap_model}
 
-FEATURE_DIR=${FEATURE_DIR:-$RUN_ROOT/sp_features}
+FEATURE=${FEATURE:-superpoint}
+FEATURE_H5_METHOD=${FEATURE_H5_METHOD:-${FEATURE}_h5}
+if [[ "$FEATURE" == "superpoint" ]]; then
+  DEFAULT_FEATURE_DIR=$RUN_ROOT/sp_features
+else
+  DEFAULT_FEATURE_DIR=$RUN_ROOT/${FEATURE}_features
+fi
+FEATURE_DIR=${FEATURE_DIR:-$DEFAULT_FEATURE_DIR}
 RETRIEVAL_DIR=${RETRIEVAL_DIR:-$RUN_ROOT/retrieval_mixvpr10}
-ATTACHED_INDEX=${ATTACHED_INDEX:-$RUN_ROOT/sp_colmap_attach_r3}
-RESULT_DIR=${RESULT_DIR:-$RUN_ROOT/results/mixvpr10/point_memory_hloc_nn_obs16_diverse}
+ATTACHED_INDEX=${ATTACHED_INDEX:-$RUN_ROOT/${FEATURE}_colmap_attach_r3}
+POINT_MEMORY_MAX_OBS=${POINT_MEMORY_MAX_OBS:-16}
+POINT_MEMORY_OBS_SELECT=${POINT_MEMORY_OBS_SELECT:-diverse_desc}
+POINT_MEMORY_ADAPTIVE_K_MIN=${POINT_MEMORY_ADAPTIVE_K_MIN:-1}
+POINT_MEMORY_ADAPTIVE_K_MAX=${POINT_MEMORY_ADAPTIVE_K_MAX:-32}
+POINT_MEMORY_ADAPTIVE_MIN_GAIN=${POINT_MEMORY_ADAPTIVE_MIN_GAIN:-0.005}
+POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH=${POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH:-2.0}
+POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ=${POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ:-4.0}
+POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT=${POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT:-0.0}
+RESULT_NAME=${RESULT_NAME:-point_memory_hloc_nn_${FEATURE}_obs${POINT_MEMORY_MAX_OBS}_${POINT_MEMORY_OBS_SELECT}}
+RESULT_DIR=${RESULT_DIR:-$RUN_ROOT/results/mixvpr10/$RESULT_NAME}
 
 MIXVPR_CHECKPOINT=${MIXVPR_CHECKPOINT:-$ROOT/MixVPR/resnet50_MixVPR_large.ckpt}
 TOPK=${TOPK:-10}
@@ -53,7 +69,7 @@ if [[ ! -f "$FEATURE_DIR/db.h5" || ! -f "$FEATURE_DIR/query.h5" ]]; then
     --config "$CFG" \
     --split_json "$SPLIT" \
     --dataset_root "$DATASET_ROOT" \
-    --method superpoint \
+    --method "$FEATURE" \
     --out_dir "$FEATURE_DIR"
 fi
 
@@ -75,7 +91,7 @@ if [[ ! -f "$ATTACHED_INDEX/summary.json" ]]; then
     --dataset_root "$DATASET_ROOT" \
     --split_json "$SPLIT" \
     --out_dir "$ATTACHED_INDEX" \
-    --method superpoint_h5 \
+    --method "$FEATURE_H5_METHOD" \
     --db_features_path "$FEATURE_DIR/db.h5" \
     --query_features_path "$FEATURE_DIR/query.h5" \
     --attach_radius_px "$ATTACH_RADIUS_PX" \
@@ -104,12 +120,18 @@ fi
   --retrieval_file "$RETRIEVAL_FILE" \
   --retrieval_method mixvpr \
   --out_dir "$RESULT_DIR" \
-  --method superpoint_h5 \
+  --method "$FEATURE_H5_METHOD" \
   --db_features_path "$FEATURE_DIR/db.h5" \
   --query_features_path "$FEATURE_DIR/query.h5" \
   --landmark_match_mode point_memory_hloc_nn \
-  --point_memory_max_obs 16 \
-  --point_memory_obs_select diverse_desc \
+  --point_memory_max_obs "$POINT_MEMORY_MAX_OBS" \
+  --point_memory_obs_select "$POINT_MEMORY_OBS_SELECT" \
+  --point_memory_adaptive_k_min "$POINT_MEMORY_ADAPTIVE_K_MIN" \
+  --point_memory_adaptive_k_max "$POINT_MEMORY_ADAPTIVE_K_MAX" \
+  --point_memory_adaptive_min_gain "$POINT_MEMORY_ADAPTIVE_MIN_GAIN" \
+  --point_memory_adaptive_sigma_attach "$POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH" \
+  --point_memory_adaptive_sigma_reproj "$POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ" \
+  --point_memory_adaptive_view_weight "$POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT" \
   --memory_search_backend exact \
   --topk "$TOPK" \
   --query_topk "$QUERY_TOPK" \
