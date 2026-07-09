@@ -8,6 +8,10 @@ from .base import BaseDatasetAdapter, FrameRecord
 from plm_match.utils.colmap_model import Camera, Image, Point3D, camera_to_intrinsics, image_twc, load_colmap_model
 
 
+def _query_pose_key(rel: str) -> str:
+    return str(rel).replace("\\", "/").lstrip("./").replace("/", "__")
+
+
 def parse_query_list(path: Path, image_root: Path, default_intrinsics: Optional[Dict[str, float]] = None) -> List[FrameRecord]:
     frames: List[FrameRecord] = []
     with open(path, 'r', encoding='utf-8') as f:
@@ -101,9 +105,17 @@ class COLMAPLocalizationDataset(BaseDatasetAdapter):
         if gt_dir is not None:
             gt_root = self.root / gt_dir
             for fr in frames:
-                p = gt_root / f'{fr.frame_id}.txt'
-                if p.exists():
-                    fr.pose_path = p
+                rel = str(fr.meta.get('relative_path', fr.image_path.name))
+                candidates = [str(fr.frame_id), _query_pose_key(rel)]
+                seen = set()
+                for key in candidates:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    p = gt_root / f'{key}.txt'
+                    if p.exists():
+                        fr.pose_path = p
+                        break
         return frames
 
     def get_map_frames(self) -> List[FrameRecord]:

@@ -7,7 +7,7 @@ import struct
 import numpy as np
 
 
-@dataclass
+@dataclass(slots=True)
 class Camera:
     id: int
     model: str
@@ -16,7 +16,7 @@ class Camera:
     params: np.ndarray
 
 
-@dataclass
+@dataclass(slots=True)
 class Image:
     id: int
     qvec: np.ndarray
@@ -27,7 +27,7 @@ class Image:
     point3D_ids: np.ndarray
 
 
-@dataclass
+@dataclass(slots=True)
 class Point3D:
     id: int
     xyz: np.ndarray
@@ -131,16 +131,25 @@ def read_cameras_text(path: Path) -> Dict[int, Camera]:
 def read_images_text(path: Path) -> Dict[int, Image]:
     images: Dict[int, Image] = {}
     with open(path, 'r', encoding='utf-8') as f:
-        lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith('#')]
-    for i in range(0, len(lines), 2):
-        toks = lines[i].split()
+        lines = [ln.rstrip('\n') for ln in f if not ln.startswith('#')]
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line:
+            continue
+        toks = line.split()
+        if len(toks) < 10:
+            continue
         image_id = int(toks[0])
         qvec = np.array([float(x) for x in toks[1:5]], dtype=np.float64)
         tvec = np.array([float(x) for x in toks[5:8]], dtype=np.float64)
         camera_id = int(toks[8])
         name = toks[9]
-        if i + 1 < len(lines):
-            xy_toks = lines[i + 1].split()
+        point_line = lines[i].strip() if i < len(lines) else ''
+        i += 1
+        if point_line:
+            xy_toks = point_line.split()
             vals = np.array([float(x) for x in xy_toks], dtype=np.float64)
             if vals.size == 0:
                 xys = np.zeros((0, 2), dtype=np.float64)

@@ -74,5 +74,21 @@ def load_tum_sequence(root: str | Path, cfg: dict) -> SequenceDataset:
     assoc = assoc[::stride][:max_frames]
     frames = []
     for i, (ts, rgb_rel, depth_rel) in enumerate(assoc):
-        frames.append(FrameRecord(frame_id=str(i), image_path=root / rgb_rel, intrinsics=intr.copy(), depth_path=root / depth_rel, pose=_nearest_pose(ts, gt, float(cfg.get('pose_assoc_delta', 0.05))), meta={'timestamp': ts, 'relative_path': rgb_rel}))
+        frames.append(
+            FrameRecord(
+                frame_id=str(i),
+                image_path=root / rgb_rel,
+                intrinsics=intr.copy(),
+                depth_path=root / depth_rel,
+                pose=_nearest_pose(ts, gt, float(cfg.get('pose_assoc_delta', 0.05))),
+                meta={
+                    'timestamp': ts,
+                    'relative_path': rgb_rel,
+                    # TUM stores depth as uint16 with factor 5000. read_depth()
+                    # interprets uint16 PNGs as millimeters, so online runners
+                    # apply this correction after reading.
+                    'depth_scale_correction': 0.2,
+                },
+            )
+        )
     return SequenceDataset(root=root, name='tum_sequence', frames=frames, meta={'preset': cfg.get('preset', 'fr1')})

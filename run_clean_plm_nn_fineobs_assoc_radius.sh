@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 RADIUS_PX [mutual|top1]" >&2
+  exit 2
+fi
+
+RADIUS="$1"
+MODE="${2:-mutual}"
+TAG="${RADIUS//./p}"
+
+SRC=outputs/loo_aachen_benchmark/loo_aachen_500/plm_local_memory_sp_ppca_rank4_obs8
+OUT=outputs/loo_aachen_benchmark/loo_aachen_500/plm_nn_fineobs_assoc_r${TAG}_${MODE}
+
+case "$MODE" in
+  mutual)
+    TOPK_OBS=1
+    LANDMARKS_PER_ANCHOR=1
+    MUTUAL_NN=true
+    MUTUAL_STRICT=true
+    ;;
+  top1)
+    TOPK_OBS=320
+    LANDMARKS_PER_ANCHOR=1
+    MUTUAL_NN=false
+    MUTUAL_STRICT=true
+    ;;
+  *)
+    echo "Unknown mode '$MODE'; expected mutual or top1" >&2
+    exit 2
+    ;;
+esac
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+cp -a "$SRC/cache" "$OUT/cache"
+
+# Force recomputation of descriptor memory with this radius. The copied
+# geometry/map cache is reused, but old SuperPoint association arrays are not.
+rm -f "$OUT"/cache/landmarks_store/fine_mu.npy
+rm -f "$OUT"/cache/landmarks_store/fine_obs_descs.npy
+rm -f "$OUT"/cache/landmarks_store/fine_basis.npy
+rm -f "$OUT"/cache/landmarks_store/fine_eigvals.npy
+rm -f "$OUT"/cache/landmarks_store/fine_sigma_perp2.npy
+
+TORCH_HOME=/tmp/torch-hub /home/andreas/anaconda3/envs/sam3/bin/python \
+  tools/run_db_leave_one_out.py \
+  --config configs/aachen_v1_1_day_refactor.yaml \
+  --split_json outputs/loo_aachen_benchmark/loo_aachen_500/split/split.json \
+  --out_dir "$OUT" \
+  --retrieval_mode file \
+  --retrieval_file outputs/loo_aachen_benchmark/loo_aachen_500/retrieval/pairs-loo-netvlad50.txt \
+  --reuse_map_cache \
+  --override hloc.topk_db_images=50 \
+  --override hloc.max_candidate_landmarks=25000 \
+  --override hloc.max_index_landmarks_per_image=3000 \
+  --override hloc.verify_image_schedule=5,10,20,50 \
+  --override hloc.covisibility_neighbors_per_seed=5 \
+  --override hloc.covisibility_expansion_seed_images=20 \
+  --override hloc.max_expanded_db_images=100 \
+  --override hloc.rank_candidate_landmarks=true \
+  --override matching.carry_pose_prior=false \
+  --override matching.min_match_guarantee=0 \
+  --override matching.ratio_margin=0.0 \
+  --override matching.adaptive_min_cosine=false \
+  --override matching.spatial_prior_enabled=true \
+  --override matching.spatial_prior_topk_db=10 \
+  --override matching.spatial_prior_radius_m=50.0 \
+  --override matching.local_memory.enabled=true \
+  --override matching.local_memory.direct_score=true \
+  --override matching.local_memory.max_obs_per_landmark=8 \
+  --override matching.local_memory.topk_observations_per_anchor="$TOPK_OBS" \
+  --override matching.local_memory.landmarks_per_anchor="$LANDMARKS_PER_ANCHOR" \
+  --override matching.local_memory.mutual_nn="$MUTUAL_NN" \
+  --override matching.local_memory.mutual_nn_strict="$MUTUAL_STRICT" \
+  --override matching.local_memory.mutual_nn_batch_size=4096 \
+  --override matching.local_memory.fine_weight=1.0 \
+  --override matching.local_memory.eupe_prior_weight=0.0 \
+  --override matching.local_memory.mean_weight=0.0 \
+  --override matching.local_memory.support_weight=0.0 \
+  --override matching.local_memory.staticness_weight=0.0 \
+  --override matching.local_memory.graph_support_weight=0.0 \
+  --override matching.local_memory.ppca.enabled=false \
+  --override matching.local_memory.observation_coherence.enabled=false \
+  --override matching.fine_rerank.enabled=false \
+  --override matching.fine_rerank.method=superpoint_h5 \
+  --override matching.fine_rerank.store_observation_descs=true \
+  --override matching.fine_rerank.require_descriptor=true \
+  --override matching.fine_rerank.max_obs_per_landmark=8 \
+  --override matching.fine_rerank.match_radius_px="$RADIUS" \
+  --override matching.fine_primary=false \
+  --override matching.materialize_topk_per_anchor=1 \
+  --override matching.max_materialized_landmarks=1024 \
+  --override matching.multi_hypothesis_per_anchor=1 \
+  --override matching.max_matches=1024 \
+  --override anchors.source=superpoint_h5 \
+  --override landmarks.graph.enabled=false \
+  --override matching.graph_filter.enabled=false \
+  --override matching.correspondence_graph.enabled=false \
+  --override matching.coherence_radius_m=null \
+  --override matching.pairwise_verifier.enabled=false \
+  --override pnp.reproj_error_px=10.0 \
+  --override pnp.iterations=8000 \
+  --override pnp.multi_pass=true

@@ -14,15 +14,16 @@ import torch
 from plm_match.utils.io import read_image
 
 
-@dataclass
+@dataclass(slots=True)
 class GrayImageCacheEntry:
     gray: np.ndarray
 
 
-@dataclass
+@dataclass(slots=True)
 class XFeatImageCacheEntry:
     keypoints: np.ndarray
     descriptors: np.ndarray
+    scores: np.ndarray | None = None
 
 
 class LRUGrayImageCache:
@@ -45,6 +46,24 @@ class LRUGrayImageCache:
             self._data.popitem(last=False)
 
 
+H5_LOCAL_FEATURE_METHODS = (
+    'superpoint_h5',
+    'superpoint-h5',
+    'sp_h5',
+    'sp-h5',
+    'd2net_h5',
+    'd2net-h5',
+    'd2_h5',
+    'd2-h5',
+    'd2net',
+    'd2-net',
+)
+
+
+def is_h5_local_feature_method(method: str | None) -> bool:
+    return str(method or '').lower() in H5_LOCAL_FEATURE_METHODS
+
+
 class LocalPatchDescriptor:
     """Sparse local descriptor head for shortlist reranking."""
 
@@ -54,6 +73,9 @@ class LocalPatchDescriptor:
         patch_size: int = 24,
         *,
         repo_root: str | None = None,
+        features_path: str | None = None,
+        db_features_path: str | None = None,
+        query_features_path: str | None = None,
         top_k: int = 4096,
         match_radius_px: float | None = None,
         image_cache_size: int = 8,
@@ -63,6 +85,13 @@ class LocalPatchDescriptor:
         self.top_k = int(max(0, top_k))
         self.match_radius_px = float(match_radius_px) if match_radius_px is not None else float(max(6.0, self.patch_size))
         self.repo_root = repo_root
+        h5_paths = []
+        for p in (features_path, db_features_path, query_features_path):
+            if p:
+                h5_paths.append(Path(p).expanduser())
+        self._h5_paths = h5_paths
+        self._h5_files: dict[Path, Any] = {}
+        self._h5_cache: OrderedDict[str, XFeatImageCacheEntry] = OrderedDict()
         self._xfeat_cache: OrderedDict[tuple[int, tuple[int, ...]], XFeatImageCacheEntry] = OrderedDict()
         self._xfeat_cache_size = int(max(1, image_cache_size))
         if self.method == 'sift':
@@ -75,12 +104,29 @@ class LocalPatchDescriptor:
             self.impl = self._load_xfeat(repo_root=repo_root, top_k=self.top_k)
             self._dim = 64
             self._binary = False
+        elif is_h5_local_feature_method(self.method):
+            if not self._h5_paths:
+                raise ValueError(
+                    'H5 local descriptor mode requires '
+                    '`matching.fine_rerank.features_path`, `db_features_path`, or `query_features_path`.'
+                )
+            self.impl = None
+            self._dim = 512 if self.method in ('d2net', 'd2-net', 'd2net_h5', 'd2net-h5', 'd2_h5', 'd2-h5') else 256
+            self._binary = False
         elif self.method == 'orb':
             self.impl = cv2.ORB_create(nfeatures=0, patchSize=int(self.patch_size))
             self._dim = 32
             self._binary = True
         else:
             raise ValueError(f'Unsupported local descriptor method: {method}')
+
+    def close(self) -> None:
+        for f in list(self._h5_files.values()):
+            try:
+                f.close()
+            except Exception:
+                pass
+        self._h5_files.clear()
 
     @property
     def dim(self) -> int:
@@ -217,6 +263,189 @@ class LocalPatchDescriptor:
             self._dim = int(descriptors.shape[1])
         return XFeatImageCacheEntry(keypoints=keypoints, descriptors=descriptors)
 
+    def _open_h5(self, path: Path):
+        path = path.expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        f = self._h5_files.get(path)
+        if f is not None:
+            return f
+        if not path.exists():
+            raise FileNotFoundError(f'H5 local feature file not found: {path}')
+        try:
+            import h5py
+        except Exception as exc:
+            raise RuntimeError('H5 local descriptor mode requires h5py.') from exc
+        f = h5py.File(path, 'r')
+        self._h5_files[path] = f
+        return f
+
+    def _h5_key_candidates(self, image_name: str | None) -> list[str]:
+        if not image_name:
+            return []
+        raw = str(image_name).replace('\\', '/').lstrip('/')
+        candidates = [raw]
+        for prefix in ('images_upright/', './', '../'):
+            if raw.startswith(prefix):
+                candidates.append(raw[len(prefix):])
+        p = Path(raw)
+        if len(p.parts) >= 2:
+            candidates.append('/'.join(p.parts[-2:]))
+        candidates.append(p.name)
+        if not raw.startswith('db/') and p.name:
+            candidates.append(f'db/{p.name}')
+        # Preserve order while removing duplicates.
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            if item and item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    def _read_h5_entry(self, image_name: str | None) -> XFeatImageCacheEntry:
+        cache_key = str(image_name or '')
+        cached = self._h5_cache.get(cache_key)
+        if cached is not None:
+            self._h5_cache.move_to_end(cache_key)
+            return cached
+        candidates = self._h5_key_candidates(image_name)
+        for path in self._h5_paths:
+            f = self._open_h5(path)
+            for key in candidates:
+                if key not in f:
+                    continue
+                group = f[key]
+                keypoints_raw = np.asarray(group['keypoints'], dtype=np.float32)
+                if keypoints_raw.ndim == 2 and keypoints_raw.shape[1] >= 2:
+                    keypoints = keypoints_raw[:, :2].astype(np.float32, copy=False)
+                else:
+                    keypoints = keypoints_raw.reshape(-1, 2).astype(np.float32, copy=False)
+                descriptors = np.asarray(group['descriptors'], dtype=np.float32)
+                if (
+                    descriptors.ndim == 2
+                    and descriptors.shape[0] != keypoints.shape[0]
+                    and descriptors.shape[1] == keypoints.shape[0]
+                ):
+                    descriptors = descriptors.T
+                descriptors = descriptors.reshape(descriptors.shape[0], -1).astype(np.float32, copy=False)
+                score_key = next((k for k in ('scores', 'score', 'responses', 'response') if k in group), None)
+                scores = np.asarray(group[score_key], dtype=np.float32).reshape(-1) if score_key is not None else None
+                n = min(keypoints.shape[0], descriptors.shape[0], scores.shape[0] if scores is not None else keypoints.shape[0])
+                keypoints = keypoints[:n]
+                descriptors = descriptors[:n]
+                if scores is not None:
+                    scores = scores[:n]
+                if descriptors.shape[0] > 0:
+                    norms = np.linalg.norm(descriptors, axis=1, keepdims=True)
+                    descriptors = descriptors / np.maximum(norms, 1e-8)
+                    self._dim = int(descriptors.shape[1])
+                entry = XFeatImageCacheEntry(
+                    keypoints=keypoints.astype(np.float32, copy=False),
+                    descriptors=descriptors.astype(np.float32, copy=False),
+                    scores=scores.astype(np.float32, copy=False) if scores is not None else None,
+                )
+                self._h5_cache[cache_key] = entry
+                self._h5_cache.move_to_end(cache_key)
+                while len(self._h5_cache) > self._xfeat_cache_size:
+                    self._h5_cache.popitem(last=False)
+                return entry
+        return XFeatImageCacheEntry(
+            keypoints=np.zeros((0, 2), dtype=np.float32),
+            descriptors=np.zeros((0, self.dim), dtype=np.float32),
+            scores=np.zeros((0,), dtype=np.float32),
+        )
+
+    def extract_keypoints(
+        self,
+        image_name: str | None,
+        *,
+        topk: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not is_h5_local_feature_method(self.method):
+            return (
+                np.zeros((0, 2), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, self.dim), dtype=np.float32),
+            )
+        entry = self._read_h5_entry(image_name)
+        scores = entry.scores
+        if scores is None:
+            scores = np.ones((entry.keypoints.shape[0],), dtype=np.float32)
+        keypoints = entry.keypoints
+        descriptors = entry.descriptors
+        if topk is not None and int(topk) > 0 and keypoints.shape[0] > int(topk):
+            order = np.argsort(-scores.astype(np.float32))[: int(topk)]
+            keypoints = keypoints[order]
+            descriptors = descriptors[order]
+            scores = scores[order]
+        return (
+            keypoints.astype(np.float32, copy=False),
+            scores.astype(np.float32, copy=False),
+            descriptors.astype(np.float32, copy=False),
+        )
+
+    def _sort_sparse_keypoints(
+        self,
+        keypoints: np.ndarray,
+        scores: np.ndarray,
+        descriptors: np.ndarray,
+        *,
+        topk: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        keypoints = np.asarray(keypoints, dtype=np.float32).reshape(-1, 2)
+        scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+        descriptors = np.asarray(descriptors, dtype=np.float32)
+        descriptors = descriptors.reshape(descriptors.shape[0], -1) if descriptors.size else np.zeros((0, self.dim), dtype=np.float32)
+        n = min(keypoints.shape[0], scores.shape[0], descriptors.shape[0])
+        keypoints = keypoints[:n]
+        scores = scores[:n]
+        descriptors = descriptors[:n]
+        if descriptors.shape[0] > 0:
+            descriptors = np.stack([self._normalize(d) for d in descriptors], axis=0).astype(np.float32)
+            self._dim = int(descriptors.shape[1])
+        if topk is not None and int(topk) > 0 and keypoints.shape[0] > int(topk):
+            order = np.argsort(-scores.astype(np.float32))[: int(topk)]
+            keypoints = keypoints[order]
+            scores = scores[order]
+            descriptors = descriptors[order]
+        return (
+            keypoints.astype(np.float32, copy=False),
+            scores.astype(np.float32, copy=False),
+            descriptors.astype(np.float32, copy=False),
+        )
+
+    def extract_keypoints_from_image(
+        self,
+        image_rgb: np.ndarray,
+        *,
+        topk: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self.method == 'xfeat':
+            entry = self._run_xfeat(image_rgb)
+            scores = entry.scores
+            if scores is None:
+                scores = np.ones((entry.keypoints.shape[0],), dtype=np.float32)
+            return self._sort_sparse_keypoints(entry.keypoints, scores, entry.descriptors, topk=topk)
+        if is_h5_local_feature_method(self.method):
+            return (
+                np.zeros((0, 2), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, self.dim), dtype=np.float32),
+            )
+        gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+        keypoints, descriptors = self.impl.detectAndCompute(gray, None)
+        if not keypoints or descriptors is None or len(keypoints) == 0:
+            return (
+                np.zeros((0, 2), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, self.dim), dtype=np.float32),
+            )
+        kpts = np.asarray([kp.pt for kp in keypoints], dtype=np.float32)
+        scores = np.asarray([kp.response for kp in keypoints], dtype=np.float32)
+        return self._sort_sparse_keypoints(kpts, scores, descriptors, topk=topk)
+
     def _xfeat_cache_get(self, key: tuple[int, tuple[int, ...]]) -> XFeatImageCacheEntry | None:
         val = self._xfeat_cache.get(key)
         if val is None:
@@ -259,12 +488,31 @@ class LocalPatchDescriptor:
                 last_error = exc
         raise RuntimeError(f'Failed to run XFeat detectAndCompute: {last_error}') from last_error
 
-    def _extract_xfeat(self, image_rgb: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
-        entry = self._run_xfeat(image_rgb)
+    def _extract_sparse_nearest(
+        self,
+        entry: XFeatImageCacheEntry,
+        points: Sequence[np.ndarray],
+    ) -> np.ndarray:
+        descs, _, _ = self._extract_sparse_nearest_with_metadata(entry, points)
+        return descs
+
+    def _extract_sparse_nearest_with_metadata(
+        self,
+        entry: XFeatImageCacheEntry,
+        points: Sequence[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not points:
-            return np.zeros((0, self.dim), dtype=np.float32)
+            return (
+                np.zeros((0, self.dim), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+            )
         if entry.keypoints.shape[0] == 0 or entry.descriptors.shape[0] == 0:
-            return np.zeros((len(points), self.dim), dtype=np.float32)
+            return (
+                np.zeros((len(points), self.dim), dtype=np.float32),
+                np.zeros((len(points),), dtype=np.float32),
+                np.zeros((len(points),), dtype=np.float32),
+            )
         pts = np.asarray([np.asarray(p, dtype=np.float32).reshape(2) for p in points], dtype=np.float32)
         kpts = entry.keypoints.astype(np.float32, copy=False)
         diff = pts[:, None, :] - kpts[None, :, :]
@@ -272,10 +520,42 @@ class LocalPatchDescriptor:
         best = np.argmin(d2, axis=1)
         best_d2 = d2[np.arange(d2.shape[0]), best]
         out = np.zeros((pts.shape[0], entry.descriptors.shape[1]), dtype=np.float32)
+        assoc_px = np.zeros((pts.shape[0],), dtype=np.float32)
+        sp_scores = np.zeros((pts.shape[0],), dtype=np.float32)
         valid = best_d2 <= float(self.match_radius_px * self.match_radius_px)
         if np.any(valid):
             out[valid] = entry.descriptors[best[valid]]
-        return out
+            assoc_px[valid] = np.sqrt(np.maximum(best_d2[valid], 0.0)).astype(np.float32, copy=False)
+            if entry.scores is not None and entry.scores.shape[0] > 0:
+                scores = entry.scores.astype(np.float32, copy=False)
+                sp_scores[valid] = scores[best[valid]]
+            else:
+                sp_scores[valid] = 1.0
+        return out, assoc_px, sp_scores
+
+    def _extract_xfeat(self, image_rgb: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
+        entry = self._run_xfeat(image_rgb)
+        return self._extract_sparse_nearest(entry, points)
+
+    def _extract_xfeat_with_metadata(
+        self,
+        image_rgb: np.ndarray,
+        points: Sequence[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        entry = self._run_xfeat(image_rgb)
+        return self._extract_sparse_nearest_with_metadata(entry, points)
+
+    def _extract_h5(self, image_name: str | None, points: Sequence[np.ndarray]) -> np.ndarray:
+        entry = self._read_h5_entry(image_name)
+        return self._extract_sparse_nearest(entry, points)
+
+    def _extract_h5_with_metadata(
+        self,
+        image_name: str | None,
+        points: Sequence[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        entry = self._read_h5_entry(image_name)
+        return self._extract_sparse_nearest_with_metadata(entry, points)
 
     def _compute_one(self, gray: np.ndarray, uv: np.ndarray) -> np.ndarray | None:
         x = float(uv[0])
@@ -289,16 +569,55 @@ class LocalPatchDescriptor:
             return None
         return self._normalize(desc[0])
 
-    def extract_at_points(self, image_rgb: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
+    def extract_at_points(
+        self,
+        image_rgb: np.ndarray,
+        points: Sequence[np.ndarray],
+        *,
+        image_name: str | None = None,
+    ) -> np.ndarray:
         if self.method == 'xfeat':
             return self._extract_xfeat(image_rgb, points)
+        if is_h5_local_feature_method(self.method):
+            return self._extract_h5(image_name, points)
         gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
         return self.extract_from_gray(gray, points)
 
-    def extract_from_gray(self, gray: np.ndarray, points: Sequence[np.ndarray]) -> np.ndarray:
+    def extract_at_points_with_metadata(
+        self,
+        image_rgb: np.ndarray,
+        points: Sequence[np.ndarray],
+        *,
+        image_name: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return descriptors plus sparse-keypoint association distance/score.
+
+        For H5/XFeat features this records the nearest detected local feature
+        used for each requested point. Dense OpenCV descriptors are computed at
+        the requested point, so their association distance is zero.
+        """
+        if self.method == 'xfeat':
+            return self._extract_xfeat_with_metadata(image_rgb, points)
+        if is_h5_local_feature_method(self.method):
+            return self._extract_h5_with_metadata(image_name, points)
+        descs = self.extract_at_points(image_rgb, points, image_name=image_name)
+        valid = (np.linalg.norm(descs.astype(np.float32, copy=False), axis=1) > 1e-8) if descs.size else np.zeros((0,), dtype=bool)
+        assoc_px = np.zeros((descs.shape[0],), dtype=np.float32)
+        scores = valid.astype(np.float32, copy=False)
+        return descs, assoc_px, scores
+
+    def extract_from_gray(
+        self,
+        gray: np.ndarray,
+        points: Sequence[np.ndarray],
+        *,
+        image_name: str | None = None,
+    ) -> np.ndarray:
         if self.method == 'xfeat':
             image_rgb = np.repeat(gray[..., None], 3, axis=2)
             return self._extract_xfeat(image_rgb, points)
+        if is_h5_local_feature_method(self.method):
+            return self._extract_h5(image_name, points)
         descs = []
         for uv in points:
             desc = self._compute_one(gray, np.asarray(uv, dtype=np.float32))

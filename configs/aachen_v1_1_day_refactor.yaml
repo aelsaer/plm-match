@@ -1,7 +1,7 @@
 dataset_root: /home/phd/plm-match/datasets/aachen_v1_1
 
 map:
-  cache_path: ./outputs/aachen_day_refactor_cache/landmarks.pkl
+  cache_path: ./outputs/aachen_day_refactor_sp_cache/landmarks.pkl
   map_feature_cache_size: 64
   map_gray_cache_size: 64
   compute_fine_descs: true
@@ -21,6 +21,27 @@ hloc:
   verify_image_batch_size: 5
   verify_image_schedule: [5, 20, 50]
   grouping: covisibility
+  covisibility_neighbors_per_seed: 0
+  covisibility_expansion_seed_images: 20
+  max_expanded_db_images: 0
+  rank_candidate_landmarks: false
+  candidate_support_weight: 1.0
+  candidate_rank_weight: 0.25
+  candidate_staticness_weight: 0.05
+
+global_graph:
+  enabled: false
+  pooling: mean
+  gem_p: 3.0
+  cache_dir: null
+  db_rerank_pool: 75
+  rank_temperature: 10.0
+  db_rank_weight: 0.7
+  eupe_global_weight: 0.3
+  covis_weight: 0.6
+  covis_global_weight: 0.4
+  candidate_graph_weight: 1.0
+  landmark_graph_weight: 0.02
 
 backbone:
   name: eupe
@@ -31,61 +52,185 @@ backbone:
   device: cuda
 
 anchors:
+  source: superpoint_h5
   alpha: 0.60
   beta: 0.40
   use_stability: true
-  topk: 512
+  topk: 1024
+  harris_method: gftt
+  keypoint_max_corners: 4096
+  keypoint_quality_level: 0.005
+  keypoint_min_distance_px: 8.0
+  keypoint_nms_radius_px: 8.0
+  keypoint_block_size: 3
+  keypoint_weight: 1.0
+  harris_weight: 2.0
   grid_cells: [16, 16]
   nms_radius: 1
 
 landmarks:
   merge_radius_m: 0.08
   merge_cos_sim: 0.72
-  manifold_rank: 2
+  manifold_rank: 0
   cache_manifold_rank: 0
-  min_obs: 3
-  max_obs_per_landmark: 4
+  min_obs: 2
+  max_obs_per_landmark: 2
   max_colmap_point_error: 4.0
   min_colmap_track_len: 3
   min_staticness: 0.05
+  context_radius: 1
+  harris_weight: 2.0
+  graph:
+    enabled: false
+    topk_neighbors: 16
+    max_landmarks_per_image: 128
+    per_image_neighbors: 4
+    max_edge_distance_m: 8.0
 
 matching:
   topk_landmarks: 40
   retrieval_anchor_batch_size: 256
   materialize_topk_per_anchor: 4
   max_materialized_landmarks: 512
-  max_matches: 512
+  max_matches: 1024
   group_verify_patience: 2
   group_verify_min_inliers: 8
   group_verify_hard_inliers: 24
   use_pose_prior: false
   carry_pose_prior: false
-  scorer: ppca
+  scorer: mean
   lambdas: [1.0, 1.2, 0.6, 0.2, 0.2]
   ppca_support_weight: 0.05
   min_cosine_sim: -1.0
   min_score: -1.0e9
   ratio_margin: 0.0
-  min_match_guarantee: 12
-  xfeat_rerank_coarse: true
+  min_match_guarantee: 0
+  fine_primary: true
+  fine_primary_topk: 40
+  fine_primary_direct_score: false
+  fine_primary_staticness_weight: 0.0
+  fine_primary_graph_support_weight: 0.0
+  local_memory:
+    enabled: true
+    descriptor: superpoint_h5
+    direct_score: false
+    topk_observations_per_anchor: 120
+    landmarks_per_anchor: 40
+    max_obs_per_landmark: 2
+    fine_weight: 1.0
+    eupe_prior_weight: 0.25
+    mean_weight: 0.10
+    support_weight: 0.03
+    staticness_weight: 0.0
+    graph_support_weight: null
+    observation_coherence:
+      enabled: false
+      candidates_per_anchor: 3
+      group_by: observer_covisibility
+      covis_neighbors: 5
+      covis_max_seed_landmarks: 512
+      max_seed_frames: 64
+      min_unique_anchors: 12
+      min_unique_landmarks: 12
+      score_weight: 1.0
+      anchor_weight: 0.05
+      landmark_weight: 0.02
+      staticness_weight: 0.02
+      restrict_to_preferred_frames: true
+      unique_landmark_per_anchor: true
+      fallback_to_unconstrained: true
+    ppca:
+      enabled: false
+      rank: 4
+      min_obs: 4
+      weight: 0.05
+      parallel_weight: 0.25
+      perp_weight: 1.0
+      max_penalty: 8.0
+  xfeat_primary: false
+  xfeat_primary_topk: 40
+  xfeat_rerank_coarse: false
   xfeat_rerank_weight: 0.5
-  adaptive_min_cosine: true
+  adaptive_min_cosine: false
   adaptive_cosine_margin: 0.25
+  db_pose_radius_m: 60.0
+  coherence_radius_m: 40.0
+  graph_filter:
+    enabled: false
+    mode: filter
+    min_matches: 12
+    min_component_size: 8
+    min_degree: 1
+    min_keep: 24
+    keep_largest_component: true
+    score_weight: 1.0
+    soft_support_weight: 0.02
+    soft_degree_weight: 0.0
+    support_normalization: max
+    soft_min_degree: 0
+  multi_hypothesis_per_anchor: 1
+  multi_hypothesis_unique_landmarks: true
+  correspondence_graph:
+    enabled: false
+    mode: rerank
+    candidates_per_anchor: 4
+    max_nodes: 768
+    min_nodes: 16
+    min_keep: 24
+    min_degree: 2
+    min_2d_distance_px: 12.0
+    max_3d_distance_m: 80.0
+    plausible_min_depth_m: 1.0
+    plausible_max_depth_m: 120.0
+    spatial_sigma_m: 12.0
+    covisibility_weight: 0.75
+    spatial_weight: 0.35
+    bearing_weight: 0.25
+    score_weight: 1.0
+    support_weight: 1.0
+    degree_weight: 0.25
+    support_normalization: sqrt_degree
+    belief_iterations: 2
+    belief_temperature: 1.0
+    merge_fallback: true
+    require_covisibility: false
   fine_rerank:
     enabled: true
-    method: xfeat
+    method: superpoint_h5
+    db_features_path: outputs/loo_aachen_benchmark/loo_aachen_500/hloc_sp_sg/artifacts/feats-superpoint-n4096-rmax1600_db.h5
+    query_features_path: outputs/loo_aachen_benchmark/loo_aachen_500/hloc_sp_sg/artifacts/feats-superpoint-n4096-rmax1600_queries.h5
     patch_size: 24
     xfeat_topk: 4096
-    match_radius_px: 12.0
-    topk: 6
-    max_obs_per_landmark: 4
+    match_radius_px: 8.0
+    topk: 40
+    max_obs_per_landmark: 2
+    store_observation_descs: true
+    fine_mu_norm_chunk: 65536
     weight: 1.0
     support_weight: 0.05
-    fuse_coarse: false
+    fuse_coarse: true
     coarse_weight: 0.15
     min_score: -1.0e9
     ratio_margin: 0.0
-    require_descriptor: false
+    require_descriptor: true
+  pairwise_verifier:
+    enabled: true
+    topk_db_images: 5
+    trigger_min_inliers: 20
+    replace_below_inliers: 20
+    accept_min_inliers: 12
+    # Uses real HLoc SuperGlue matches when the query/db pair exists in this
+    # file. Leave-one-out DB queries are not in the HLoc match file, so they
+    # fall back to SuperPoint mutual-nearest matching unless fresh SuperGlue
+    # pairs are generated for that split.
+    matches_path: outputs/loo_aachen_benchmark/loo_aachen_500/hloc_sp_sg/artifacts/feats-superpoint-n4096-rmax1600_matches-superglue_pairs-loo-netvlad50.h5
+    allow_mutual_fallback: true
+    max_keypoints: 2048
+    match_score_thresh: 0.2
+    lift_radius_px: 4.0
+    max_matches: 2048
+    reproj_error_px: 8.0
+    iterations: 8000
   early_geometry:
     enabled: true
     min_matches: 12

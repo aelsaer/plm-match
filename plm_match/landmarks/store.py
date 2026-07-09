@@ -10,14 +10,19 @@ import numpy as np
 from plm_match.types import Landmark, LandmarkObservation, LandmarkCandidateSet
 from plm_match.landmarks.manifold import compute_landmark_ppca
 from plm_match.landmarks.memory import _view_diversity_score, _view_envelope_stats
-from plm_match.fine_features import LRUGrayImageCache, LocalPatchDescriptor, get_gray_frame
+from plm_match.fine_features import (
+    LRUGrayImageCache,
+    LocalPatchDescriptor,
+    get_gray_frame,
+    is_h5_local_feature_method,
+)
 from plm_match.landmarks.staticness import compute_staticness
 from plm_match.utils.interp import bilinear_sample_token_descriptor
 from plm_match.utils.io import read_image
 from plm_match.utils.pose import camera_center_from_Twc
 
 
-@dataclass
+@dataclass(slots=True)
 class FeatureCacheEntry:
     tokens: np.ndarray
     token_xy: np.ndarray
@@ -76,6 +81,18 @@ class CompactLandmarkStore:
         image_to_landmarks: Optional[Dict[int, np.ndarray]] = None,
         cache_basis_rank: int = 0,
         fine_mu: np.ndarray | None = None,
+        fine_obs_descs: np.ndarray | None = None,
+        fine_basis: np.ndarray | None = None,
+        fine_eigvals: np.ndarray | None = None,
+        fine_sigma_perp2: np.ndarray | None = None,
+        graph_offsets: np.ndarray | None = None,
+        graph_indices: np.ndarray | None = None,
+        graph_weights: np.ndarray | None = None,
+        obs_assoc_px: np.ndarray | None = None,
+        obs_sp_score: np.ndarray | None = None,
+        obs_track_len: np.ndarray | None = None,
+        obs_track_reproj_error: np.ndarray | None = None,
+        obs_track_parallax: np.ndarray | None = None,
     ):
         self.ids = ids
         self.xyz = xyz
@@ -99,6 +116,52 @@ class CompactLandmarkStore:
         self.image_to_landmarks = image_to_landmarks or {}
         self.cache_basis_rank = int(cache_basis_rank) if cache_basis_rank is not None else basis_rank
         self.fine_mu = fine_mu
+        self.fine_obs_descs = fine_obs_descs
+        self.fine_basis = fine_basis
+        self.fine_eigvals = fine_eigvals
+        self.fine_sigma_perp2 = fine_sigma_perp2
+        n_obs_total = int(obs_frame_ids.shape[0])
+        self.obs_assoc_px = (
+            obs_assoc_px
+            if obs_assoc_px is not None
+            else np.zeros((n_obs_total,), dtype=np.float16)
+        )
+        self.obs_sp_score = (
+            obs_sp_score
+            if obs_sp_score is not None
+            else np.zeros((n_obs_total,), dtype=np.float16)
+        )
+        self.obs_track_len = (
+            obs_track_len
+            if obs_track_len is not None
+            else np.zeros((n_obs_total,), dtype=np.uint16)
+        )
+        self.obs_track_reproj_error = (
+            obs_track_reproj_error
+            if obs_track_reproj_error is not None
+            else np.zeros((n_obs_total,), dtype=np.float16)
+        )
+        self.obs_track_parallax = (
+            obs_track_parallax
+            if obs_track_parallax is not None
+            else np.zeros((n_obs_total,), dtype=np.float16)
+        )
+        self.graph_offsets = (
+            graph_offsets
+            if graph_offsets is not None
+            else np.zeros((ids.shape[0] + 1,), dtype=np.int64)
+        )
+        self.graph_indices = (
+            graph_indices
+            if graph_indices is not None
+            else np.zeros((0,), dtype=np.int32)
+        )
+        self.graph_weights = (
+            graph_weights
+            if graph_weights is not None
+            else np.zeros((0,), dtype=np.float16)
+        )
+        self._id_to_index: dict[int, int] | None = None
 
     @property
     def num_landmarks(self) -> int:
@@ -133,6 +196,158 @@ class CompactLandmarkStore:
         self.image_to_landmarks = compact
         return compact
 
+    @property
+    def has_landmark_graph(self) -> bool:
+        return (
+            self.graph_offsets is not None
+            and self.graph_indices is not None
+            and int(self.graph_indices.shape[0]) > 0
+            and int(self.graph_offsets.shape[0]) == int(self.num_landmarks + 1)
+        )
+
+    @property
+    def has_fine_observation_memory(self) -> bool:
+        return (
+            self.fine_obs_descs is not None
+            and self.fine_obs_descs.ndim == 2
+            and int(self.fine_obs_descs.shape[0]) == int(self.obs_frame_ids.shape[0])
+            and int(self.fine_obs_descs.shape[1]) > 0
+        )
+
+    @property
+    def has_fine_ppca_memory(self) -> bool:
+        return (
+            self.fine_mu is not None
+            and self.fine_basis is not None
+            and self.fine_eigvals is not None
+            and self.fine_sigma_perp2 is not None
+            and getattr(self.fine_basis, 'ndim', 0) == 3
+            and getattr(self.fine_eigvals, 'ndim', 0) == 2
+            and int(self.fine_basis.shape[0]) == int(self.num_landmarks)
+            and int(self.fine_eigvals.shape[0]) == int(self.num_landmarks)
+            and int(self.fine_sigma_perp2.shape[0]) == int(self.num_landmarks)
+            and int(self.fine_basis.shape[2]) > 0
+        )
+
+    def _ensure_id_to_index(self) -> dict[int, int]:
+        if self._id_to_index is None:
+            self._id_to_index = {int(lid): int(i) for i, lid in enumerate(np.asarray(self.ids).tolist())}
+        return self._id_to_index
+
+    def indices_for_landmark_ids(self, landmark_ids: Sequence[int]) -> np.ndarray:
+        lookup = self._ensure_id_to_index()
+        return np.asarray([lookup.get(int(lid), -1) for lid in landmark_ids], dtype=np.int64)
+
+    def build_covisibility_graph(
+        self,
+        *,
+        topk_neighbors: int = 16,
+        max_landmarks_per_image: int = 128,
+        per_image_neighbors: int = 4,
+        max_edge_distance_m: float | None = 8.0,
+    ) -> None:
+        """Build a bounded landmark graph from per-image covisibility.
+
+        For each database image, take the strongest visible landmarks, connect
+        each landmark to a few spatial nearest co-visible landmarks, and keep a
+        bounded top-k neighborhood per node. This avoids the quadratic all-pairs
+        covisibility graph that would be too large for city-scale maps.
+        """
+        if self.num_landmarks == 0 or not self.image_to_landmarks:
+            self.graph_offsets = np.zeros((self.num_landmarks + 1,), dtype=np.int64)
+            self.graph_indices = np.zeros((0,), dtype=np.int32)
+            self.graph_weights = np.zeros((0,), dtype=np.float16)
+            return
+
+        topk_neighbors = max(1, int(topk_neighbors))
+        max_landmarks_per_image = max(2, int(max_landmarks_per_image))
+        per_image_neighbors = max(1, int(per_image_neighbors))
+        max_edge_distance = None if max_edge_distance_m is None else float(max_edge_distance_m)
+        # Per-node dicts are created only for landmarks that receive edges.
+        # Each dict is bounded to keep memory predictable during graph build.
+        cap_per_node = max(topk_neighbors, min(topk_neighbors * 2, topk_neighbors + per_image_neighbors * 2))
+        neighbors_by_node: dict[int, dict[int, float]] = {}
+
+        try:
+            from scipy.spatial import cKDTree
+        except Exception:  # pragma: no cover - scipy is present in our envs
+            cKDTree = None
+
+        def add_edge(src: int, dst: int, weight: float) -> None:
+            if src == dst:
+                return
+            bucket = neighbors_by_node.setdefault(int(src), {})
+            dst = int(dst)
+            prev = bucket.get(dst)
+            if prev is not None:
+                bucket[dst] = float(prev) + float(weight)
+                return
+            if len(bucket) < cap_per_node:
+                bucket[dst] = float(weight)
+                return
+            # Keep only useful candidates when the temporary bucket is full.
+            min_key = min(bucket, key=bucket.get)
+            if float(weight) > float(bucket[min_key]):
+                del bucket[min_key]
+                bucket[dst] = float(weight)
+
+        for idxs_raw in self.image_to_landmarks.values():
+            idxs = np.asarray(idxs_raw, dtype=np.int64)
+            if idxs.shape[0] < 2:
+                continue
+            if idxs.shape[0] > max_landmarks_per_image:
+                idxs = idxs[:max_landmarks_per_image]
+            xyz = self.xyz[idxs].astype(np.float32, copy=False)
+            k = min(per_image_neighbors + 1, int(idxs.shape[0]))
+            if k <= 1:
+                continue
+            if cKDTree is not None:
+                dists, nn = cKDTree(xyz).query(xyz, k=k)
+            else:
+                diff = xyz[:, None, :] - xyz[None, :, :]
+                dist_all = np.linalg.norm(diff, axis=-1)
+                nn = np.argsort(dist_all, axis=1)[:, :k]
+                dists = np.take_along_axis(dist_all, nn, axis=1)
+            if np.ndim(nn) == 1:
+                nn = nn[:, None]
+                dists = np.asarray(dists)[:, None]
+            for row, src in enumerate(idxs.tolist()):
+                for col, dist in zip(nn[row].tolist(), np.asarray(dists[row]).tolist()):
+                    dst = int(idxs[int(col)])
+                    if dst == int(src):
+                        continue
+                    dist_f = float(dist)
+                    if max_edge_distance is not None and dist_f > max_edge_distance:
+                        continue
+                    weight = 1.0 / (1.0 + max(0.0, dist_f))
+                    add_edge(int(src), dst, weight)
+                    add_edge(dst, int(src), weight)
+
+        offsets = np.zeros((self.num_landmarks + 1,), dtype=np.int64)
+        total_edges = 0
+        compact_neighbors: dict[int, list[tuple[int, float]]] = {}
+        for node, nbrs in neighbors_by_node.items():
+            ranked = sorted(nbrs.items(), key=lambda item: item[1], reverse=True)[:topk_neighbors]
+            if not ranked:
+                continue
+            compact_neighbors[int(node)] = [(int(n), float(w)) for n, w in ranked]
+            total_edges += len(ranked)
+        indices = np.zeros((total_edges,), dtype=np.int32)
+        weights = np.zeros((total_edges,), dtype=np.float16)
+        ptr = 0
+        for node in range(self.num_landmarks):
+            offsets[node] = ptr
+            ranked = compact_neighbors.get(node)
+            if ranked:
+                for nbr, weight in ranked:
+                    indices[ptr] = int(nbr)
+                    weights[ptr] = np.float16(weight)
+                    ptr += 1
+        offsets[self.num_landmarks] = ptr
+        self.graph_offsets = offsets
+        self.graph_indices = indices[:ptr]
+        self.graph_weights = weights[:ptr]
+
     def save(self, root: str | Path) -> None:
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
@@ -154,6 +369,24 @@ class CompactLandmarkStore:
         np.save(root / 'obs_offsets.npy', self.obs_offsets)
         np.save(root / 'obs_frame_ids.npy', self.obs_frame_ids)
         np.save(root / 'obs_uvs.npy', self.obs_uvs)
+        optional_obs_arrays = {
+            'obs_assoc_px.npy': getattr(self, 'obs_assoc_px', None),
+            'obs_sp_score.npy': getattr(self, 'obs_sp_score', None),
+            'obs_track_len.npy': getattr(self, 'obs_track_len', None),
+            'obs_track_reproj_error.npy': getattr(self, 'obs_track_reproj_error', None),
+            'obs_track_parallax.npy': getattr(self, 'obs_track_parallax', None),
+        }
+        for name, arr in optional_obs_arrays.items():
+            save_arr = False
+            if arr is not None and int(getattr(arr, 'shape', (0,))[0]) == int(self.obs_frame_ids.shape[0]):
+                arr_np = np.asarray(arr)
+                if arr_np.size > 0:
+                    finite = np.isfinite(arr_np.astype(np.float32, copy=False))
+                    save_arr = bool(np.any(finite & (arr_np != 0)))
+            if save_arr:
+                np.save(root / name, arr)
+            else:
+                (root / name).unlink(missing_ok=True)
         index_dir = root / 'image_to_landmarks'
         index_dir.mkdir(parents=True, exist_ok=True)
         for p in index_dir.glob('*.npy'):
@@ -162,6 +395,26 @@ class CompactLandmarkStore:
             np.save(index_dir / f'{int(fid)}.npy', idxs.astype(np.int32))
         if self.fine_mu is not None:
             np.save(root / 'fine_mu.npy', self.fine_mu)
+        else:
+            (root / 'fine_mu.npy').unlink(missing_ok=True)
+        if self.fine_obs_descs is not None:
+            np.save(root / 'fine_obs_descs.npy', self.fine_obs_descs)
+        else:
+            (root / 'fine_obs_descs.npy').unlink(missing_ok=True)
+        if self.has_fine_ppca_memory:
+            np.save(root / 'fine_basis.npy', self.fine_basis)
+            np.save(root / 'fine_eigvals.npy', self.fine_eigvals)
+            np.save(root / 'fine_sigma_perp2.npy', self.fine_sigma_perp2)
+        else:
+            for name in ('fine_basis.npy', 'fine_eigvals.npy', 'fine_sigma_perp2.npy'):
+                (root / name).unlink(missing_ok=True)
+        if self.has_landmark_graph:
+            np.save(root / 'graph_offsets.npy', self.graph_offsets)
+            np.save(root / 'graph_indices.npy', self.graph_indices)
+            np.save(root / 'graph_weights.npy', self.graph_weights)
+        else:
+            for name in ('graph_offsets.npy', 'graph_indices.npy', 'graph_weights.npy'):
+                (root / name).unlink(missing_ok=True)
         meta = {'cache_basis_rank': int(self.cache_basis_rank)}
         (root / 'meta.json').write_text(json.dumps(meta), encoding='utf-8')
 
@@ -223,6 +476,44 @@ class CompactLandmarkStore:
         )
         fine_mu_path = root / 'fine_mu.npy'
         fine_mu = np.load(fine_mu_path, mmap_mode=mmap_mode) if fine_mu_path.exists() else None
+        fine_obs_descs_path = root / 'fine_obs_descs.npy'
+        fine_obs_descs = (
+            np.load(fine_obs_descs_path, mmap_mode=mmap_mode)
+            if fine_obs_descs_path.exists()
+            else None
+        )
+        fine_basis_path = root / 'fine_basis.npy'
+        fine_eigvals_path = root / 'fine_eigvals.npy'
+        fine_sigma_perp2_path = root / 'fine_sigma_perp2.npy'
+        fine_basis = np.load(fine_basis_path, mmap_mode=mmap_mode) if fine_basis_path.exists() else None
+        fine_eigvals = np.load(fine_eigvals_path, mmap_mode=mmap_mode) if fine_eigvals_path.exists() else None
+        fine_sigma_perp2 = (
+            np.load(fine_sigma_perp2_path, mmap_mode=mmap_mode)
+            if fine_sigma_perp2_path.exists()
+            else None
+        )
+        graph_offsets_path = root / 'graph_offsets.npy'
+        graph_indices_path = root / 'graph_indices.npy'
+        graph_weights_path = root / 'graph_weights.npy'
+        graph_offsets = (
+            np.load(graph_offsets_path, mmap_mode=mmap_mode)
+            if graph_offsets_path.exists()
+            else None
+        )
+        graph_indices = (
+            np.load(graph_indices_path, mmap_mode=mmap_mode)
+            if graph_indices_path.exists()
+            else None
+        )
+        graph_weights = (
+            np.load(graph_weights_path, mmap_mode=mmap_mode)
+            if graph_weights_path.exists()
+            else None
+        )
+        def load_optional_obs(name: str):
+            path = root / name
+            return np.load(path, mmap_mode=mmap_mode) if path.exists() else None
+
         return cls(
             ids=ids,
             xyz=np.load(root / 'xyz.npy', mmap_mode=mmap_mode),
@@ -245,6 +536,18 @@ class CompactLandmarkStore:
             image_to_landmarks=image_to_landmarks,
             cache_basis_rank=int(meta.get('cache_basis_rank', 0)),
             fine_mu=fine_mu,
+            fine_obs_descs=fine_obs_descs,
+            fine_basis=fine_basis,
+            fine_eigvals=fine_eigvals,
+            fine_sigma_perp2=fine_sigma_perp2,
+            graph_offsets=graph_offsets,
+            graph_indices=graph_indices,
+            graph_weights=graph_weights,
+            obs_assoc_px=load_optional_obs('obs_assoc_px.npy'),
+            obs_sp_score=load_optional_obs('obs_sp_score.npy'),
+            obs_track_len=load_optional_obs('obs_track_len.npy'),
+            obs_track_reproj_error=load_optional_obs('obs_track_reproj_error.npy'),
+            obs_track_parallax=load_optional_obs('obs_track_parallax.npy'),
         )
 
     def top_landmarks(self, max_landmarks: int) -> np.ndarray:
@@ -382,18 +685,40 @@ class CompactLandmarkStore:
             if include_fine_descs and fine_extractor is not None and obs_frame_ids_view.shape[0] > 0:
                 selected_fids = obs_frame_ids_view
                 selected_uvs = obs_uvs_view
+                selected_obs_slots = np.arange(start, end, dtype=np.int64)
+                if preferred_frame_ids_arr is not None and obs_frame_ids_all.shape[0] > 0:
+                    pref_mask = np.isin(obs_frame_ids_all, preferred_frame_ids_arr)
+                    if np.any(pref_mask):
+                        selected_obs_slots = selected_obs_slots[pref_mask]
                 if max_fine_obs_per_landmark is not None and selected_fids.shape[0] > int(max_fine_obs_per_landmark):
-                    selected_fids = selected_fids[: int(max_fine_obs_per_landmark)]
-                    selected_uvs = selected_uvs[: int(max_fine_obs_per_landmark)]
+                    keep = int(max_fine_obs_per_landmark)
+                    selected_fids = selected_fids[:keep]
+                    selected_uvs = selected_uvs[:keep]
+                    selected_obs_slots = selected_obs_slots[:keep]
                 descs = []
                 valid_fids = []
-                for fid, uv in zip(selected_fids, selected_uvs):
-                    gray = get_gray_frame(int(fid), dataset=dataset, cache=fine_image_cache)
-                    desc = fine_extractor.extract_from_gray(gray, [uv])[0]
-                    if float(np.linalg.norm(desc)) <= 1e-8:
-                        continue
-                    descs.append(desc.astype(np.float32))
-                    valid_fids.append(int(fid))
+                if self.has_fine_observation_memory:
+                    for obs_slot, fid in zip(selected_obs_slots, selected_fids):
+                        desc = self.fine_obs_descs[int(obs_slot)].astype(np.float32, copy=False)
+                        if float(np.linalg.norm(desc)) <= 1e-8:
+                            continue
+                        descs.append(desc)
+                        valid_fids.append(int(fid))
+                else:
+                    for fid, uv in zip(selected_fids, selected_uvs):
+                        frame = dataset.get_map_frames()[int(fid)]
+                        frame_name = str(frame.meta.get('relative_path', frame.image_path.name))
+                        uses_h5_fine = is_h5_local_feature_method(getattr(fine_extractor, 'method', ''))
+                        gray = (
+                            np.zeros((1, 1), dtype=np.uint8)
+                            if uses_h5_fine
+                            else get_gray_frame(int(fid), dataset=dataset, cache=fine_image_cache)
+                        )
+                        desc = fine_extractor.extract_from_gray(gray, [uv], image_name=frame_name)[0]
+                        if float(np.linalg.norm(desc)) <= 1e-8:
+                            continue
+                        descs.append(desc.astype(np.float32))
+                        valid_fids.append(int(fid))
                 if descs:
                     fine_descs = np.stack(descs, axis=0).astype(np.float32)
                     fine_obs_frame_ids = valid_fids
@@ -461,6 +786,9 @@ def build_compact_store_from_groups(
             obs_uvs=np.zeros((0, 2), dtype=np.float16),
             image_to_landmarks={},
             cache_basis_rank=cache_basis_rank,
+            fine_basis=None,
+            fine_eigvals=None,
+            fine_sigma_perp2=None,
         )
 
     # infer descriptor dimensions from first valid obs
@@ -493,10 +821,12 @@ def build_compact_store_from_groups(
     max_view_cos = np.full((n_capacity,), 1.0, dtype=np.float16)
     reproj_error_mean = np.zeros((n_capacity,), dtype=np.float16)
     fine_mu_arr = np.zeros((n_capacity, d_fine), dtype=np.float16) if d_fine > 0 else None
+    fine_obs_descs_arr = np.zeros((total_obs_capacity, d_fine), dtype=np.float16) if d_fine > 0 else None
     descriptor_spread = np.zeros((n_capacity,), dtype=np.float16)
     obs_offsets = np.zeros((n_capacity + 1,), dtype=np.int64)
     obs_frame_ids = np.zeros((total_obs_capacity,), dtype=np.int32)
     obs_uvs = np.zeros((total_obs_capacity, 2), dtype=np.float16)
+    obs_reproj_errors = np.zeros((total_obs_capacity,), dtype=np.float16)
 
     lm_ptr = 0
     obs_ptr = 0
@@ -561,6 +891,9 @@ def build_compact_store_from_groups(
         for obs in observations:
             obs_frame_ids[obs_ptr] = int(obs.frame_id)
             obs_uvs[obs_ptr] = np.asarray(obs.uv, dtype=np.float16)
+            obs_reproj_errors[obs_ptr] = np.float16(float(obs.reproj_error))
+            if fine_obs_descs_arr is not None and obs.fine_desc is not None:
+                fine_obs_descs_arr[obs_ptr] = np.asarray(obs.fine_desc, dtype=np.float16)
             obs_ptr += 1
     obs_offsets[lm_ptr] = obs_ptr
     store = CompactLandmarkStore(
@@ -585,6 +918,11 @@ def build_compact_store_from_groups(
         image_to_landmarks={},
         cache_basis_rank=cache_basis_rank,
         fine_mu=fine_mu_arr[:lm_ptr] if fine_mu_arr is not None else None,
+        fine_obs_descs=fine_obs_descs_arr[:obs_ptr] if fine_obs_descs_arr is not None else None,
+        fine_basis=None,
+        fine_eigvals=None,
+        fine_sigma_perp2=None,
+        obs_track_reproj_error=obs_reproj_errors[:obs_ptr],
     )
     store.build_image_to_landmarks_index()
     return store

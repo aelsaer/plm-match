@@ -1,0 +1,52 @@
+dataset_root: .
+
+dataset:
+  type: colmap_localization
+  scene: ShopFacade
+  image_root: datasets/cambridge_landmarks/ShopFacade
+  model_path: outputs/cambridge_shopfacade_lifted/colmap_model
+  db_image_names_file: outputs/cambridge_shopfacade_lifted/split/map_images.txt
+  query_list: outputs/cambridge_shopfacade_lifted/split/query_list.txt
+  query_gt_pose_dir: outputs/cambridge_shopfacade_lifted/split/query_gt_pose_dir
+  default_query_camera_from_first_map: true
+
+reporting:
+  benchmark: cambridge_landmarks
+
+hloc:
+  retrieval_file: outputs/cambridge_shopfacade_lifted/retrieval/pairs-loo-netvlad20.txt
+  topk_db_images: 20
+
+matching:
+  fine_rerank:
+    enabled: true
+    method: superpoint_h5
+    db_features_path: outputs/cambridge_shopfacade_lifted/sp_features/feats-superpoint-n4096-rmax1600_db.h5
+    query_features_path: outputs/cambridge_shopfacade_lifted/sp_features/feats-superpoint-n4096-rmax1600_queries.h5
+    patch_size: 24
+    xfeat_topk: 4096
+    match_radius_px: 8.0
+
+lifted_nn:
+  topk: 20
+  query_topk: 4096
+  ratio_margin: 0.10
+  min_similarity: 0.65
+  support_weight: 0.03
+  point_support_weight: 0.02
+  rank_weight: 0.02
+  attach_dist_weight: 0.0
+  rank_tau: 10.0
+  min_shared_points: 20
+  max_cluster_images: 5
+  max_cluster_seeds: 10
+  max_matches: 4096
+  pnp_first_thresh: 8.0
+  pnp_refine_thresh: 4.0
+  pnp_iterations: 8000
+  min_final_inliers: 12
+  min_pose_guided_inliers: 16
+  pose_guided: false
+  pose_guided_radius_px: 8.0
+  pose_guided_score_thresh: 0.1
+  pose_guided_reproj_penalty: 0.02

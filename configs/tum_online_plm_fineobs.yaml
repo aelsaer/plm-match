@@ -1,0 +1,108 @@
+dataset_root: datasets/tum_rgbd/sequences/rgbd_dataset_freiburg1_desk
+out_dir: outputs/tum_rgbd/fr1_desk_plm_fineobs
+
+sequence_dataset:
+  type: tum_rgbd_sequence
+  rgb_file: rgb.txt
+  depth_file: depth.txt
+  groundtruth_file: groundtruth.txt
+  preset: fr1
+  stride: 1
+  max_frames: 700
+  max_assoc_delta: 0.02
+  pose_assoc_delta: 0.05
+
+backbone:
+  name: dinov2
+  model_name: dinov2_vits14
+  input_size: [336, 336]
+  device: cuda
+  feature_cache:
+    enabled: true
+    cache_dir: outputs/tum_rgbd/feature_cache/dinov2_vits14_336
+    dtype: float16
+    compress: false
+
+anchors:
+  source: gftt
+  alpha: 0.60
+  beta: 0.40
+  use_stability: false
+  topk: 600
+  keypoint_max_corners: 1600
+  keypoint_quality_level: 0.003
+  keypoint_min_distance_px: 6.0
+  keypoint_nms_radius_px: 6.0
+  keypoint_weight: 1.0
+  grid_cells: [8, 8]
+  nms_radius: 1
+
+landmarks:
+  merge_radius_m: 0.04
+  merge_cos_sim: 0.65
+  manifold_rank: 2
+  min_obs: 2
+  min_staticness: 0.0
+
+matching:
+  topk_landmarks: 32
+  max_matches: 512
+  min_match_guarantee: 0
+  adaptive_min_cosine: false
+  min_cosine_sim: -1.0
+  min_score: -1000000000.0
+  ratio_margin: 0.03
+  materialize_topk_per_anchor: 2
+  multi_hypothesis_per_anchor: 1
+  use_pose_prior: true
+  carry_pose_prior: true
+  lambdas: [1.0, 1.2, 0.6, 0.3, 0.4]
+  local_memory:
+    enabled: true
+    direct_score: true
+    max_obs_per_landmark: 8
+    topk_observations_per_anchor: 192
+    landmarks_per_anchor: 2
+    fine_weight: 1.0
+    eupe_prior_weight: 0.0
+    mean_weight: 0.0
+    support_weight: 0.0
+    staticness_weight: 0.0
+    graph_support_weight: 0.0
+    ppca:
+      enabled: false
+    vps:
+      enabled: false
+      num_words: 256
+      top_words: 4
+      target_correspondences: 0
+      topk_observations_per_anchor: 128
+      max_train_descriptors: 16384
+      iterations: 4
+      batch_size: 8192
+      max_bucket_size: 4096
+      skip_large_buckets: false
+      min_similarity: -1.0
+  fine_rerank:
+    enabled: false
+    method: sift
+    patch_size: 24
+    max_obs_per_landmark: 8
+  graph_filter:
+    enabled: false
+  correspondence_graph:
+    enabled: false
+
+pnp:
+  reproj_error_px: 6.0
+  iterations: 2000
+  multi_pass: false
+
+online:
+  use_gt_bootstrap: true
+  bootstrap_count: 20
+  max_age_frames: 80
+  max_active_landmarks: 12000
+  integrate_on_success: true
+  integrate_pose_source: pred
+  min_staticness: 0.0

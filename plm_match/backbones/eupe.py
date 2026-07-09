@@ -8,6 +8,7 @@ import torch
 import cv2
 
 from .base import BaseFeatureExtractor
+from .resize import ResizeInfo, resize_for_patch_backbone, token_xy_from_resize
 
 
 def _ensure_writable_torch_hub_dir() -> None:
@@ -31,12 +32,14 @@ class EUPEFeatureExtractor(BaseFeatureExtractor):
         weights_path: str | None = None,
         model_name: str = 'eupe_vits16',
         input_size: Tuple[int, int] = (256, 256),
+        resize_mode: str = 'square',
         device: str = 'cpu',
     ):
         self.repo_dir = repo_dir
         self.weights_path = weights_path
         self.model_name = model_name
         self.input_size = input_size
+        self.resize_mode = str(resize_mode or 'square').lower()
         self._device = device
         self._use_cuda = str(device).startswith('cuda') and torch.cuda.is_available()
         if self._use_cuda:
@@ -65,17 +68,21 @@ class EUPEFeatureExtractor(BaseFeatureExtractor):
     def name(self) -> str:
         return self.model_name
 
-    def _prep(self, image: np.ndarray) -> torch.Tensor:
-        h, w = self.input_size
-        img = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+    def _prep(self, image: np.ndarray) -> tuple[torch.Tensor, ResizeInfo]:
+        img_resized, info = resize_for_patch_backbone(
+            image,
+            self.input_size,
+            patch_size=self.patch,
+            mode=self.resize_mode,
+        )
+        img = img_resized.astype(np.float32) / 255.0
         x = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(self._device)
         x = (x - self.mean) / self.std
-        return x
+        return x, info
 
     @torch.no_grad()
     def extract(self, image: np.ndarray) -> Dict[str, object]:
-        orig_h, orig_w = image.shape[:2]
-        x = self._prep(image)
+        x, resize_info = self._prep(image)
         if self._use_cuda:
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 feats = self.model.forward_features(x)
@@ -83,15 +90,13 @@ class EUPEFeatureExtractor(BaseFeatureExtractor):
             feats = self.model.forward_features(x)
         patch_tokens = feats['x_norm_patchtokens'][0].detach().cpu().numpy()
         cls_token = feats['x_norm_clstoken'][0].detach().cpu()
-        Ht = self.input_size[0] // self.patch
-        Wt = self.input_size[1] // self.patch
+        Ht = int(x.shape[-2]) // self.patch
+        Wt = int(x.shape[-1]) // self.patch
         tokens = patch_tokens.reshape(Ht, Wt, -1).astype(np.float32)
         tokens = tokens / (np.linalg.norm(tokens, axis=-1, keepdims=True) + 1e-8)
-        yy, xx = np.meshgrid(np.linspace(0.0, 1.0, Ht, dtype=np.float32),
-                             np.linspace(0.0, 1.0, Wt, dtype=np.float32), indexing='ij')
-        token_xy = np.stack([xx * (orig_w - 1), yy * (orig_h - 1)], axis=-1)
+        token_xy = token_xy_from_resize(resize_info, patch_size=self.patch, grid_h=Ht, grid_w=Wt)
         return {
             'tokens': tokens,
-            'token_xy': token_xy.astype(np.float32),
+            'token_xy': token_xy,
             'global_desc': cls_token,
         }

@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 
-@dataclass
+@dataclass(slots=True)
 class Anchor:
     uv: np.ndarray                 # [2] pixel coordinates (x, y)
     desc: np.ndarray               # [D] L2-normalized descriptor
@@ -15,7 +15,7 @@ class Anchor:
     fine_desc: Optional[np.ndarray] = None
 
 
-@dataclass
+@dataclass(slots=True)
 class TrackObservation:
     frame_id: int
     uv: np.ndarray
@@ -23,14 +23,14 @@ class TrackObservation:
     score: float
 
 
-@dataclass
+@dataclass(slots=True)
 class Track:
     id: int
     observations: List[TrackObservation] = field(default_factory=list)
     alive: bool = True
 
 
-@dataclass
+@dataclass(slots=True)
 class LandmarkObservation:
     frame_id: int
     uv: np.ndarray
@@ -41,7 +41,7 @@ class LandmarkObservation:
     fine_desc: Optional[np.ndarray] = None
 
 
-@dataclass
+@dataclass(slots=True)
 class Landmark:
     id: int
     xyz: Optional[np.ndarray]
@@ -66,7 +66,7 @@ class Landmark:
     observed_image_names: List[str] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class LandmarkCandidateSet:
     landmarks: List[Landmark]
     mus: Optional[np.ndarray] = None
@@ -74,7 +74,7 @@ class LandmarkCandidateSet:
     lazy_context: object = None
 
 
-@dataclass
+@dataclass(slots=True)
 class LandmarkCandidateGroup:
     image_names: Tuple[str, ...] = field(default_factory=tuple)
     frame_ids: Tuple[int, ...] = field(default_factory=tuple)
@@ -83,14 +83,14 @@ class LandmarkCandidateGroup:
     lazy_context: object = None
 
 
-@dataclass
+@dataclass(slots=True)
 class LandmarkCandidateSchedule:
     groups: List[LandmarkCandidateGroup] = field(default_factory=list)
     stages: List[int] = field(default_factory=list)
     meta: dict[str, object] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class Match3D2D:
     landmark_id: int
     uv_query: np.ndarray
@@ -99,7 +99,7 @@ class Match3D2D:
     anchor_idx: int
 
 
-@dataclass
+@dataclass(slots=True)
 class PoseResult:
     success: bool
     T_wc: Optional[np.ndarray]

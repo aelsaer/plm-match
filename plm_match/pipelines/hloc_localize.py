@@ -10,7 +10,7 @@ from plm_match.pipelines.localize_from_map import PLMMapLocalizer
 from plm_match.types import LandmarkCandidateGroup, LandmarkCandidateSchedule
 from plm_match.utils.config import load_config
 from plm_match.utils.io import ensure_dir, write_json
-from plm_match.utils.pose import invert_pose, pose_to_quat_t
+from plm_match.utils.pose import camera_center_from_Twc, invert_pose, pose_to_quat_t
 
 
 def write_hloc_results(path: str | Path, rows: list[tuple[str, object]]) -> None:
@@ -100,6 +100,8 @@ def main() -> None:
     grouping_method = str(cfg.get('hloc', {}).get('grouping', 'covisibility')).lower()
     manifold_rank = int(cfg.get('landmarks', {}).get('manifold_rank', 0))
     include_view = float(cfg.get('matching', {}).get('lambdas', [0, 0, 0, 0, 0])[3]) != 0.0
+    db_pose_radius_m = cfg.get('matching', {}).get('db_pose_radius_m', None)
+    db_pose_radius_m = float(db_pose_radius_m) if db_pose_radius_m is not None else None
 
     # Build compact HLoc candidate provider directly from the compact store if available.
     if localizer.landmark_store is None:
@@ -150,6 +152,17 @@ def main() -> None:
             per_image_candidate_budget = max(1, int(np.ceil(float(max_candidate_landmarks) / float(max_stage_images))))
         if db_names:
             valid_pairs = [(name, name_to_frame_id[name]) for name in db_names if name in name_to_frame_id]
+            # Spatial prior: restrict landmarks to those within db_pose_radius_m of
+            # the top retrieved db camera. Prevents matching to the wrong city block.
+            spatial_mask: np.ndarray | None = None
+            if db_pose_radius_m is not None and valid_pairs:
+                top_frame = map_frames[valid_pairs[0][1]]
+                if top_frame.pose is not None:
+                    top_center = camera_center_from_Twc(top_frame.pose).astype(np.float64)
+                    dists = np.linalg.norm(
+                        store.xyz.astype(np.float64) - top_center, axis=1
+                    )
+                    spatial_mask = dists <= float(db_pose_radius_m)
             if grouping_method == 'covisibility':
                 grouped_pairs = _covisibility_groups(valid_pairs, store, verify_image_batch_size)
             else:
@@ -164,6 +177,8 @@ def main() -> None:
                     for idx in idxs:
                         idx = int(idx)
                         if idx in seen:
+                            continue
+                        if spatial_mask is not None and not spatial_mask[idx]:
                             continue
                         seen.add(idx)
                         merged_list.append(idx)
