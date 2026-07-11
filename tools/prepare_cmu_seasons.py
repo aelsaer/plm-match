@@ -248,7 +248,10 @@ def _write_config(
     model_path: Path,
     query_list: Path,
     topk: int,
+    feature_method: str,
+    feature_dir_name: str,
 ) -> None:
+    feature_dir = out_dir / feature_dir_name
     text = f"""dataset_root: .
 out_dir: {out_dir.as_posix()}
 
@@ -267,9 +270,9 @@ retrieval:
 
 matching:
   fine_rerank:
-    method: superpoint_h5
-    db_features_path: {out_dir / 'sp_features' / 'db.h5'}
-    query_features_path: {out_dir / 'sp_features' / 'query.h5'}
+    method: {feature_method}
+    db_features_path: {feature_dir / 'db.h5'}
+    query_features_path: {feature_dir / 'query.h5'}
     patch_size: 24
     min_similarity: 0.65
     ratio_margin: 0.10
@@ -297,6 +300,8 @@ def main() -> None:
     parser.add_argument("--extract_images", choices=("auto", "0", "1"), default="auto")
     parser.add_argument("--overwrite_extract", action="store_true")
     parser.add_argument("--skip_model_conversion", action="store_true")
+    parser.add_argument("--feature_method", default="superpoint_h5")
+    parser.add_argument("--feature_dir_name", default="sp_features")
     parser.add_argument("--config_out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -382,6 +387,8 @@ def main() -> None:
         model_path=model_path,
         query_list=query_list,
         topk=int(args.topk),
+        feature_method=str(args.feature_method),
+        feature_dir_name=str(args.feature_dir_name),
     )
     summary = {
         "dataset_root": str(dataset_root),

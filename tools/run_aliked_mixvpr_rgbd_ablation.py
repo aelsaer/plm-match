@@ -204,7 +204,16 @@ def main() -> None:
     parser.add_argument("--point_memory_max_obs", type=int, default=4)
     parser.add_argument(
         "--point_memory_obs_select",
-        choices=("all", "first", "uniform", "random", "diverse_desc", "fixed_fps", "adaptive_cover"),
+        choices=(
+            "all",
+            "first",
+            "uniform",
+            "random",
+            "diverse_desc",
+            "fixed_fps",
+            "adaptive_cover",
+            "adaptive_cover_farthest",
+        ),
         default="first",
     )
     parser.add_argument("--point_memory_adaptive_k_min", type=int, default=1)

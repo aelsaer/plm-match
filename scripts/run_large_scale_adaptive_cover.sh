@@ -67,10 +67,17 @@ case "$FEATURE" in
     ;;
 esac
 AACHEN_TOPK=${AACHEN_TOPK:-50}
+AACHEN_PLM_RETRIEVAL_METHOD=${AACHEN_PLM_RETRIEVAL_METHOD:-mixvpr}
+AACHEN_PLM_RETRIEVAL_FILE=${AACHEN_PLM_RETRIEVAL_FILE:-}
+AACHEN_HLOC_RETRIEVAL_FILE=${AACHEN_HLOC_RETRIEVAL_FILE:-}
+AACHEN_RUN_TAG=${AACHEN_RUN_TAG:-}
+AACHEN_LOCAL_MAX_KEYPOINTS=${AACHEN_LOCAL_MAX_KEYPOINTS:-4096}
+AACHEN_LOCAL_RESIZE_MAX=${AACHEN_LOCAL_RESIZE_MAX:-1600}
 ROBOTCAR_TOPK=${ROBOTCAR_TOPK:-$TOPK}
 CMU_TOPK=${CMU_TOPK:-$TOPK}
 QUERY_TOPK=${QUERY_TOPK:-4096}
 MAX_QUERIES=${MAX_QUERIES:-}
+AACHEN_MAX_QUERIES=${AACHEN_MAX_QUERIES:-$MAX_QUERIES}
 ROBOTCAR_MAX_QUERIES=${ROBOTCAR_MAX_QUERIES:-$MAX_QUERIES}
 CMU_MAX_QUERIES=${CMU_MAX_QUERIES:-$MAX_QUERIES}
 
@@ -92,16 +99,30 @@ OVERWRITE=${OVERWRITE:-0}
 
 POINT_MEMORY_MAX_OBS=${POINT_MEMORY_MAX_OBS:-0}
 POINT_MEMORY_OBS_SELECT=${POINT_MEMORY_OBS_SELECT:-adaptive_cover}
+POINT_MEMORY_OBS_TAG=${POINT_MEMORY_OBS_TAG:-$POINT_MEMORY_OBS_SELECT}
 POINT_MEMORY_ADAPTIVE_K_MIN=${POINT_MEMORY_ADAPTIVE_K_MIN:-1}
 POINT_MEMORY_ADAPTIVE_K_MAX=${POINT_MEMORY_ADAPTIVE_K_MAX:-32}
 POINT_MEMORY_ADAPTIVE_MIN_GAIN=${POINT_MEMORY_ADAPTIVE_MIN_GAIN:-0.005}
 POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH=${POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH:-2.0}
 POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ=${POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ:-4.0}
 POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT=${POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT:-0.0}
-RESULT_NAME=${RESULT_NAME:-plmloc_${FEATURE}_adaptive_cover_k${POINT_MEMORY_ADAPTIVE_K_MIN}_${POINT_MEMORY_ADAPTIVE_K_MAX}_gain${POINT_MEMORY_ADAPTIVE_MIN_GAIN/./}}
+POINT_MEMORY_ADAPTIVE_S_MIN=${POINT_MEMORY_ADAPTIVE_S_MIN:-0.80}
+POINT_MEMORY_ADAPTIVE_GATE_FRAC=${POINT_MEMORY_ADAPTIVE_GATE_FRAC:-0.30}
+PNP_FIRST_THRESH=${PNP_FIRST_THRESH:-12.0}
+PNP_REFINE_THRESH=${PNP_REFINE_THRESH:-$PNP_FIRST_THRESH}
+MIN_FINAL_INLIERS=${MIN_FINAL_INLIERS:-12}
+POSE_GUIDED=${POSE_GUIDED:-0}
+POSE_GUIDED_RADIUS_PX=${POSE_GUIDED_RADIUS_PX:-10.0}
+POSE_GUIDED_SCORE_THRESH=${POSE_GUIDED_SCORE_THRESH:-0.1}
+POSE_GUIDED_REPROJ_PENALTY=${POSE_GUIDED_REPROJ_PENALTY:-0.02}
+POSE_GUIDED_MAX_DESCS_PER_POINT=${POSE_GUIDED_MAX_DESCS_PER_POINT:-8}
+MIN_POSE_GUIDED_INLIERS=${MIN_POSE_GUIDED_INLIERS:-12}
+RESULT_NAME=${RESULT_NAME:-plmloc_${FEATURE}_${POINT_MEMORY_OBS_TAG}_k${POINT_MEMORY_ADAPTIVE_K_MIN}_${POINT_MEMORY_ADAPTIVE_K_MAX}_gain${POINT_MEMORY_ADAPTIVE_MIN_GAIN/./}}
 
 CMU_SLICES=${CMU_SLICES:-slice2,slice3,slice4,slice5,slice6,slice7,slice8,slice9,slice10,slice17,slice18,slice19,slice20,slice21,slice22,slice24,slice25}
 CMU_EXTRACT_IMAGES=${CMU_EXTRACT_IMAGES:-auto}
+CMU_LAYOUT=${CMU_LAYOUT:-auto}
+CMU_LEGACY_SPLIT_ROOT=${CMU_LEGACY_SPLIT_ROOT:-$OUTPUT_ROOT/cmu_extended_plmloc}
 ROBOTCAR_EXTRACT_IMAGES=${ROBOTCAR_EXTRACT_IMAGES:-0}
 ROBOTCAR_QUERY_CONDITIONS=${ROBOTCAR_QUERY_CONDITIONS:-}
 
@@ -125,6 +146,18 @@ find_feature() {
   printf '%s\n' "$path"
 }
 
+find_local_feature() {
+  local root="$1"
+  local pattern="$2"
+  local path
+  path="$(find "$root" -name "$pattern" ! -name "*_matches-*" -print -quit)"
+  if [[ -z "$path" ]]; then
+    echo "Could not find local feature file matching $pattern under $root" >&2
+    exit 2
+  fi
+  printf '%s\n' "$path"
+}
+
 run_plmloc() {
   local cfg="$1"
   local dataset_root="$2"
@@ -142,6 +175,17 @@ run_plmloc() {
   local max_args=()
   if [[ -n "$max_queries" ]]; then
     max_args+=(--max_queries "$max_queries")
+  fi
+  local pose_args=()
+  if [[ "$POSE_GUIDED" == "1" || "$POSE_GUIDED" == "true" || "$POSE_GUIDED" == "TRUE" ]]; then
+    pose_args+=(
+      --pose_guided
+      --pose_guided_radius_px "$POSE_GUIDED_RADIUS_PX"
+      --pose_guided_score_thresh "$POSE_GUIDED_SCORE_THRESH"
+      --pose_guided_reproj_penalty "$POSE_GUIDED_REPROJ_PENALTY"
+      --pose_guided_max_descs_per_point "$POSE_GUIDED_MAX_DESCS_PER_POINT"
+      --min_pose_guided_inliers "$MIN_POSE_GUIDED_INLIERS"
+    )
   fi
 
   "$PY" -m plm_match.pipelines.lifted_nn_localize \
@@ -164,6 +208,8 @@ run_plmloc() {
     --point_memory_adaptive_sigma_attach "$POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH" \
     --point_memory_adaptive_sigma_reproj "$POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ" \
     --point_memory_adaptive_view_weight "$POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT" \
+    --point_memory_adaptive_s_min "$POINT_MEMORY_ADAPTIVE_S_MIN" \
+    --point_memory_adaptive_gate_frac "$POINT_MEMORY_ADAPTIVE_GATE_FRAC" \
     --memory_search_backend exact \
     --topk "$topk" \
     --query_topk "$QUERY_TOPK" \
@@ -176,9 +222,10 @@ run_plmloc() {
     --attach_dist_weight 0.0 \
     --max_cluster_images 5 \
     --max_cluster_seeds 10 \
-    --pnp_first_thresh 12.0 \
-    --pnp_refine_thresh 12.0 \
-    --min_final_inliers 12 \
+    --pnp_first_thresh "$PNP_FIRST_THRESH" \
+    --pnp_refine_thresh "$PNP_REFINE_THRESH" \
+    --min_final_inliers "$MIN_FINAL_INLIERS" \
+    "${pose_args[@]}" \
     --point_memory_batch_size 128 \
     --no-log_memory_scores \
     --no-attached_index_mmap \
@@ -189,20 +236,42 @@ run_aachen() {
   require_path "$AACHEN_ROOT"
   require_path "$AACHEN_ROOT/images_upright"
   require_path "$AACHEN_ROOT/3D-models/aachen_v_1_1"
-  require_path "$AACHEN_ROOT/pairs-query-netvlad50.txt"
   require_path "$AACHEN_ROOT/day_time_queries_with_intrinsics.txt"
   require_path "$AACHEN_ROOT/queries/night_time_queries_with_intrinsics.txt"
 
   local run_root="$OUTPUT_ROOT/aachen_day_night"
-  local day_hloc="$run_root/hloc_${FEATURE}_day"
-  local night_hloc="$run_root/hloc_${FEATURE}_night"
-  local attach="$run_root/${FEATURE}_colmap_attach_hloc"
+  local aachen_retrieval_tag="${AACHEN_PLM_RETRIEVAL_METHOD}${AACHEN_TOPK}"
+  local aachen_run_tag="${AACHEN_RUN_TAG:-${FEATURE}_${aachen_retrieval_tag}}"
+  local aachen_attach_tag="${AACHEN_ATTACH_TAG:-$aachen_run_tag}"
+  local day_hloc="$run_root/hloc_${aachen_run_tag}_day"
+  local night_hloc="$run_root/hloc_${aachen_run_tag}_night"
+  local attach="$run_root/${aachen_attach_tag}_colmap_attach_hloc"
   mkdir -p "$run_root"
 
   local ow=()
   if [[ "$OVERWRITE" == "1" ]]; then
     ow+=(--overwrite)
   fi
+
+  local plm_retrieval_method="$AACHEN_PLM_RETRIEVAL_METHOD"
+  local plm_retrieval_file="$AACHEN_PLM_RETRIEVAL_FILE"
+  if [[ -z "$plm_retrieval_file" ]]; then
+    if [[ "$plm_retrieval_method" == "mixvpr" ]]; then
+      plm_retrieval_file="$AACHEN_ROOT/pairs-loo-mixvpr${AACHEN_TOPK}.txt"
+    elif [[ "$plm_retrieval_method" == "netvlad" ]]; then
+      plm_retrieval_file="$AACHEN_ROOT/pairs-query-netvlad50.txt"
+    else
+      echo "Unsupported AACHEN_PLM_RETRIEVAL_METHOD=$plm_retrieval_method" >&2
+      exit 2
+    fi
+  fi
+  require_path "$plm_retrieval_file"
+
+  local hloc_retrieval_file="$AACHEN_HLOC_RETRIEVAL_FILE"
+  if [[ -z "$hloc_retrieval_file" ]]; then
+    hloc_retrieval_file="$plm_retrieval_file"
+  fi
+  require_path "$hloc_retrieval_file"
 
   if [[ "$OVERWRITE" == "1" || ! -f "$day_hloc/run_summary.json" ]]; then
     "$PY" tools/run_hloc_baseline.py \
@@ -211,11 +280,12 @@ run_aachen() {
       --dataset_root "$AACHEN_ROOT" \
       --out_dir "$day_hloc" \
       --query_list day_time_queries_with_intrinsics.txt \
-      --retrieval_file pairs-query-netvlad50.txt \
+      --retrieval_file "$hloc_retrieval_file" \
       --hloc_root "$HLOC_ROOT" \
+      --superglue_root "$HLOC_ROOT" \
       --localizer nearest_lift \
-      --max_keypoints 4096 \
-      --resize_max 1600 \
+      --max_keypoints "$AACHEN_LOCAL_MAX_KEYPOINTS" \
+      --resize_max "$AACHEN_LOCAL_RESIZE_MAX" \
       --ransac_thresh 12.0 \
       --db_lift_thresh_px 4.0 \
       --pnp_iterations 8000 \
@@ -229,11 +299,12 @@ run_aachen() {
       --dataset_root "$AACHEN_ROOT" \
       --out_dir "$night_hloc" \
       --query_list queries/night_time_queries_with_intrinsics.txt \
-      --retrieval_file pairs-query-netvlad50.txt \
+      --retrieval_file "$hloc_retrieval_file" \
       --hloc_root "$HLOC_ROOT" \
+      --superglue_root "$HLOC_ROOT" \
       --localizer nearest_lift \
-      --max_keypoints 4096 \
-      --resize_max 1600 \
+      --max_keypoints "$AACHEN_LOCAL_MAX_KEYPOINTS" \
+      --resize_max "$AACHEN_LOCAL_RESIZE_MAX" \
       --ransac_thresh 12.0 \
       --db_lift_thresh_px 4.0 \
       --pnp_iterations 8000 \
@@ -243,9 +314,9 @@ run_aachen() {
   local db_features
   local day_query_features
   local night_query_features
-  db_features="$(find_feature "$day_hloc/artifacts" "*_db.h5")"
-  day_query_features="$(find_feature "$day_hloc/artifacts" "*_queries.h5")"
-  night_query_features="$(find_feature "$night_hloc/artifacts" "*_queries.h5")"
+  db_features="$(find_local_feature "$day_hloc/artifacts" "*_db.h5")"
+  day_query_features="$(find_local_feature "$day_hloc/artifacts" "*_queries.h5")"
+  night_query_features="$(find_local_feature "$night_hloc/artifacts" "*_queries.h5")"
 
   if [[ "$OVERWRITE" == "1" || ! -f "$attach/summary.json" ]]; then
     "$PY" tools/build_sp_colmap_attachment.py \
@@ -261,32 +332,32 @@ run_aachen() {
       --descriptor_dtype "$AACHEN_DESCRIPTOR_DTYPE" \
       --min_colmap_track_len "$MIN_COLMAP_TRACK_LEN" \
       --max_colmap_point_error "$MAX_COLMAP_POINT_ERROR" \
-      --max_keypoints 4096
+      --max_keypoints "$AACHEN_LOCAL_MAX_KEYPOINTS"
   fi
 
   run_plmloc \
     configs/aachen_v1_1_day_refactor.yaml \
     "$AACHEN_ROOT" \
     "$attach" \
-    "$AACHEN_ROOT/pairs-query-netvlad50.txt" \
-    netvlad \
+    "$plm_retrieval_file" \
+    "$plm_retrieval_method" \
     "$run_root/results/day/$RESULT_NAME" \
     "$db_features" \
     "$day_query_features" \
     "$AACHEN_TOPK" \
-    ""
+    "$AACHEN_MAX_QUERIES"
 
   run_plmloc \
     configs/aachen_v1_1_night_refactor.yaml \
     "$AACHEN_ROOT" \
     "$attach" \
-    "$AACHEN_ROOT/pairs-query-netvlad50.txt" \
-    netvlad \
+    "$plm_retrieval_file" \
+    "$plm_retrieval_method" \
     "$run_root/results/night/$RESULT_NAME" \
     "$db_features" \
     "$night_query_features" \
     "$AACHEN_TOPK" \
-    ""
+    "$AACHEN_MAX_QUERIES"
 
   cat \
     "$run_root/results/day/$RESULT_NAME/hloc_results.txt" \
@@ -359,20 +430,42 @@ run_cmu_slice() {
   local attach="$slice_dir/${FEATURE}_colmap_attach_r${ATTACH_RADIUS_PX}"
   local result_dir="$slice_dir/results/mixvpr${CMU_TOPK}/$RESULT_NAME"
 
-  local prepare_args=(
-    tools/prepare_cmu_seasons.py
-    --dataset_root "$CMU_ROOT"
-    --slice_id "$slice_id"
-    --out_dir "$slice_dir"
-    --topk "$CMU_TOPK"
-    --extract_images "$CMU_EXTRACT_IMAGES"
-    --max_map_images "$CMU_MAX_MAP_IMAGES"
-    --max_points "$CMU_MAX_POINTS"
-  )
-  if [[ -n "$CMU_MAX_QUERIES" ]]; then
-    prepare_args+=(--max_queries "$CMU_MAX_QUERIES")
+  local layout="$CMU_LAYOUT"
+  if [[ "$layout" == "auto" ]]; then
+    if [[ -d "$CMU_ROOT/$slice_id/sparse" ]]; then
+      layout="slice"
+    else
+      layout="nvm"
+    fi
   fi
-  "$PY" "${prepare_args[@]}"
+
+  if [[ "$layout" == "slice" ]]; then
+    "$PY" tools/prepare_cmu_extended_slice_layout.py \
+      --dataset_root "$CMU_ROOT" \
+      --slice_id "$slice_id" \
+      --out_dir "$slice_dir" \
+      --legacy_split_root "$CMU_LEGACY_SPLIT_ROOT" \
+      --topk "$CMU_TOPK" \
+      --feature_method "$FEATURE_H5_METHOD" \
+      --feature_dir_name "$DEFAULT_FEATURE_DIR_NAME"
+  else
+    local prepare_args=(
+      tools/prepare_cmu_seasons.py
+      --dataset_root "$CMU_ROOT"
+      --slice_id "$slice_id"
+      --out_dir "$slice_dir"
+      --topk "$CMU_TOPK"
+      --extract_images "$CMU_EXTRACT_IMAGES"
+      --max_map_images "$CMU_MAX_MAP_IMAGES"
+      --max_points "$CMU_MAX_POINTS"
+      --feature_method "$FEATURE_H5_METHOD"
+      --feature_dir_name "$DEFAULT_FEATURE_DIR_NAME"
+    )
+    if [[ -n "$CMU_MAX_QUERIES" ]]; then
+      prepare_args+=(--max_queries "$CMU_MAX_QUERIES")
+    fi
+    "$PY" "${prepare_args[@]}"
+  fi
 
   if [[ "$OVERWRITE" == "1" || ! -f "$features/db.h5" || ! -f "$features/query.h5" ]]; then
     local feature_ow=()

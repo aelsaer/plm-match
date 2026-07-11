@@ -38,15 +38,39 @@ def _resolve(root: Path, path: str | Path) -> Path:
     return p
 
 
-def _find_superglue_source() -> Path | None:
-    candidates = [
+def _find_superglue_source(source_root: Path | None = None) -> Path | None:
+    candidates: list[Path] = []
+    if source_root is not None:
+        root = Path(source_root).expanduser().resolve()
+        candidates.extend(
+            [
+                root,
+                root / "SuperGluePretrainedNetwork",
+                root / "third_party" / "SuperGluePretrainedNetwork",
+            ]
+        )
+    candidates.extend(
+        [
+            ROOT / "external" / "Hierarchical-Localization" / "third_party" / "SuperGluePretrainedNetwork",
+            ROOT / "external" / "SuperGluePretrainedNetwork",
+        ]
+    )
+    candidates.extend(
+        [
         Path("/home/andreas/anaconda3/envs/sam3/lib/python3.12/site-packages/imm/third_party/TopicFM/third_party/loftr/third_party/SuperGluePretrainedNetwork"),
         Path("/home/andreas/anaconda3/envs/sam3/lib/python3.12/site-packages/imm/third_party/MINIMA/third_party/LoFTR/third_party/SuperGluePretrainedNetwork"),
         Path("/home/andreas/anaconda3/envs/phd/lib/python3.10/site-packages/imm/third_party/TopicFM/third_party/loftr/third_party/SuperGluePretrainedNetwork"),
-    ]
+        ]
+    )
     for cand in candidates:
         if (cand / "models" / "superglue.py").exists():
             return cand
+    if source_root is not None:
+        try:
+            for p in Path(source_root).expanduser().resolve().rglob("SuperGluePretrainedNetwork/models/superglue.py"):
+                return p.parent.parent
+        except Exception:
+            pass
     for root in (Path("/home/andreas"), Path("/home/phd")):
         try:
             for p in root.rglob("SuperGluePretrainedNetwork/models/superglue.py"):
@@ -61,8 +85,9 @@ def _prepare_superglue_shim(
     weights: str,
     weights_path: Path | None,
     download_weights: bool,
+    source_root: Path | None = None,
 ) -> Path:
-    src = _find_superglue_source()
+    src = _find_superglue_source(source_root)
     if src is None:
         raise RuntimeError(
             "Could not find a local SuperGluePretrainedNetwork source tree. "
@@ -288,6 +313,7 @@ def main() -> None:
     parser.add_argument("--db_features_path", type=Path, default=None)
     parser.add_argument("--query_features_path", type=Path, default=None)
     parser.add_argument("--weights", choices=("outdoor", "indoor"), default="outdoor")
+    parser.add_argument("--superglue_root", type=Path, default=None)
     parser.add_argument("--weights_path", type=Path, default=None)
     parser.add_argument("--download_weights", action="store_true")
     parser.add_argument("--sinkhorn_iterations", type=int, default=50)
@@ -337,6 +363,7 @@ def main() -> None:
         weights=args.weights,
         weights_path=args.weights_path,
         download_weights=bool(args.download_weights),
+        source_root=args.superglue_root,
     )
     from hloc import match_features
 

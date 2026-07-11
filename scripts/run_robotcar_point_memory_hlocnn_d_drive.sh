@@ -45,6 +45,15 @@ DESCRIPTOR_DTYPE=${DESCRIPTOR_DTYPE:-float16}
 ATTACH_RADIUS_PX=${ATTACH_RADIUS_PX:-3}
 MIN_COLMAP_TRACK_LEN=${MIN_COLMAP_TRACK_LEN:-3}
 MAX_COLMAP_POINT_ERROR=${MAX_COLMAP_POINT_ERROR:-4.0}
+PNP_FIRST_THRESH=${PNP_FIRST_THRESH:-12.0}
+PNP_REFINE_THRESH=${PNP_REFINE_THRESH:-$PNP_FIRST_THRESH}
+MIN_FINAL_INLIERS=${MIN_FINAL_INLIERS:-12}
+POSE_GUIDED=${POSE_GUIDED:-0}
+POSE_GUIDED_RADIUS_PX=${POSE_GUIDED_RADIUS_PX:-10.0}
+POSE_GUIDED_SCORE_THRESH=${POSE_GUIDED_SCORE_THRESH:-0.1}
+POSE_GUIDED_REPROJ_PENALTY=${POSE_GUIDED_REPROJ_PENALTY:-0.02}
+POSE_GUIDED_MAX_DESCS_PER_POINT=${POSE_GUIDED_MAX_DESCS_PER_POINT:-8}
+MIN_POSE_GUIDED_INLIERS=${MIN_POSE_GUIDED_INLIERS:-12}
 MAX_QUERIES=${MAX_QUERIES:-}
 
 cd "$ROOT"
@@ -112,6 +121,18 @@ if [[ -n "$MAX_QUERIES" ]]; then
   max_query_args+=(--max_queries "$MAX_QUERIES")
 fi
 
+pose_args=()
+if [[ "$POSE_GUIDED" == "1" || "$POSE_GUIDED" == "true" || "$POSE_GUIDED" == "TRUE" ]]; then
+  pose_args+=(
+    --pose_guided
+    --pose_guided_radius_px "$POSE_GUIDED_RADIUS_PX"
+    --pose_guided_score_thresh "$POSE_GUIDED_SCORE_THRESH"
+    --pose_guided_reproj_penalty "$POSE_GUIDED_REPROJ_PENALTY"
+    --pose_guided_max_descs_per_point "$POSE_GUIDED_MAX_DESCS_PER_POINT"
+    --min_pose_guided_inliers "$MIN_POSE_GUIDED_INLIERS"
+  )
+fi
+
 "$PY" -m plm_match.pipelines.lifted_nn_localize \
   --config "$CFG" \
   --dataset_root "$DATASET_ROOT" \
@@ -144,9 +165,10 @@ fi
   --attach_dist_weight 0.0 \
   --max_cluster_images 5 \
   --max_cluster_seeds 10 \
-  --pnp_first_thresh 12.0 \
-  --pnp_refine_thresh 12.0 \
-  --min_final_inliers 12 \
+  --pnp_first_thresh "$PNP_FIRST_THRESH" \
+  --pnp_refine_thresh "$PNP_REFINE_THRESH" \
+  --min_final_inliers "$MIN_FINAL_INLIERS" \
+  "${pose_args[@]}" \
   --point_memory_batch_size 128 \
   --no-log_memory_scores \
   --no-attached_index_mmap \

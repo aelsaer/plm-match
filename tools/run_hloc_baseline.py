@@ -416,6 +416,7 @@ def _prepare_hloc_shims(
             weights=str(args.superglue_weights),
             weights_path=superglue_weights_path,
             download_weights=bool(args.download_superglue_weights),
+            source_root=superglue_root,
         )
     elif "superpoint" in extractor_name:
         _prepare_superpoint_shim(

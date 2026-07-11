@@ -1,10 +1,13 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 
 from plm_match.pipelines.lifted_nn_localize import (
     _select_point_observation_indices,
     adaptive_cover_select,
+    adaptive_cover_farthest_select,
+    adaptive_cover_select_v2,
     compute_obs_weights,
 )
 
@@ -27,6 +30,38 @@ class AdaptiveCoverSelectionTest(unittest.TestCase):
         selected = adaptive_cover_select(descs, k_min=1, k_max=4, min_gain=0.005)
         self.assertEqual(selected.shape[0], 4)
         self.assertEqual(len(set(selected.tolist())), 4)
+
+    def test_weak_cosine_similarity_is_not_treated_as_covered(self) -> None:
+        descs = _norm(
+            np.asarray(
+                [
+                    [1.0, 0.0],
+                    [1.0, 0.0],
+                    [0.2, np.sqrt(1.0 - 0.2**2)],
+                ],
+                dtype=np.float32,
+            )
+        )
+        selected = adaptive_cover_select(descs, k_min=1, k_max=3, min_gain=0.2)
+        self.assertGreaterEqual(selected.shape[0], 2)
+        self.assertIn(2, selected.tolist())
+
+    def test_farthest_rescue_threshold_can_be_overridden(self) -> None:
+        descs = _norm(
+            np.asarray(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.95, np.sqrt(1.0 - 0.95**2), 0.0],
+                    [0.2, 0.0, np.sqrt(1.0 - 0.2**2)],
+                ],
+                dtype=np.float32,
+            )
+        )
+        with mock.patch.dict("os.environ", {"PLM_ADAPTIVE_FARTHEST_RESCUE_SIM_THRESH": "0.9"}):
+            conservative = adaptive_cover_farthest_select(descs, k_min=1, k_max=3, min_gain=0.99)
+        with mock.patch.dict("os.environ", {"PLM_ADAPTIVE_FARTHEST_RESCUE_SIM_THRESH": "0.99"}):
+            permissive = adaptive_cover_farthest_select(descs, k_min=1, k_max=3, min_gain=0.99)
+        self.assertLess(conservative.shape[0], permissive.shape[0])
 
     def test_view_diversity_can_expand_identical_descriptors(self) -> None:
         descs = _norm(np.repeat(np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), repeats=4, axis=0))
@@ -59,6 +94,40 @@ class AdaptiveCoverSelectionTest(unittest.TestCase):
         )
         self.assertEqual(selected_no_view.shape[0], 1)
         self.assertEqual(selected_view.shape[0], 4)
+
+    def test_radius_cover_v2_covers_reliable_modes_and_gates_junk(self) -> None:
+        descs = _norm(
+            np.asarray(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.97, 0.24, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.20, 0.98, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+        )
+        weights = np.asarray([1.0, 1.0, 1.0, 1.0, 0.01], dtype=np.float32)
+        selected = adaptive_cover_select_v2(descs, weights=weights, k_min=1, k_max=5, s_min=0.80, gate_frac=0.30)
+        selected_set = set(selected.tolist())
+        self.assertTrue(selected_set & {0, 1})
+        self.assertTrue(selected_set & {2, 3})
+        self.assertNotIn(4, selected_set)
+
+        selected_from_wrapper = _select_point_observation_indices(
+            descs,
+            0,
+            descs.shape[0],
+            max_obs=0,
+            obs_select="adaptive_cover_v2",
+            detector_scores=weights,
+            adaptive_k_min=1,
+            adaptive_k_max=5,
+            adaptive_s_min=0.80,
+            adaptive_gate_frac=0.30,
+        )
+        self.assertEqual(set(selected_from_wrapper.tolist()), selected_set)
 
     def test_adaptive_mode_uses_view_directions_from_frame_centers(self) -> None:
         descs = _norm(np.repeat(np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), repeats=4, axis=0))
