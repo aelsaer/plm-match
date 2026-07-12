@@ -1499,6 +1499,13 @@ def _adaptive_farthest_rescue_sim_thresh() -> float:
         return float(ADAPTIVE_FARTHEST_RESCUE_SIM_THRESH)
 
 
+def _adaptive_v2_use_quality_weights() -> bool:
+    raw = os.environ.get("PLM_ADAPTIVE_V2_USE_QUALITY_WEIGHTS")
+    if raw is None or str(raw).strip() == "":
+        return True
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def compute_obs_weights(
     detector_scores: np.ndarray | None,
     attach_dist: np.ndarray | None = None,
@@ -1708,7 +1715,9 @@ def adaptive_cover_select_v2(
 
     Unlike the v1 mass-gain rule, this selects until every reliable observation
     is covered to cosine radius ``s_min`` or the safety cap ``k_max`` is reached.
-    Low-weight observations are gated out of both selection and coverage demand.
+    Low-weight observations are gated out of adaptive coverage demand. ``k_min``
+    is a hard floor: if coverage stalls below it, descriptor-farthest observations
+    fill the remaining slots, including gated observations only when necessary.
     """
     descs = _normalise_descriptors(np.asarray(descs, dtype=np.float32))
     n_obs = int(descs.shape[0])
@@ -1753,7 +1762,9 @@ def adaptive_cover_select_v2(
         wg = w
         gate = np.ones((n_obs,), dtype=bool)
 
-    first = int(np.argmax(sim.T @ wg))
+    seed_scores = sim.T @ wg
+    seed_scores[~gate] = -np.inf
+    first = int(np.argmax(seed_scores))
     selected = [first]
     selected_mask = np.zeros((n_obs,), dtype=bool)
     selected_mask[first] = True
@@ -1771,6 +1782,30 @@ def adaptive_cover_select_v2(
         best = int(np.argmax(gains))
         best_gain = float(gains[best])
         if not np.isfinite(best_gain) or best_gain <= 1e-9:
+            break
+        selected.append(best)
+        selected_mask[best] = True
+        covered = np.maximum(covered, sim[:, best])
+
+    # Coverage may be complete before k_min, and the quality gate may contain
+    # fewer than k_min observations. Preserve the requested memory floor with a
+    # deterministic farthest fill. Prefer reliable observations, but admit gated
+    # ones when that is the only way to satisfy the floor.
+    floor = min(k_min, limit)
+    while len(selected) < floor:
+        candidates = ~selected_mask
+        preferred = candidates & gate
+        if not bool(np.any(preferred)):
+            preferred = candidates
+        if not bool(np.any(preferred)):
+            break
+        selected_arr = np.asarray(selected, dtype=np.int64)
+        novelty = 1.0 - np.max(sim[:, selected_arr], axis=1)
+        quality = w / max(float(np.max(w)), 1e-9)
+        fill_scores = novelty + 1e-6 * quality
+        fill_scores[~preferred] = -np.inf
+        best = int(np.argmax(fill_scores))
+        if selected_mask[best] or not np.isfinite(float(fill_scores[best])):
             break
         selected.append(best)
         selected_mask[best] = True
@@ -1842,6 +1877,7 @@ def adaptive_cover_v2_budget_curve(
     s_grid: Sequence[float] = (0.70, 0.75, 0.78, 0.80, 0.82, 0.85),
     k_max: int = 32,
     max_landmarks: int = 500,
+    gate_frac: float = 0.30,
 ) -> list[tuple[float, float, float, float]]:
     """Return ``(s_min, mean_k, median_k, p90_k)`` rows for radius calibration."""
     rows: list[tuple[float, float, float, float]] = []
@@ -1856,6 +1892,7 @@ def adaptive_cover_v2_budget_curve(
                         weights=weights,
                         s_min=float(s_min),
                         k_max=int(k_max),
+                        gate_frac=float(gate_frac),
                     ).shape[0]
                 )
                 for descs, weights in zip(desc_list, weight_list, strict=False)
@@ -1891,6 +1928,11 @@ def _selection_budget_summary(
     total_landmarks = int(budgets.shape[0])
     total_original = int(np.sum(original_counts, dtype=np.int64)) if original_counts.size > 0 else 0
     total_selected = int(np.sum(budgets, dtype=np.int64)) if budgets.size > 0 else 0
+    aligned_count = min(int(budgets.shape[0]), int(original_counts.shape[0]))
+    aligned_budgets = budgets[:aligned_count]
+    aligned_original = original_counts[:aligned_count]
+    floor_targets = np.minimum(aligned_original, max(1, int(adaptive_k_min)))
+    nonempty_floor = aligned_original > 0
     return {
         "selection_mode": str(mode),
         "point_memory_max_obs": int(max_obs),
@@ -1902,12 +1944,26 @@ def _selection_budget_summary(
         "view_weight": float(adaptive_view_weight),
         "s_min": float(adaptive_s_min),
         "gate_frac": float(adaptive_gate_frac),
+        "use_quality_weights": bool(_adaptive_v2_use_quality_weights()) if str(mode) == "adaptive_cover_v2" else None,
         "farthest_rescue_sim_thresh": (
             float(_adaptive_farthest_rescue_sim_thresh()) if str(mode) == "adaptive_cover_farthest" else None
         ),
         "total_landmarks": total_landmarks,
         "total_original_observations": total_original,
         "total_selected_observations": total_selected,
+        "mean_K_p_hard_floor_capacity": (
+            float(np.mean(floor_targets[nonempty_floor])) if bool(np.any(nonempty_floor)) else 0.0
+        ),
+        "fraction_landmarks_with_at_least_k_min_observations": (
+            float(np.mean(aligned_original[nonempty_floor] >= int(adaptive_k_min)))
+            if bool(np.any(nonempty_floor))
+            else 0.0
+        ),
+        "fraction_below_hard_floor_unexpected": (
+            float(np.mean(aligned_budgets[nonempty_floor] < floor_targets[nonempty_floor]))
+            if bool(np.any(nonempty_floor))
+            else 0.0
+        ),
         "mean_K_p": float(np.mean(arr)) if arr.size > 0 else 0.0,
         "median_K_p": float(np.median(arr)) if arr.size > 0 else 0.0,
         "p75_K_p": float(np.percentile(arr, 75)) if arr.size > 0 else 0.0,
@@ -1960,6 +2016,8 @@ def _select_point_observation_indices(
             sigma_attach=float(adaptive_sigma_attach),
             sigma_reproj=float(adaptive_sigma_reproj),
         )
+        if mode == "adaptive_cover_v2" and not _adaptive_v2_use_quality_weights():
+            weights = None
         view_dirs = _observation_view_dirs(
             point_xyz=point_xyz,
             obs_frame_ids=obs_frame_ids,

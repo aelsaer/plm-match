@@ -96,6 +96,7 @@ ATTACH_RADIUS_PX=${ATTACH_RADIUS_PX:-3}
 MIN_COLMAP_TRACK_LEN=${MIN_COLMAP_TRACK_LEN:-3}
 MAX_COLMAP_POINT_ERROR=${MAX_COLMAP_POINT_ERROR:-4.0}
 OVERWRITE=${OVERWRITE:-0}
+REBUILD_ATTACHMENT=${REBUILD_ATTACHMENT:-0}
 
 POINT_MEMORY_MAX_OBS=${POINT_MEMORY_MAX_OBS:-0}
 POINT_MEMORY_OBS_SELECT=${POINT_MEMORY_OBS_SELECT:-adaptive_cover}
@@ -132,6 +133,13 @@ require_path() {
     echo "Missing required input: $path" >&2
     exit 2
   fi
+}
+
+attachment_has_quality_arrays() {
+  local root="$1"
+  [[ -f "$root/point_obs_scores.npy" \
+    && -f "$root/point_obs_attach_dist.npy" \
+    && -f "$root/point_obs_reproj_error.npy" ]]
 }
 
 find_feature() {
@@ -318,7 +326,8 @@ run_aachen() {
   day_query_features="$(find_local_feature "$day_hloc/artifacts" "*_queries.h5")"
   night_query_features="$(find_local_feature "$night_hloc/artifacts" "*_queries.h5")"
 
-  if [[ "$OVERWRITE" == "1" || ! -f "$attach/summary.json" ]]; then
+  if [[ "$OVERWRITE" == "1" || "$REBUILD_ATTACHMENT" == "1" || ! -f "$attach/summary.json" ]] \
+    || ! attachment_has_quality_arrays "$attach"; then
     "$PY" tools/build_sp_colmap_attachment.py \
       --config configs/aachen_v1_1_day_refactor.yaml \
       --dataset_root "$AACHEN_ROOT" \
@@ -415,6 +424,8 @@ run_robotcar() {
   POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH="$POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH" \
   POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ="$POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ" \
   POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT="$POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT" \
+  POINT_MEMORY_ADAPTIVE_S_MIN="$POINT_MEMORY_ADAPTIVE_S_MIN" \
+  POINT_MEMORY_ADAPTIVE_GATE_FRAC="$POINT_MEMORY_ADAPTIVE_GATE_FRAC" \
   RESULT_NAME="$RESULT_NAME" \
     scripts/run_robotcar_point_memory_hlocnn_d_drive.sh
 }
@@ -500,7 +511,8 @@ run_cmu_slice() {
       "${retrieval_ow[@]}"
   fi
 
-  if [[ "$OVERWRITE" == "1" || ! -f "$attach/summary.json" ]]; then
+  if [[ "$OVERWRITE" == "1" || "$REBUILD_ATTACHMENT" == "1" || ! -f "$attach/summary.json" ]] \
+    || ! attachment_has_quality_arrays "$attach"; then
     "$PY" tools/build_sp_colmap_attachment.py \
       --config "$cfg" \
       --dataset_root "$slice_dir" \

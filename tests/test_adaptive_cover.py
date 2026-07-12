@@ -129,6 +129,85 @@ class AdaptiveCoverSelectionTest(unittest.TestCase):
         )
         self.assertEqual(set(selected_from_wrapper.tolist()), selected_set)
 
+    def test_radius_cover_v2_never_uses_gated_observation_as_seed(self) -> None:
+        # The low-weight descriptor is central to both reliable modes and would
+        # win an unconstrained medoid search despite being below the junk gate.
+        diagonal = float(np.sqrt(0.5))
+        descs = np.asarray(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [diagonal, diagonal],
+            ],
+            dtype=np.float32,
+        )
+        weights = np.asarray([1.0, 1.0, 0.01], dtype=np.float32)
+        selected = adaptive_cover_select_v2(
+            descs,
+            weights=weights,
+            k_min=1,
+            k_max=3,
+            s_min=0.80,
+            gate_frac=0.30,
+        )
+        self.assertNotIn(2, selected.tolist())
+
+    def test_radius_cover_v2_enforces_hard_minimum_with_farthest_fill(self) -> None:
+        # Coverage is complete before the floor and only three observations
+        # pass the quality gate. The hard floor must still retain four distinct
+        # observations when four are available.
+        descs = _norm(
+            np.asarray(
+                [
+                    [1.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [-1.0, 0.0, 0.0],
+                ],
+                dtype=np.float32,
+            )
+        )
+        weights = np.asarray([1.0, 1.0, 1.0, 0.01, 0.01], dtype=np.float32)
+        selected = adaptive_cover_select_v2(
+            descs,
+            weights=weights,
+            k_min=4,
+            k_max=5,
+            s_min=0.80,
+            gate_frac=0.30,
+        )
+        self.assertEqual(selected.shape[0], 4)
+        self.assertEqual(len(set(selected.tolist())), 4)
+        self.assertTrue({0, 1, 2}.issubset(set(selected.tolist())))
+
+    def test_radius_cover_v2_wrapper_can_disable_quality_weights(self) -> None:
+        descs = _norm(
+            np.asarray(
+                [
+                    [1.0, 0.0],
+                    [0.8, 0.6],
+                    [0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+        )
+        scores = np.asarray([1.0, 0.01, 0.01], dtype=np.float32)
+        with mock.patch.dict("os.environ", {"PLM_ADAPTIVE_V2_USE_QUALITY_WEIGHTS": "0"}):
+            selected = _select_point_observation_indices(
+                descs,
+                0,
+                3,
+                max_obs=0,
+                obs_select="adaptive_cover_v2",
+                detector_scores=scores,
+                adaptive_k_min=1,
+                adaptive_k_max=1,
+                adaptive_s_min=0.80,
+                adaptive_gate_frac=0.30,
+            )
+        self.assertEqual(selected.tolist(), [1])
+
     def test_adaptive_mode_uses_view_directions_from_frame_centers(self) -> None:
         descs = _norm(np.repeat(np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), repeats=4, axis=0))
         selected = _select_point_observation_indices(

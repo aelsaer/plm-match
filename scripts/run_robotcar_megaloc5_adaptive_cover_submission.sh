@@ -188,7 +188,10 @@ if [[ "$OVERWRITE" == "1" || ! -f "$RETRIEVAL_FILE" ]]; then
     "${retrieval_ow[@]}"
 fi
 
-if [[ "$OVERWRITE" == "1" || ! -f "$ATTACHED_INDEX/summary.json" ]]; then
+if [[ "$OVERWRITE" == "1" || ! -f "$ATTACHED_INDEX/summary.json" \
+  || ! -f "$ATTACHED_INDEX/point_obs_scores.npy" \
+  || ! -f "$ATTACHED_INDEX/point_obs_attach_dist.npy" \
+  || ! -f "$ATTACHED_INDEX/point_obs_reproj_error.npy" ]]; then
   "$PY" tools/build_sp_colmap_attachment.py \
     --config "$CFG" \
     --dataset_root "$ROBOT_TEST" \

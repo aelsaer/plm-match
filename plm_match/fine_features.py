@@ -411,7 +411,10 @@ class LocalPatchDescriptor:
                 ):
                     descriptors = descriptors.T
                 descriptors = self._reshape_descriptor_rows(descriptors)
-                score_key = next((k for k in ('scores', 'score', 'responses', 'response') if k in group), None)
+                score_key = next(
+                    (k for k in ('keypoint_scores', 'scores', 'score', 'responses', 'response') if k in group),
+                    None,
+                )
                 scores = np.asarray(group[score_key], dtype=np.float32).reshape(-1) if score_key is not None else None
                 n = min(keypoints.shape[0], descriptors.shape[0], scores.shape[0] if scores is not None else keypoints.shape[0])
                 keypoints = keypoints[:n]

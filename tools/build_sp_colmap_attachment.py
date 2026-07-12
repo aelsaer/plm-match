@@ -234,6 +234,9 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     global_frame_ids: list[np.ndarray] = []
     global_uvs: list[np.ndarray] = []
     global_descs: list[np.ndarray] = []
+    global_scores: list[np.ndarray] = []
+    global_attach_dists: list[np.ndarray] = []
+    global_reproj_errors: list[np.ndarray] = []
     total_obs = 0
     frames_with_obs = 0
     descriptor_dim = int(getattr(fine_extractor, "dim", 0))
@@ -310,6 +313,10 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                         attached_scores = np.ones((attached_pids.shape[0],), dtype=np.float32)
                     attached_descs = computed_descs[valid_desc].astype(descriptor_dtype, copy=False)
                     attached_dists = np.zeros((attached_pids.shape[0],), dtype=np.float32)
+                    attached_reproj_errors = np.asarray(
+                        [float(getattr(dataset.points3d[int(pid)], "error", np.nan)) for pid in attached_pids],
+                        dtype=np.float32,
+                    )
                     attached_xyz = np.stack(
                         [np.asarray(dataset.points3d[int(pid)].xyz, dtype=np.float32) for pid in attached_pids],
                         axis=0,
@@ -328,12 +335,16 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                         point_ids=attached_pids,
                         xyz=attached_xyz,
                         attach_dist=attached_dists,
+                        reproj_error=attached_reproj_errors,
                     )
                     global_pids.append(attached_pids)
                     global_xyz.append(attached_xyz)
                     global_frame_ids.append(np.full((attached_count,), int(frame_id), dtype=np.int32))
                     global_uvs.append(attached_uvs)
                     global_descs.append(attached_descs)
+                    global_scores.append(attached_scores)
+                    global_attach_dists.append(attached_dists)
+                    global_reproj_errors.append(attached_reproj_errors)
                     total_obs += attached_count
                     frames_with_obs += 1
             if run_detected_nearest:
@@ -376,6 +387,10 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                         attached_scores = sp_scores[sp_indices].astype(np.float32, copy=False)
                         attached_descs = sp_descs[sp_indices].astype(descriptor_dtype, copy=False)
                         attached_dists = attached_dists_all.astype(np.float32, copy=False)
+                        attached_reproj_errors = np.asarray(
+                            [float(getattr(dataset.points3d[int(pid)], "error", np.nan)) for pid in attached_pids],
+                            dtype=np.float32,
+                        )
                         attached_xyz = np.stack(
                             [np.asarray(dataset.points3d[int(pid)].xyz, dtype=np.float32) for pid in attached_pids],
                             axis=0,
@@ -394,6 +409,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                             attached_scores = attached_scores[keep_local]
                             attached_descs = attached_descs[keep_local]
                             attached_dists = attached_dists[keep_local]
+                            attached_reproj_errors = attached_reproj_errors[keep_local]
                             attached_xyz = attached_xyz[keep_local]
                         attached_count = int(attached_pids.shape[0])
                         obs_file = _safe_obs_filename(image_id, image_name)
@@ -409,12 +425,16 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                             point_ids=attached_pids,
                             xyz=attached_xyz,
                             attach_dist=attached_dists,
+                            reproj_error=attached_reproj_errors,
                         )
                         global_pids.append(attached_pids)
                         global_xyz.append(attached_xyz)
                         global_frame_ids.append(np.full((attached_count,), int(frame_id), dtype=np.int32))
                         global_uvs.append(attached_uvs)
                         global_descs.append(attached_descs)
+                        global_scores.append(attached_scores)
+                        global_attach_dists.append(attached_dists)
+                        global_reproj_errors.append(attached_reproj_errors)
                         total_obs += attached_count
                         frames_with_obs += 1
 
@@ -448,6 +468,9 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         all_frame_ids = np.concatenate(global_frame_ids, axis=0).astype(np.int32, copy=False)
         all_uvs = np.concatenate(global_uvs, axis=0).astype(np.float32, copy=False)
         all_descs = np.concatenate(global_descs, axis=0).astype(descriptor_dtype, copy=False)
+        all_scores = np.concatenate(global_scores, axis=0).astype(np.float32, copy=False)
+        all_attach_dists = np.concatenate(global_attach_dists, axis=0).astype(np.float32, copy=False)
+        all_reproj_errors = np.concatenate(global_reproj_errors, axis=0).astype(np.float32, copy=False)
         order = np.argsort(all_pids, kind="stable")
         sorted_pids = all_pids[order]
         unique_pids, first, counts = np.unique(sorted_pids, return_index=True, return_counts=True)
@@ -457,6 +480,9 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         np.save(out_dir / "point_obs_descs.npy", all_descs[order])
         np.save(out_dir / "point_obs_frame_ids.npy", all_frame_ids[order])
         np.save(out_dir / "point_obs_uvs.npy", all_uvs[order])
+        np.save(out_dir / "point_obs_scores.npy", all_scores[order])
+        np.save(out_dir / "point_obs_attach_dist.npy", all_attach_dists[order])
+        np.save(out_dir / "point_obs_reproj_error.npy", all_reproj_errors[order])
         np.save(out_dir / "point_ids.npy", unique_pids.astype(np.int64, copy=False))
         np.save(out_dir / "point_xyz.npy", point_xyz)
         num_landmarks = int(unique_pids.shape[0])
@@ -465,6 +491,9 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         np.save(out_dir / "point_obs_descs.npy", np.zeros((0, descriptor_dim), dtype=descriptor_dtype))
         np.save(out_dir / "point_obs_frame_ids.npy", np.zeros((0,), dtype=np.int32))
         np.save(out_dir / "point_obs_uvs.npy", np.zeros((0, 2), dtype=np.float32))
+        np.save(out_dir / "point_obs_scores.npy", np.zeros((0,), dtype=np.float32))
+        np.save(out_dir / "point_obs_attach_dist.npy", np.zeros((0,), dtype=np.float32))
+        np.save(out_dir / "point_obs_reproj_error.npy", np.zeros((0,), dtype=np.float32))
         np.save(out_dir / "point_ids.npy", np.zeros((0,), dtype=np.int64))
         np.save(out_dir / "point_xyz.npy", np.zeros((0, 3), dtype=np.float32))
 
@@ -499,6 +528,11 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         "descriptor_dtype": str(np.dtype(descriptor_dtype)),
         "min_colmap_track_len": int(min_track_len),
         "max_colmap_point_error": float(max_error) if max_error is not None else None,
+        "observation_quality_arrays": {
+            "detector_scores": "point_obs_scores.npy",
+            "attachment_distance_px": "point_obs_attach_dist.npy",
+            "colmap_point_reprojection_error_px": "point_obs_reproj_error.npy",
+        },
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     (out_dir / "command.txt").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")

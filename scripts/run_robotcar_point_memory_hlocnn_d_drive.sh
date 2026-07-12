@@ -34,6 +34,8 @@ POINT_MEMORY_ADAPTIVE_MIN_GAIN=${POINT_MEMORY_ADAPTIVE_MIN_GAIN:-0.005}
 POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH=${POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH:-2.0}
 POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ=${POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ:-4.0}
 POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT=${POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT:-0.0}
+POINT_MEMORY_ADAPTIVE_S_MIN=${POINT_MEMORY_ADAPTIVE_S_MIN:-0.80}
+POINT_MEMORY_ADAPTIVE_GATE_FRAC=${POINT_MEMORY_ADAPTIVE_GATE_FRAC:-0.30}
 RESULT_NAME=${RESULT_NAME:-point_memory_hloc_nn_${FEATURE}_obs${POINT_MEMORY_MAX_OBS}_${POINT_MEMORY_OBS_SELECT}}
 RESULT_DIR=${RESULT_DIR:-$RUN_ROOT/results/mixvpr10/$RESULT_NAME}
 
@@ -55,6 +57,7 @@ POSE_GUIDED_REPROJ_PENALTY=${POSE_GUIDED_REPROJ_PENALTY:-0.02}
 POSE_GUIDED_MAX_DESCS_PER_POINT=${POSE_GUIDED_MAX_DESCS_PER_POINT:-8}
 MIN_POSE_GUIDED_INLIERS=${MIN_POSE_GUIDED_INLIERS:-12}
 MAX_QUERIES=${MAX_QUERIES:-}
+REBUILD_ATTACHMENT=${REBUILD_ATTACHMENT:-0}
 
 cd "$ROOT"
 mkdir -p "$RUN_ROOT" "$FEATURE_DIR" "$RETRIEVAL_DIR" "$(dirname "$RESULT_DIR")"
@@ -94,7 +97,11 @@ if [[ ! -f "$RETRIEVAL_FILE" ]]; then
     --batch_size "$MIXVPR_BATCH_SIZE"
 fi
 
-if [[ ! -f "$ATTACHED_INDEX/summary.json" ]]; then
+if [[ "$REBUILD_ATTACHMENT" == "1" \
+  || ! -f "$ATTACHED_INDEX/summary.json" \
+  || ! -f "$ATTACHED_INDEX/point_obs_scores.npy" \
+  || ! -f "$ATTACHED_INDEX/point_obs_attach_dist.npy" \
+  || ! -f "$ATTACHED_INDEX/point_obs_reproj_error.npy" ]]; then
   "$PY" tools/build_sp_colmap_attachment.py \
     --config "$CFG" \
     --dataset_root "$DATASET_ROOT" \
@@ -153,6 +160,8 @@ fi
   --point_memory_adaptive_sigma_attach "$POINT_MEMORY_ADAPTIVE_SIGMA_ATTACH" \
   --point_memory_adaptive_sigma_reproj "$POINT_MEMORY_ADAPTIVE_SIGMA_REPROJ" \
   --point_memory_adaptive_view_weight "$POINT_MEMORY_ADAPTIVE_VIEW_WEIGHT" \
+  --point_memory_adaptive_s_min "$POINT_MEMORY_ADAPTIVE_S_MIN" \
+  --point_memory_adaptive_gate_frac "$POINT_MEMORY_ADAPTIVE_GATE_FRAC" \
   --memory_search_backend exact \
   --topk "$TOPK" \
   --query_topk "$QUERY_TOPK" \

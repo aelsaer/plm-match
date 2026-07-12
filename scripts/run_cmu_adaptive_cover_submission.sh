@@ -30,6 +30,8 @@ POINT_MEMORY_MAX_OBS=${POINT_MEMORY_MAX_OBS:-0}
 POINT_MEMORY_ADAPTIVE_K_MIN=${POINT_MEMORY_ADAPTIVE_K_MIN:-1}
 POINT_MEMORY_ADAPTIVE_K_MAX=${POINT_MEMORY_ADAPTIVE_K_MAX:-32}
 POINT_MEMORY_ADAPTIVE_MIN_GAIN=${POINT_MEMORY_ADAPTIVE_MIN_GAIN:-0.005}
+POINT_MEMORY_ADAPTIVE_S_MIN=${POINT_MEMORY_ADAPTIVE_S_MIN:-0.80}
+POINT_MEMORY_ADAPTIVE_GATE_FRAC=${POINT_MEMORY_ADAPTIVE_GATE_FRAC:-0.30}
 
 PNP_FIRST_THRESH=${PNP_FIRST_THRESH:-12.0}
 PNP_REFINE_THRESH=${PNP_REFINE_THRESH:-$PNP_FIRST_THRESH}
@@ -120,6 +122,8 @@ POINT_MEMORY_MAX_OBS="$POINT_MEMORY_MAX_OBS" \
 POINT_MEMORY_ADAPTIVE_K_MIN="$POINT_MEMORY_ADAPTIVE_K_MIN" \
 POINT_MEMORY_ADAPTIVE_K_MAX="$POINT_MEMORY_ADAPTIVE_K_MAX" \
 POINT_MEMORY_ADAPTIVE_MIN_GAIN="$POINT_MEMORY_ADAPTIVE_MIN_GAIN" \
+POINT_MEMORY_ADAPTIVE_S_MIN="$POINT_MEMORY_ADAPTIVE_S_MIN" \
+POINT_MEMORY_ADAPTIVE_GATE_FRAC="$POINT_MEMORY_ADAPTIVE_GATE_FRAC" \
 PNP_FIRST_THRESH="$PNP_FIRST_THRESH" \
 PNP_REFINE_THRESH="$PNP_REFINE_THRESH" \
 MIN_FINAL_INLIERS="$MIN_FINAL_INLIERS" \
@@ -141,12 +145,14 @@ fi
 awk '{name=$1; sub(/^.*\//,"",name); printf "%s", name; for(i=2;i<=NF;i++) printf " %s",$i; printf "\n"}' \
   "$CMU_PRED" > "$CMU_SUB"
 
-CMU_ROOT="$CMU_ROOT" CMU_SLICES="$CMU_SLICES" CMU_PRED="$CMU_PRED" CMU_SUB="$CMU_SUB" "$PY" - <<'PY'
+CMU_ROOT="$CMU_ROOT" CMU_LEGACY_SPLIT_ROOT="$CMU_LEGACY_SPLIT_ROOT" \
+CMU_SLICES="$CMU_SLICES" CMU_PRED="$CMU_PRED" CMU_SUB="$CMU_SUB" "$PY" - <<'PY'
 import json
 import os
 from pathlib import Path
 
 cmu_root = Path(os.environ["CMU_ROOT"])
+legacy_root = Path(os.environ["CMU_LEGACY_SPLIT_ROOT"])
 slices = [s.strip() for s in os.environ["CMU_SLICES"].split(",") if s.strip()]
 pred_path = Path(os.environ["CMU_PRED"])
 sub_path = Path(os.environ["CMU_SUB"])
@@ -155,7 +161,13 @@ expected = []
 for slice_id in slices:
     if not slice_id.startswith("slice"):
         slice_id = f"slice{slice_id}"
-    query_list = cmu_root / "query_lists" / f"{slice_id}.queries_with_intrinsics.txt"
+    candidates = (
+        cmu_root / "query_lists" / f"{slice_id}.queries_with_intrinsics.txt",
+        legacy_root / slice_id / "split" / "query_list_with_intrinsics.txt",
+    )
+    query_list = next((path for path in candidates if path.is_file()), None)
+    if query_list is None:
+        raise FileNotFoundError(f"Could not find an official query list for {slice_id}: {candidates}")
     for line in query_list.read_text().splitlines():
         raw = line.strip()
         if raw and not raw.startswith("#"):

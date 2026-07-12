@@ -179,7 +179,10 @@ run_slice() {
       "${retrieval_ow[@]}"
   fi
 
-  if [[ "$OVERWRITE" == "1" || ! -f "$attach/summary.json" ]]; then
+  if [[ "$OVERWRITE" == "1" || ! -f "$attach/summary.json" \
+    || ! -f "$attach/point_obs_scores.npy" \
+    || ! -f "$attach/point_obs_attach_dist.npy" \
+    || ! -f "$attach/point_obs_reproj_error.npy" ]]; then
     "$PY" tools/build_sp_colmap_attachment.py \
       --config "$cfg" \
       --dataset_root "$slice_dir" \

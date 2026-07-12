@@ -22,3 +22,6 @@ eu-proposal-chatgpt-skill.zip
 *.npz
 
 .DS_Store
+
+# Local SSH credentials
+.ssh/
