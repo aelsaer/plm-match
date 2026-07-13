@@ -1,0 +1,1 @@
+tools/prepare_robotcar_seasons.py --dataset_root datasets/RobotCar-Seasons --out_dir outputs/robotcar_seasons_v2_train --extract_images --topk 20

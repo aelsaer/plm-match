@@ -1,0 +1,31 @@
+dataset_root: .
+out_dir: outputs/robotcar_seasons_v2_train
+
+dataset:
+  type: colmap_localization
+  image_root: datasets/RobotCar-Seasons/images
+  model_path: outputs/robotcar_seasons_v2_train/colmap_model
+  db_image_names_file: outputs/robotcar_seasons_v2_train/split/map_images.txt
+  query_list: outputs/robotcar_seasons_v2_train/split/query_list_with_intrinsics.txt
+  query_gt_pose_dir: outputs/robotcar_seasons_v2_train/split/query_gt_pose_dir
+  benchmark: robotcar_seasons_v2
+
+retrieval:
+  global_feature: netvlad
+  topk: 20
+  retrieval_file: outputs/robotcar_seasons_v2_train/retrieval/pairs-netvlad20.txt
+
+matching:
+  fine_rerank:
+    method: superpoint_h5
+    db_features_path: outputs/robotcar_seasons_v2_train/sp_features/feats-superpoint-n4096-rmax1600_db.h5
+    query_features_path: outputs/robotcar_seasons_v2_train/sp_features/feats-superpoint-n4096-rmax1600_queries.h5
+    patch_size: 24
+    min_similarity: 0.65
+    ratio_margin: 0.10
+
+lifted_nn:
+  metric_thresholds:
+    - [0.25, 2.0]
+    - [0.5, 5.0]
+    - [5.0, 10.0]

@@ -1,0 +1,38 @@
+{
+  "dataset_root": "datasets/RobotCar-Seasons",
+  "out_dir": "outputs/robotcar_seasons_v2_train",
+  "config": "outputs/robotcar_seasons_v2_train/robotcar_seasons_v2_train.yaml",
+  "split_json": "outputs/robotcar_seasons_v2_train/split/split.json",
+  "model_path": "outputs/robotcar_seasons_v2_train/colmap_model",
+  "num_map_frames": 20862,
+  "num_queries": 1906,
+  "query_conditions": [
+    "dawn",
+    "dusk",
+    "night",
+    "night-rain",
+    "overcast-summer",
+    "overcast-winter",
+    "rain",
+    "snow",
+    "sun"
+  ],
+  "extracted_images": [
+    "dawn",
+    "dusk",
+    "night",
+    "night-rain",
+    "overcast-reference",
+    "overcast-summer",
+    "overcast-winter",
+    "rain",
+    "snow",
+    "sun"
+  ],
+  "model_summary": {
+    "model_path": "outputs/robotcar_seasons_v2_train/colmap_model",
+    "num_map_images": 20862,
+    "num_points3D": 6771749,
+    "num_observations": 36154430
+  }
+}
