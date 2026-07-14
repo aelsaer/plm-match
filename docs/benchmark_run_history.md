@@ -8,6 +8,11 @@ Localization benchmark. Parameters are taken from preserved `command.txt` and
 benchmark portal records supplied by the experiment author. A dash means that
 an official score has not been recorded here.
 
+See [Dataset Workflows and Map Provenance](dataset_workflows.md) for the exact
+map-construction, feature-attachment, retrieval, localization, and submission
+pipeline used by each dataset family. In particular, feature labels do not by
+themselves imply a feature-native triangulated map.
+
 Metric triplets are reported in this order:
 
 ```text
@@ -44,10 +49,10 @@ Combined values use these counts as weights.
 
 | Status | Retrieval | Local feature | Selector | Budget | PnP | Pose guided | Submission file | Day | Night | Combined |
 |---|---|---|---|---:|---|---|---|---|---|---|
-| Submitted | MixVPR-5 | ALIKED-r1024 | `diverse_desc` | 8 | 16/16, min 10 | off | `plmloc_aliked_mixvpr_aachen5_obs8_pnp16_min10_v1_1_full_official_format/Aachen_v1_1_eval_plmloc_aliked_mixvpr_aachen5_obs8_pnp16_min10_full1015.txt` | 83.0 / 90.3 / 94.3 | 65.4 / 84.8 / 93.2 | 79.7 / 89.3 / 94.1 |
-| Pending portal result | MixVPR-5 | ALIKED-r1024 | `diverse_desc` | 16 | 16/16, min 10 | off | `adaptive_cover/Aachen_v1_1_eval_PLMLoc_aliked_mixvpr5_farthest16_diverse_desc_r1024_k16_16_gain0005_pnp16_min10.txt` | - | - | - |
-| Pending portal result | MixVPR-5 | ALIKED-r1024 | `diverse_desc` | 8 | 16/16, min 10 | off | `adaptive_cover/Aachen_v1_1_eval_PLMLoc_aliked_mixvpr5_farthest8_diverse_desc_r1024_obs8_pnp16_min10.txt` | - | - | - |
-| Pending portal result | MegaLoc-5 | ALIKED-r1024 | `diverse_desc` | 8 | 16/16, min 10 | off | `adaptive_cover/Aachen_v1_1_eval_PLMLoc_aliked_megaloc5_farthest8_diverse_desc_r1024_obs8_pnp16_min10.txt` | - | - | - |
+| Submitted | MixVPR-5 | Official Aachen geometry + nearest-attached ALIKED-r1024 | `diverse_desc` | 8 | 16/16, min 10 | off | `plmloc_aliked_mixvpr_aachen5_obs8_pnp16_min10_v1_1_full_official_format/Aachen_v1_1_eval_plmloc_aliked_mixvpr_aachen5_obs8_pnp16_min10_full1015.txt` | 83.0 / 90.3 / 94.3 | 65.4 / 84.8 / 93.2 | 79.7 / 89.3 / 94.1 |
+| Pending portal result | MixVPR-5 | Official Aachen geometry + nearest-attached ALIKED-r1024 | `diverse_desc` | 16 | 16/16, min 10 | off | `adaptive_cover/Aachen_v1_1_eval_PLMLoc_aliked_mixvpr5_farthest16_diverse_desc_r1024_k16_16_gain0005_pnp16_min10.txt` | - | - | - |
+| Pending portal result | MixVPR-5 | Official Aachen geometry + nearest-attached ALIKED-r1024 | `diverse_desc` | 8 | 16/16, min 10 | off | `adaptive_cover/Aachen_v1_1_eval_PLMLoc_aliked_mixvpr5_farthest8_diverse_desc_r1024_obs8_pnp16_min10.txt` | - | - | - |
+| Pending portal result | MegaLoc-5 | Official Aachen geometry + nearest-attached ALIKED-r1024 | `diverse_desc` | 8 | 16/16, min 10 | off | `adaptive_cover/Aachen_v1_1_eval_PLMLoc_aliked_megaloc5_farthest8_diverse_desc_r1024_obs8_pnp16_min10.txt` | - | - | - |
 
 The first row is the original `PLMLoc-aliked` portal entry. Its preserved run
 localized 1,008/1,015 queries at 0.133 s/query. Provenance:
@@ -130,9 +135,9 @@ The official split contains 1,443 day and 429 night queries (1,872 total).
 | Status | Retrieval | Map/local feature | Selector | Budget | PnP | Submission file | Day | Night | Combined |
 |---|---|---|---|---:|---|---|---|---|---|
 | Submitted | MixVPR-5 | ALIKED+LightGlue SfM, ALIKED-r1024 | fixed `diverse_desc` | 8 | 16/16, min 10 | `RobotCar_eval_PLMLoc_aliked_mixvpr5_obs8_pnp16_min10_v2_test.txt` | 65.3 / 95.0 / 100.0 | 38.0 / 70.9 / 82.3 | 59.0 / 89.5 / 95.9 |
-| Submitted | MixVPR-5 | ALIKED-r1024 | adaptive v2 descriptor-only | K 8-16, s=0.85 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_aliked_top5_adaptive_cover_v2_floor8_s085_k16_r1024_k8_16_gain0005_pnp16_min10_v2_test.txt` | 63.8 / 94.7 / 100.0 | 27.5 / 64.3 / 83.4 | 55.5 / 87.7 / 96.2 |
-| Submitted | MegaLoc-5 | ALIKED-r1024 | fixed `diverse_desc` | 8 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_plmloc_aliked_megaloc5_farthest8_diverse_desc_r1024_obs8_pnp16_min10_v2_test.txt` | 63.3 / 94.7 / 100.0 | 35.9 / 80.9 / 98.6 | 57.0 / 91.5 / 99.7 |
-| Portal score not recorded here | MegaLoc-5 | ALIKED-r1024 | adaptive + farthest rescue 0.95 | K 1-8 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_plmloc_aliked_megaloc5_adaptive_cover_farthest_rawcos_thr095_k8_r1024_k1_8_gain0005_pnp16_min10_v2_test.txt` | - | - | - |
+| Submitted | MixVPR-5 | Converted RobotCar reference + nearest-attached ALIKED-r1024 | adaptive v2 descriptor-only | K 8-16, s=0.85 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_aliked_top5_adaptive_cover_v2_floor8_s085_k16_r1024_k8_16_gain0005_pnp16_min10_v2_test.txt` | 63.8 / 94.7 / 100.0 | 27.5 / 64.3 / 83.4 | 55.5 / 87.7 / 96.2 |
+| Submitted | MegaLoc-5 | Converted RobotCar reference + nearest-attached ALIKED-r1024 | fixed `diverse_desc` | 8 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_plmloc_aliked_megaloc5_farthest8_diverse_desc_r1024_obs8_pnp16_min10_v2_test.txt` | 63.3 / 94.7 / 100.0 | 35.9 / 80.9 / 98.6 | 57.0 / 91.5 / 99.7 |
+| Portal score not recorded here | MegaLoc-5 | Converted RobotCar reference + nearest-attached ALIKED-r1024 | adaptive + farthest rescue 0.95 | K 1-8 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_plmloc_aliked_megaloc5_adaptive_cover_farthest_rawcos_thr095_k8_r1024_k1_8_gain0005_pnp16_min10_v2_test.txt` | - | - | - |
 
 Preserved legacy RobotCar submissions:
 
@@ -156,8 +161,8 @@ day/night weighted aggregate.
 | Submitted | MixVPR-5 | native ALIKED+LightGlue SfM, covisibility 30, ALIKED-r1024 | point memory, max 8 | 16/16, min 10 | `cmu_extended_plmloc_aliked_lg_covis30_mixvpr5/CMU_eval_PLMLoc_aliked_lg_covis30_mixvpr5.txt` | 94.0 / 97.0 / 99.1 | 95.2 / 97.6 / 99.6 | 85.3 / 89.9 / 96.2 |
 | Submitted | MixVPR-5 | native SP+SG SfM, SP-r1600, covisibility 30 | point memory, max 8 | 16/16, min 10 | `CMU_eval_PLMLoc_sp_sg_1600_covis30_mixvpr5_full56613.txt` | 93.4 / 96.2 / 98.7 | 88.1 / 90.8 / 97.0 | 77.0 / 80.1 / 88.9 |
 | Submitted | MixVPR-5 | native SP+SG SfM, SP-r1600, covisibility 30 | point memory, max 16 | 16/16, min 10 | `CMU_eval_PLMLoc_sp_sg_1600_covis30_mixvpr5_obs16_full56613.txt` | 93.6 / 96.3 / 98.6 | 88.2 / 91.0 / 97.0 | 76.8 / 80.3 / 88.8 |
-| Portal score not recorded here | MegaLoc-5 | ALIKED-r1024 | adaptive raw cosine, K 1-12 | 16/16, min 10 | `adaptive_cover/CMU_eval_PLMLoc_plmloc_aliked_megaloc5_adaptive_cover_rawcos_k12_r1024_k1_12_gain0005_pnp16_min10.txt` | - | - | - |
-| In progress | MixVPR-5 | ALIKED-r1600 | adaptive v2 descriptor-only, K 8-16, s=0.85 | 16/16, min 10 | expected `CMU_eval_PLMLoc_aliked_top5_adaptive_cover_v2_floor8_s085_k16_r1600...txt` | - | - | - |
+| Portal score not recorded here | MegaLoc-5 | Provided per-slice geometry + nearest-attached ALIKED-r1024 | adaptive raw cosine, K 1-12 | 16/16, min 10 | `adaptive_cover/CMU_eval_PLMLoc_plmloc_aliked_megaloc5_adaptive_cover_rawcos_k12_r1024_k1_12_gain0005_pnp16_min10.txt` | - | - | - |
+| In progress | MixVPR-5 | Provided per-slice geometry + nearest-attached ALIKED-r1600 | adaptive v2 descriptor-only, K 8-16, s=0.85 | 16/16, min 10 | expected `CMU_eval_PLMLoc_aliked_top5_adaptive_cover_v2_floor8_s085_k16_r1600...txt` | - | - | - |
 
 ### CMU Park Ablations
 
@@ -197,4 +202,3 @@ For each new submission, add:
 6. Exact submitted filename.
 7. Official portal score once available.
 8. Path to `command.txt` and `run_summary.json` when artifacts are retained.
-
