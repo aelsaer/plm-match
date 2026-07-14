@@ -57,6 +57,11 @@ Combined values use these counts as weights.
 The first row is the original `PLMLoc-aliked` portal entry. Its preserved run
 localized 1,008/1,015 queries at 0.133 s/query. Provenance:
 
+See
+[Aachen PLMLoc-ALIKED MixVPR-5 Fixed-8 Reproduction](aachen_aliked_mixvpr5_fixed8.md)
+for the exact split, extraction, attachment, retrieval, localization, packaging,
+and validation commands.
+
 ```text
 aachen_submission_plmloc/results/mixvpr5_v1_1/
   point_memory_aliked_obs8_pnp16_min10/command.txt

@@ -74,6 +74,10 @@ SuperPoint+LightGlue model, depending on the selected matcher configuration.
 
 ## Aachen Day-Night v1.1
 
+The exact fixed-memory `PLMLoc-aliked` recipe and preserved official result are
+documented separately in
+[Aachen PLMLoc-ALIKED MixVPR-5 Fixed-8 Reproduction](aachen_aliked_mixvpr5_fixed8.md).
+
 ### Standard 1,015-query submission workflow
 
 The standard runner is:
@@ -375,4 +379,3 @@ python -m json.tool <native-sfm>/native_feature_sfm_summary.json | less
 Treat `command.txt`, config paths, and summaries as authoritative. Directory
 and submission filenames are descriptive labels and may contain legacy tokens
 that were inactive during localization.
-
