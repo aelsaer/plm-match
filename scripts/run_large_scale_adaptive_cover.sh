@@ -8,6 +8,8 @@ set -euo pipefail
 #   - writes generated artifacts and results under /mnt/d
 #   - uses the final adaptive-cover point-memory setting:
 #       ALIKED point_memory_hloc_nn + adaptive_cover, K in [1, 32], min gain 0.005
+#   - LANDMARK_MATCH_MODE=image_obs switches to retrieval-conditioned image
+#     observations; point-memory selector settings are then inactive.
 #
 # Examples:
 #   bash scripts/run_large_scale_adaptive_cover.sh
@@ -101,6 +103,7 @@ REBUILD_ATTACHMENT=${REBUILD_ATTACHMENT:-0}
 POINT_MEMORY_MAX_OBS=${POINT_MEMORY_MAX_OBS:-0}
 POINT_MEMORY_OBS_SELECT=${POINT_MEMORY_OBS_SELECT:-adaptive_cover}
 POINT_MEMORY_OBS_TAG=${POINT_MEMORY_OBS_TAG:-$POINT_MEMORY_OBS_SELECT}
+LANDMARK_MATCH_MODE=${LANDMARK_MATCH_MODE:-point_memory_hloc_nn}
 POINT_MEMORY_ADAPTIVE_K_MIN=${POINT_MEMORY_ADAPTIVE_K_MIN:-1}
 POINT_MEMORY_ADAPTIVE_K_MAX=${POINT_MEMORY_ADAPTIVE_K_MAX:-32}
 POINT_MEMORY_ADAPTIVE_MIN_GAIN=${POINT_MEMORY_ADAPTIVE_MIN_GAIN:-0.005}
@@ -118,7 +121,20 @@ POSE_GUIDED_SCORE_THRESH=${POSE_GUIDED_SCORE_THRESH:-0.1}
 POSE_GUIDED_REPROJ_PENALTY=${POSE_GUIDED_REPROJ_PENALTY:-0.02}
 POSE_GUIDED_MAX_DESCS_PER_POINT=${POSE_GUIDED_MAX_DESCS_PER_POINT:-8}
 MIN_POSE_GUIDED_INLIERS=${MIN_POSE_GUIDED_INLIERS:-12}
-RESULT_NAME=${RESULT_NAME:-plmloc_${FEATURE}_${POINT_MEMORY_OBS_TAG}_k${POINT_MEMORY_ADAPTIVE_K_MIN}_${POINT_MEMORY_ADAPTIVE_K_MAX}_gain${POINT_MEMORY_ADAPTIVE_MIN_GAIN/./}}
+case "$LANDMARK_MATCH_MODE" in
+  image_obs|image_obs_hloc_nn)
+    DEFAULT_METHOD_TAG="$LANDMARK_MATCH_MODE"
+    ;;
+  point_memory|point_memory_support|point_memory_hloc_nn|point_memory_imagewise_hloc_nn)
+    DEFAULT_METHOD_TAG="${LANDMARK_MATCH_MODE}_${POINT_MEMORY_OBS_TAG}_k${POINT_MEMORY_ADAPTIVE_K_MIN}_${POINT_MEMORY_ADAPTIVE_K_MAX}_gain${POINT_MEMORY_ADAPTIVE_MIN_GAIN/./}"
+    ;;
+  *)
+    echo "Unsupported LANDMARK_MATCH_MODE=$LANDMARK_MATCH_MODE for the large-scale runner." >&2
+    echo "Use image_obs, image_obs_hloc_nn, point_memory, point_memory_support, point_memory_hloc_nn, or point_memory_imagewise_hloc_nn." >&2
+    exit 2
+    ;;
+esac
+RESULT_NAME=${RESULT_NAME:-plmloc_${FEATURE}_${DEFAULT_METHOD_TAG}}
 
 CMU_SLICES=${CMU_SLICES:-slice2,slice3,slice4,slice5,slice6,slice7,slice8,slice9,slice10,slice17,slice18,slice19,slice20,slice21,slice22,slice24,slice25}
 CMU_EXTRACT_IMAGES=${CMU_EXTRACT_IMAGES:-auto}
@@ -207,7 +223,7 @@ run_plmloc() {
     --method "$FEATURE_H5_METHOD" \
     --db_features_path "$db_features" \
     --query_features_path "$query_features" \
-    --landmark_match_mode point_memory_hloc_nn \
+    --landmark_match_mode "$LANDMARK_MATCH_MODE" \
     --point_memory_max_obs "$POINT_MEMORY_MAX_OBS" \
     --point_memory_obs_select "$POINT_MEMORY_OBS_SELECT" \
     --point_memory_adaptive_k_min "$POINT_MEMORY_ADAPTIVE_K_MIN" \

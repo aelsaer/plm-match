@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PY=${PY:-/home/andreas/anaconda3/envs/sam3/bin/python}
-ROOT=${ROOT:-/home/phd/plm-match}
-HLOC_ROOT=${HLOC_ROOT:-/home/phd/Hierarchical-Localization}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT=${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}
+PY=${PY:-python}
+HLOC_ROOT=${HLOC_ROOT:-$ROOT/external/Hierarchical-Localization}
 HLOC_ALIKED_ROOT=${HLOC_ALIKED_ROOT:-outputs/hloc_7scenes_aliked_lg}
+SEVENSCENES_ROOT=${SEVENSCENES_ROOT:-/mnt/d/private/pairs}
+SEVENSCENES_REFERENCE_ROOT=${SEVENSCENES_REFERENCE_ROOT:-$SEVENSCENES_ROOT/7scenes_sfm_triangulated}
 SFM_TAG=${SFM_TAG:-hloc_aliked_lg_sfm}
 SCENES=${SCENES:-"chess fire heads office pumpkin redkitchen stairs"}
 TOPK=${TOPK:-10}
@@ -20,13 +23,33 @@ POSE_SCORE=${POSE_SCORE:-0.1}
 POSE_REPROJ_PENALTY=${POSE_REPROJ_PENALTY:-0.02}
 POSE_MAX_DESCS_PER_POINT=${POSE_MAX_DESCS_PER_POINT:-8}
 MIN_POSE_GUIDED_INLIERS=${MIN_POSE_GUIDED_INLIERS:-12}
+LANDMARK_MATCH_MODE=${LANDMARK_MATCH_MODE:-point_memory_hloc_nn}
+POINT_MEMORY_MAX_OBS=${POINT_MEMORY_MAX_OBS:-16}
+POINT_MEMORY_OBS_SELECT=${POINT_MEMORY_OBS_SELECT:-diverse_desc}
+POINT_MEMORY_ADAPTIVE_K_MIN=${POINT_MEMORY_ADAPTIVE_K_MIN:-1}
+POINT_MEMORY_ADAPTIVE_K_MAX=${POINT_MEMORY_ADAPTIVE_K_MAX:-32}
+POINT_MEMORY_ADAPTIVE_MIN_GAIN=${POINT_MEMORY_ADAPTIVE_MIN_GAIN:-0.005}
+POINT_MEMORY_ADAPTIVE_S_MIN=${POINT_MEMORY_ADAPTIVE_S_MIN:-0.80}
+POINT_MEMORY_ADAPTIVE_GATE_FRAC=${POINT_MEMORY_ADAPTIVE_GATE_FRAC:-0.30}
+PNP_FIRST_THRESH=${PNP_FIRST_THRESH:-8.0}
+PNP_REFINE_THRESH=${PNP_REFINE_THRESH:-4.0}
+MIN_FINAL_INLIERS=${MIN_FINAL_INLIERS:-12}
 
 score_label="${POSE_SCORE//./p}"
 if [[ -z "${RUN_NAME+x}" ]]; then
-  if [[ "$POSE_GUIDED" == "1" ]]; then
-    RUN_NAME="point_memory_hloc_nn_obs16_diverse_poseguided_r${POSE_RADIUS}_s${score_label}"
+  if [[ "$LANDMARK_MATCH_MODE" == image_obs* ]]; then
+    memory_label="$LANDMARK_MATCH_MODE"
   else
-    RUN_NAME="point_memory_hloc_nn_obs16_diverse"
+    selector_label="$POINT_MEMORY_OBS_SELECT"
+    if [[ "$selector_label" == "diverse_desc" ]]; then
+      selector_label=diverse
+    fi
+    memory_label="${LANDMARK_MATCH_MODE}_obs${POINT_MEMORY_MAX_OBS}_${selector_label}"
+  fi
+  if [[ "$POSE_GUIDED" == "1" ]]; then
+    RUN_NAME="${memory_label}_poseguided_r${POSE_RADIUS}_s${score_label}"
+  else
+    RUN_NAME="$memory_label"
   fi
 fi
 
@@ -38,9 +61,9 @@ for SCENE in $SCENES; do
   SPLIT="${BASE}/split/split.json"
   SFM_SPLIT_DIR="outputs/7scenes_${SCENE}_sfm_plm_hlocnn/split"
   SFM_SPLIT="${SFM_SPLIT_DIR}/split.json"
-  DATASET_ROOT="/mnt/d/private/pairs"
-  DATASET="/mnt/d/private/pairs/${SCENE}"
-  REF_MODEL="/mnt/d/private/pairs/7scenes_sfm_triangulated/${SCENE}/triangulated"
+  DATASET_ROOT="$SEVENSCENES_ROOT"
+  DATASET="$SEVENSCENES_ROOT/${SCENE}"
+  REF_MODEL="$SEVENSCENES_REFERENCE_ROOT/${SCENE}/triangulated"
   RETRIEVAL="${BASE}/retrieval_mixvpr/pairs-loo-mixvpr${TOPK}.txt"
   HLOC_SCENE_DIR="${HLOC_ALIKED_ROOT}/${SCENE}"
   HLOC_MODEL="${HLOC_SCENE_DIR}/sfm_aliked+lightglue"
@@ -202,7 +225,7 @@ PY
     )
   fi
 
-  echo "[run PLMLoc ALIKED+MixVPR point memory] $SCENE -> $RUN_NAME"
+  echo "[run PLMLoc ALIKED+MixVPR $LANDMARK_MATCH_MODE] $SCENE -> $RUN_NAME"
   "$PY" -m plm_match.pipelines.lifted_nn_localize \
     --config "$COLMAP_CONFIG" \
     --dataset_root "$DATASET" \
@@ -213,10 +236,15 @@ PY
     --method aliked_h5 \
     --db_features_path "$HLOC_FEATURES" \
     --query_features_path "$HLOC_FEATURES" \
-    --landmark_match_mode point_memory_hloc_nn \
+    --landmark_match_mode "$LANDMARK_MATCH_MODE" \
     --memory_search_backend exact \
-    --point_memory_max_obs 16 \
-    --point_memory_obs_select diverse_desc \
+    --point_memory_max_obs "$POINT_MEMORY_MAX_OBS" \
+    --point_memory_obs_select "$POINT_MEMORY_OBS_SELECT" \
+    --point_memory_adaptive_k_min "$POINT_MEMORY_ADAPTIVE_K_MIN" \
+    --point_memory_adaptive_k_max "$POINT_MEMORY_ADAPTIVE_K_MAX" \
+    --point_memory_adaptive_min_gain "$POINT_MEMORY_ADAPTIVE_MIN_GAIN" \
+    --point_memory_adaptive_s_min "$POINT_MEMORY_ADAPTIVE_S_MIN" \
+    --point_memory_adaptive_gate_frac "$POINT_MEMORY_ADAPTIVE_GATE_FRAC" \
     --topk "$TOPK" \
     --query_topk "$QUERY_TOPK" \
     --metric_thresholds 0.05/5,0.1/5,0.25/10 \
@@ -230,9 +258,9 @@ PY
     --attach_dist_weight 0.0 \
     --max_cluster_images 5 \
     --max_cluster_seeds 10 \
-    --pnp_first_thresh 8.0 \
-    --pnp_refine_thresh 4.0 \
-    --min_final_inliers 12 \
+    --pnp_first_thresh "$PNP_FIRST_THRESH" \
+    --pnp_refine_thresh "$PNP_REFINE_THRESH" \
+    --min_final_inliers "$MIN_FINAL_INLIERS" \
     --point_memory_batch_size 128 \
     --point_viewproto_k 4 \
     --point_viewproto_min_obs 2 \

@@ -13,10 +13,12 @@ set -euo pipefail
 #   RETRIEVALS="netvlad mixvpr salad" bash scripts/run_cambridge_sp_sg_poseguided_plmloc.sh
 #   SCENES="shopfacade greatcourt" SKIP_EXISTING=0 bash scripts/run_cambridge_sp_sg_poseguided_plmloc.sh
 
-PY=${PY:-/home/andreas/anaconda3/envs/sam3/bin/python}
-ROOT=${ROOT:-/home/phd/plm-match}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT=${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}
+PY=${PY:-python}
 cd "$ROOT"
 
+CAMBRIDGE_ROOT=${CAMBRIDGE_ROOT:-/mnt/d/private/pairs/cambridge_landmarks}
 SCENES=${SCENES:-"kingscollege oldhospital shopfacade stmaryschurch greatcourt"}
 RETRIEVALS=${RETRIEVALS:-"mixvpr"}
 SKIP_EXISTING=${SKIP_EXISTING:-1}
@@ -28,13 +30,30 @@ POSE_REPROJ_PENALTY=${POSE_REPROJ_PENALTY:-0.02}
 POSE_MAX_DESCS_PER_POINT=${POSE_MAX_DESCS_PER_POINT:-8}
 MIN_POSE_GUIDED_INLIERS=${MIN_POSE_GUIDED_INLIERS:-12}
 TOPK=${TOPK:-10}
+LANDMARK_MATCH_MODE=${LANDMARK_MATCH_MODE:-point_memory_hloc_nn}
+POINT_MEMORY_MAX_OBS=${POINT_MEMORY_MAX_OBS:-16}
+POINT_MEMORY_OBS_SELECT=${POINT_MEMORY_OBS_SELECT:-diverse_desc}
+POINT_MEMORY_ADAPTIVE_K_MIN=${POINT_MEMORY_ADAPTIVE_K_MIN:-1}
+POINT_MEMORY_ADAPTIVE_K_MAX=${POINT_MEMORY_ADAPTIVE_K_MAX:-32}
+POINT_MEMORY_ADAPTIVE_MIN_GAIN=${POINT_MEMORY_ADAPTIVE_MIN_GAIN:-0.005}
+POINT_MEMORY_ADAPTIVE_S_MIN=${POINT_MEMORY_ADAPTIVE_S_MIN:-0.80}
+POINT_MEMORY_ADAPTIVE_GATE_FRAC=${POINT_MEMORY_ADAPTIVE_GATE_FRAC:-0.30}
 
 score_label="${POSE_SCORE//./p}"
 if [[ -z "${RUN_NAME:-}" ]]; then
-  if [[ "$TOPK" == "10" ]]; then
-    RUN_NAME=point_memory_hloc_nn_obs16_diverse_poseguided_r${POSE_RADIUS}_s${score_label}
+  if [[ "$LANDMARK_MATCH_MODE" == image_obs* ]]; then
+    memory_label="$LANDMARK_MATCH_MODE"
   else
-    RUN_NAME=point_memory_hloc_nn_obs16_diverse_topk${TOPK}_poseguided_r${POSE_RADIUS}_s${score_label}
+    selector_label="$POINT_MEMORY_OBS_SELECT"
+    if [[ "$selector_label" == "diverse_desc" ]]; then
+      selector_label=diverse
+    fi
+    memory_label="${LANDMARK_MATCH_MODE}_obs${POINT_MEMORY_MAX_OBS}_${selector_label}"
+  fi
+  if [[ "$TOPK" == "10" ]]; then
+    RUN_NAME=${memory_label}_poseguided_r${POSE_RADIUS}_s${score_label}
+  else
+    RUN_NAME=${memory_label}_topk${TOPK}_poseguided_r${POSE_RADIUS}_s${score_label}
   fi
 fi
 RESULT_TAG=${RESULT_TAG:-plm_hlocnn_poseguided_sp_sg}
@@ -72,11 +91,11 @@ CONFIGS=(
 )
 
 DATASET_ROOTS=(
-  /mnt/d/private/pairs/cambridge_landmarks/KingsCollege
-  /mnt/d/private/pairs/cambridge_landmarks/OldHospital
-  /mnt/d/private/pairs/cambridge_landmarks/ShopFacade
-  /mnt/d/private/pairs/cambridge_landmarks/StMarysChurch
-  /mnt/d/private/pairs/cambridge_landmarks/GreatCourt
+  "$CAMBRIDGE_ROOT/KingsCollege"
+  "$CAMBRIDGE_ROOT/OldHospital"
+  "$CAMBRIDGE_ROOT/ShopFacade"
+  "$CAMBRIDGE_ROOT/StMarysChurch"
+  "$CAMBRIDGE_ROOT/GreatCourt"
 )
 
 SP_INDEXES=(
@@ -88,19 +107,19 @@ SP_INDEXES=(
 )
 
 SP_FEATURES=(
-  /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/KingsCollege/feats-superpoint-n4096-r1024.h5
-  /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/feats-superpoint-n4096-r1024.h5
+  "$CAMBRIDGE_ROOT/CambridgeLandmarks_Colmap_Retriangulated_1024px/KingsCollege/feats-superpoint-n4096-r1024.h5"
+  "$CAMBRIDGE_ROOT/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/feats-superpoint-n4096-r1024.h5"
   outputs/hloc_cambridge_sp_sg/ShopFacade/feats-superpoint-n4096-r1024.h5
-  /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/feats-superpoint-n4096-r1024.h5
-  /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/feats-superpoint-n4096-r1024.h5
+  "$CAMBRIDGE_ROOT/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/feats-superpoint-n4096-r1024.h5"
+  "$CAMBRIDGE_ROOT/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/feats-superpoint-n4096-r1024.h5"
 )
 
 NETVLAD_RETRIEVALS=(
-  /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/KingsCollege/pairs-query-netvlad10.txt
-  /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/pairs-query-netvlad10.txt
+  "$CAMBRIDGE_ROOT/CambridgeLandmarks_Colmap_Retriangulated_1024px/KingsCollege/pairs-query-netvlad10.txt"
+  "$CAMBRIDGE_ROOT/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/pairs-query-netvlad10.txt"
   outputs/cambridge_shopfacade_official/retrieval/pairs-loo-netvlad10.txt
-  /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/pairs-query-netvlad10.txt
-  /mnt/d/private/pairs/cambridge_landmarks/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/pairs-query-netvlad10.txt
+  "$CAMBRIDGE_ROOT/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/pairs-query-netvlad10.txt"
+  "$CAMBRIDGE_ROOT/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/pairs-query-netvlad10.txt"
 )
 
 MIXVPR_RETRIEVALS=(
@@ -167,7 +186,7 @@ run_scene() {
     --method superpoint_h5 \
     --db_features_path "${SP_FEATURES[$i]}" \
     --query_features_path "${SP_FEATURES[$i]}" \
-    --landmark_match_mode point_memory_hloc_nn \
+    --landmark_match_mode "$LANDMARK_MATCH_MODE" \
     --retrieval_prior_mode rank \
     --memory_score_weight 0.0 \
     --memory_search_backend exact \
@@ -183,8 +202,13 @@ run_scene() {
     --pnp_first_thresh 12.0 \
     --pnp_refine_thresh 12.0 \
     --min_final_inliers 12 \
-    --point_memory_max_obs 16 \
-    --point_memory_obs_select diverse_desc \
+    --point_memory_max_obs "$POINT_MEMORY_MAX_OBS" \
+    --point_memory_obs_select "$POINT_MEMORY_OBS_SELECT" \
+    --point_memory_adaptive_k_min "$POINT_MEMORY_ADAPTIVE_K_MIN" \
+    --point_memory_adaptive_k_max "$POINT_MEMORY_ADAPTIVE_K_MAX" \
+    --point_memory_adaptive_min_gain "$POINT_MEMORY_ADAPTIVE_MIN_GAIN" \
+    --point_memory_adaptive_s_min "$POINT_MEMORY_ADAPTIVE_S_MIN" \
+    --point_memory_adaptive_gate_frac "$POINT_MEMORY_ADAPTIVE_GATE_FRAC" \
     --pose_guided \
     --pose_guided_radius_px "$POSE_RADIUS" \
     --pose_guided_score_thresh "$POSE_SCORE" \

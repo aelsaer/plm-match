@@ -18,12 +18,24 @@ SCENES="${SCENES:-chess fire heads office pumpkin redkitchen stairs}"
 POSE_RADIUS="${POSE_RADIUS:-6}"
 POSE_SCORE="${POSE_SCORE:-0.2}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
+LANDMARK_MATCH_MODE="${LANDMARK_MATCH_MODE:-point_memory_hloc_nn}"
+POINT_MEMORY_MAX_OBS="${POINT_MEMORY_MAX_OBS:-16}"
+POINT_MEMORY_OBS_SELECT="${POINT_MEMORY_OBS_SELECT:-diverse_desc}"
 
 cd "$ROOT"
 
 for scene in $SCENES; do
   score_label="${POSE_SCORE//./p}"
-  run_name="point_memory_hloc_nn_obs16_diverse_poseguided_r${POSE_RADIUS}_s${score_label}"
+  if [[ "$LANDMARK_MATCH_MODE" == image_obs* ]]; then
+    memory_label="$LANDMARK_MATCH_MODE"
+  else
+    selector_label="$POINT_MEMORY_OBS_SELECT"
+    if [[ "$selector_label" == "diverse_desc" ]]; then
+      selector_label=diverse
+    fi
+    memory_label="${LANDMARK_MATCH_MODE}_obs${POINT_MEMORY_MAX_OBS}_${selector_label}"
+  fi
+  run_name="${memory_label}_poseguided_r${POSE_RADIUS}_s${score_label}"
   out_dir="outputs/7scenes_plm_hlocnn_ablation/results/sfm_hloc_sp_sg/superpoint/${scene}/mixvpr/${run_name}"
   eval_json="$out_dir/hloc_eval_sfm_gt.json"
 
@@ -38,6 +50,7 @@ for scene in $SCENES; do
   PY="$PY" \
   POSE_RADIUS="$POSE_RADIUS" \
   POSE_SCORE="$POSE_SCORE" \
+  RUN_NAME="$run_name" \
   MAX_QUERIES="${MAX_QUERIES:-}" \
     "$SCRIPT_DIR/run_7scenes_stairs_poseguided_sfm_plm.sh"
 done

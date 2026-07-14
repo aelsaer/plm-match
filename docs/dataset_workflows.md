@@ -11,11 +11,18 @@ filename:
    descriptor used to represent map observations and query keypoints.
 3. **Global retrieval**: MixVPR, MegaLoc, NetVLAD, or SALAD pairs used to select
    database images.
-4. **Point-memory selection**: fixed `diverse_desc`, `adaptive_cover`,
-   `adaptive_cover_farthest`, or `adaptive_cover_v2`.
+4. **PLMLoc matching backend**: retrieval-conditioned `image_obs` or a
+   landmark-centric mode such as `point_memory_hloc_nn`.
+5. **Point-memory selection**: fixed `diverse_desc`, `adaptive_cover`,
+   `adaptive_cover_farthest`, or `adaptive_cover_v2`. This choice is active
+   only for a point-memory backend.
 
 In particular, `FEATURE=aliked` controls local feature extraction. It does not
 by itself imply that the 3D map was triangulated with ALIKED+LightGlue.
+
+For a common command interface that runs `image_obs`, fixed diverse-8 point
+memory, or adaptive-cover-v2 floor-8 across all supported datasets, see
+[PLMLoc Backend Reproduction](plmloc_backend_reproduction.md).
 
 ## Map Construction Terms
 
@@ -371,7 +378,7 @@ Useful provenance checks are:
 
 ```bash
 rg -n 'model_path|sfm_dir' <run-config.yaml>
-rg -n -- '--attached_index|--db_features_path|--point_memory_obs_select' <result>/command.txt
+rg -n -- '--attached_index|--db_features_path|--landmark_match_mode|--point_memory_obs_select' <result>/command.txt
 python -m json.tool <attachment>/summary.json | less
 python -m json.tool <native-sfm>/native_feature_sfm_summary.json | less
 ```

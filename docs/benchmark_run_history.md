@@ -139,7 +139,7 @@ The official split contains 1,443 day and 429 night queries (1,872 total).
 
 | Status | Retrieval | Map/local feature | Selector | Budget | PnP | Submission file | Day | Night | Combined |
 |---|---|---|---|---:|---|---|---|---|---|
-| Submitted | MixVPR-5 | ALIKED+LightGlue SfM, ALIKED-r1024 | fixed `diverse_desc` | 8 | 16/16, min 10 | `RobotCar_eval_PLMLoc_aliked_mixvpr5_obs8_pnp16_min10_v2_test.txt` | 65.3 / 95.0 / 100.0 | 38.0 / 70.9 / 82.3 | 59.0 / 89.5 / 95.9 |
+| Submitted | MixVPR-5 | ALIKED+LightGlue SfM, ALIKED-r1024 | retrieval-conditioned `image_obs` | n/a | 16/16, min 10 | `RobotCar_eval_PLMLoc_aliked_mixvpr5_obs8_pnp16_min10_v2_test.txt` | 65.3 / 95.0 / 100.0 | 38.0 / 70.9 / 82.3 | 59.0 / 89.5 / 95.9 |
 | Submitted | MixVPR-5 | Converted RobotCar reference + nearest-attached ALIKED-r1024 | adaptive v2 descriptor-only | K 8-16, s=0.85 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_aliked_top5_adaptive_cover_v2_floor8_s085_k16_r1024_k8_16_gain0005_pnp16_min10_v2_test.txt` | 63.8 / 94.7 / 100.0 | 27.5 / 64.3 / 83.4 | 55.5 / 87.7 / 96.2 |
 | Submitted | MegaLoc-5 | Converted RobotCar reference + nearest-attached ALIKED-r1024 | fixed `diverse_desc` | 8 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_plmloc_aliked_megaloc5_farthest8_diverse_desc_r1024_obs8_pnp16_min10_v2_test.txt` | 63.3 / 94.7 / 100.0 | 35.9 / 80.9 / 98.6 | 57.0 / 91.5 / 99.7 |
 | Portal score not recorded here | MegaLoc-5 | Converted RobotCar reference + nearest-attached ALIKED-r1024 | adaptive + farthest rescue 0.95 | K 1-8 | 16/16, min 10 | `adaptive_cover/RobotCar_eval_PLMLoc_plmloc_aliked_megaloc5_adaptive_cover_farthest_rawcos_thr095_k8_r1024_k1_8_gain0005_pnp16_min10_v2_test.txt` | - | - | - |
@@ -155,6 +155,11 @@ The fixed MegaLoc farthest-8 run produced all 1,872 pose lines. Its exact-zero
 portal entry observed during one upload was therefore not caused by missing
 query names: the submission names matched `robotcar_v2_test.txt` exactly. The
 subsequent recorded portal result is the non-zero row shown above.
+
+The first native-ALIKED row has a legacy `obs8` token in its filename, but its
+preserved `command.txt` sets `landmark_match_mode=image_obs`. Therefore the
+observation cap and point-memory selector were inactive; this result must not
+be described as a fixed diverse-8 point-memory run.
 
 ## Extended CMU Seasons
 
@@ -183,7 +188,9 @@ All rows retain the original urban/suburban poses and replace only park slices.
 ## Interpretation Notes
 
 1. Fixed `diverse_desc` farthest-8 is the strongest verified simple selector
-   across the original ALIKED Aachen and RobotCar runs.
+   among the recorded point-memory Aachen and RobotCar attachment runs. The
+   native RobotCar ALIKED result at 65.3/95.0/100.0 day used `image_obs` and is
+   not a selector ablation.
 2. Adaptive v2's Aachen floor fix improved night results over unconstrained v2,
    but it did not transfer to RobotCar strict/medium night thresholds.
 3. MegaLoc retrieval is substantially more spatially coherent than MixVPR on

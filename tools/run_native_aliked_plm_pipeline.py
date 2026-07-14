@@ -72,7 +72,17 @@ def main() -> None:
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument("--query_topk", type=int, default=4096)
     parser.add_argument("--memory_score_weight", type=float, default=0.02)
+    parser.add_argument("--landmark_match_mode", type=str, default="image_obs")
     parser.add_argument("--point_memory_max_obs", type=int, default=4)
+    parser.add_argument("--point_memory_obs_select", type=str, default="diverse_desc")
+    parser.add_argument("--point_memory_adaptive_k_min", type=int, default=1)
+    parser.add_argument("--point_memory_adaptive_k_max", type=int, default=32)
+    parser.add_argument("--point_memory_adaptive_min_gain", type=float, default=0.005)
+    parser.add_argument("--point_memory_adaptive_s_min", type=float, default=0.80)
+    parser.add_argument("--point_memory_adaptive_gate_frac", type=float, default=0.30)
+    parser.add_argument("--pnp_first_thresh", type=float, default=12.0)
+    parser.add_argument("--pnp_refine_thresh", type=float, default=12.0)
+    parser.add_argument("--min_final_inliers", type=int, default=12)
     parser.add_argument("--max_queries", type=int, default=None)
     parser.add_argument("--overwrite_features", action="store_true")
     parser.add_argument("--overwrite_pairs", action="store_true")
@@ -277,15 +287,11 @@ def main() -> None:
             "--query_features_path",
             str(query_features),
             "--landmark_match_mode",
-            "image_obs",
+            str(args.landmark_match_mode),
             "--memory_score_weight",
             str(args.memory_score_weight),
             "--memory_score_mode",
             "point_memory",
-            "--point_memory_max_obs",
-            str(args.point_memory_max_obs),
-            "--point_memory_batch_size",
-            "128",
             "--topk",
             str(args.topk),
             "--query_topk",
@@ -299,7 +305,36 @@ def main() -> None:
             "0.0",
             "--attach_dist_weight",
             "0.0",
+            "--pnp_first_thresh",
+            str(args.pnp_first_thresh),
+            "--pnp_refine_thresh",
+            str(args.pnp_refine_thresh),
+            "--min_final_inliers",
+            str(args.min_final_inliers),
         ]
+        if str(args.landmark_match_mode).startswith("point_"):
+            loc_cmd.extend(
+                [
+                    "--point_memory_max_obs",
+                    str(args.point_memory_max_obs),
+                    "--point_memory_obs_select",
+                    str(args.point_memory_obs_select),
+                    "--point_memory_adaptive_k_min",
+                    str(args.point_memory_adaptive_k_min),
+                    "--point_memory_adaptive_k_max",
+                    str(args.point_memory_adaptive_k_max),
+                    "--point_memory_adaptive_min_gain",
+                    str(args.point_memory_adaptive_min_gain),
+                    "--point_memory_adaptive_s_min",
+                    str(args.point_memory_adaptive_s_min),
+                    "--point_memory_adaptive_gate_frac",
+                    str(args.point_memory_adaptive_gate_frac),
+                    "--point_memory_batch_size",
+                    "128",
+                ]
+            )
+        else:
+            print(f"PLMLoc backend {args.landmark_match_mode}: point-memory selector arguments are inactive.")
         if args.max_queries is not None:
             loc_cmd.extend(["--max_queries", str(args.max_queries)])
         _run(loc_cmd, dry_run=bool(args.dry_run))
@@ -341,6 +376,10 @@ def main() -> None:
                 "report": str(attached_index / "inspection" / "plm_landmark_memory_report.md"),
             },
             "localization": {
+                "landmark_match_mode": eval_summary.get("landmark_match_mode"),
+                "point_memory_settings_active": str(args.landmark_match_mode).startswith("point_"),
+                "point_memory_obs_select": eval_summary.get("point_memory_obs_select"),
+                "point_memory_max_obs": eval_summary.get("point_memory_max_obs"),
                 "num_queries": eval_summary.get("num_queries"),
                 "success_rate": eval_summary.get("success_rate"),
                 "report_text": eval_summary.get("report_text"),
