@@ -382,12 +382,19 @@ def _run_nearest_lift_localization(
 def _single_process_dataloader(torch_module):
     original_dataloader = torch_module.utils.data.DataLoader
 
-    def _patched_dataloader(*args, **kwargs):
-        kwargs["num_workers"] = 0
-        kwargs["pin_memory"] = False
-        return original_dataloader(*args, **kwargs)
+    class _PatchedDataLoader(original_dataloader):
+        # Kornia evaluates DataLoader[Any] while importing ALIKED.  Preserve
+        # the generic class interface while forcing HLoc to a single worker.
+        @classmethod
+        def __class_getitem__(cls, item):
+            return original_dataloader[item]
 
-    torch_module.utils.data.DataLoader = _patched_dataloader
+        def __init__(self, *args, **kwargs):
+            kwargs["num_workers"] = 0
+            kwargs["pin_memory"] = False
+            super().__init__(*args, **kwargs)
+
+    torch_module.utils.data.DataLoader = _PatchedDataLoader
     try:
         yield
     finally:

@@ -224,6 +224,69 @@ def _umeyama(src: np.ndarray, dst: np.ndarray) -> tuple[float, np.ndarray, np.nd
     return scale, R, t
 
 
+def _alignment_residuals_gt(src: np.ndarray, dst: np.ndarray, *, scale: float, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Residuals in source/GT units for a fit dst ~= scale * R * src + t."""
+    src = np.asarray(src, dtype=np.float64).reshape(-1, 3)
+    dst = np.asarray(dst, dtype=np.float64).reshape(-1, 3)
+    t = np.asarray(t, dtype=np.float64).reshape(3)
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    src_from_dst = ((dst - t[None, :]) @ R) / max(float(scale), 1e-12)
+    return np.linalg.norm(src_from_dst - src, axis=1)
+
+
+def _robust_umeyama(
+    src: np.ndarray,
+    dst: np.ndarray,
+    *,
+    min_threshold: float = 0.10,
+    mad_scale: float = 4.0,
+    max_iters: int = 8,
+    min_inliers: int = 3,
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, list[dict[str, float | int]]]:
+    """Fit a Sim3 while rejecting gross camera-center outliers.
+
+    Cambridge NVM files can contain a few cameras whose NVM center is not
+    consistent with the official train pose. A plain all-point Umeyama fit lets
+    those outliers shift the metric frame by centimetres. We fit once, reject
+    points above a robust MAD threshold, and iterate.
+    """
+    src = np.asarray(src, dtype=np.float64).reshape(-1, 3)
+    dst = np.asarray(dst, dtype=np.float64).reshape(-1, 3)
+    if src.shape[0] != dst.shape[0]:
+        raise ValueError("src and dst must contain the same number of points")
+    min_inliers = max(int(min_inliers), 3)
+    mask = np.ones(src.shape[0], dtype=bool)
+    history: list[dict[str, float | int]] = []
+    for iteration in range(max(1, int(max_iters))):
+        scale, R, t = _umeyama(src[mask], dst[mask])
+        residuals = _alignment_residuals_gt(src, dst, scale=scale, R=R, t=t)
+        active = residuals[mask]
+        median = float(np.median(active)) if active.size else 0.0
+        mad = float(np.median(np.abs(active - median))) if active.size else 0.0
+        sigma = float(1.4826 * mad)
+        threshold = max(float(min_threshold), median + float(mad_scale) * sigma)
+        new_mask = residuals <= threshold
+        history.append(
+            {
+                "iteration": int(iteration),
+                "num_fit_poses": int(mask.sum()),
+                "num_kept_poses": int(new_mask.sum()),
+                "threshold_gt_m": float(threshold),
+                "median_residual_gt_m": float(np.median(residuals)),
+                "mean_residual_gt_m": float(np.mean(residuals)),
+                "max_residual_gt_m": float(np.max(residuals)),
+            }
+        )
+        if int(new_mask.sum()) < min_inliers:
+            break
+        if np.array_equal(new_mask, mask):
+            mask = new_mask
+            break
+        mask = new_mask
+    scale, R, t = _umeyama(src[mask], dst[mask])
+    return scale, R, t, mask, history
+
+
 def _colmap_point_to_gt(xyz_colmap: np.ndarray, *, scale: float, R: np.ndarray, t: np.ndarray) -> np.ndarray:
     return R.T @ ((np.asarray(xyz_colmap, dtype=np.float64).reshape(3) - t.reshape(3)) / float(scale))
 
@@ -404,6 +467,30 @@ def main() -> None:
     parser.add_argument("--matcher", choices=("exhaustive", "sequential"), default="exhaustive")
     parser.add_argument("--camera_model", default="SIMPLE_RADIAL")
     parser.add_argument("--single_camera", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--robust_alignment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reject gross train-pose/NVM camera-center outliers before fitting the metric Sim3 alignment.",
+    )
+    parser.add_argument(
+        "--robust_alignment_min_threshold_m",
+        type=float,
+        default=0.10,
+        help="Minimum robust-alignment inlier threshold in GT metres.",
+    )
+    parser.add_argument(
+        "--robust_alignment_mad_scale",
+        type=float,
+        default=4.0,
+        help="MAD multiplier used by robust train-pose/NVM alignment.",
+    )
+    parser.add_argument(
+        "--robust_alignment_max_iters",
+        type=int,
+        default=8,
+        help="Maximum robust-alignment reweighting iterations.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
@@ -467,7 +554,20 @@ def main() -> None:
             raise RuntimeError(
                 f"Only {len(used_names)} NVM train images had GT poses; need at least 3 for Sim3 alignment."
             )
-        scale, R, t = _umeyama(np.stack(gt_centers, axis=0), np.stack(colmap_centers, axis=0))
+        gt_centers_arr = np.stack(gt_centers, axis=0)
+        colmap_centers_arr = np.stack(colmap_centers, axis=0)
+        if bool(args.robust_alignment):
+            scale, R, t, alignment_mask, robust_history = _robust_umeyama(
+                gt_centers_arr,
+                colmap_centers_arr,
+                min_threshold=float(args.robust_alignment_min_threshold_m),
+                mad_scale=float(args.robust_alignment_mad_scale),
+                max_iters=int(args.robust_alignment_max_iters),
+            )
+        else:
+            scale, R, t = _umeyama(gt_centers_arr, colmap_centers_arr)
+            alignment_mask = np.ones(len(used_names), dtype=bool)
+            robust_history = []
         residuals_colmap = []
         residuals_gt = []
         for T_gt_center, T_cmap_center in zip(gt_centers, colmap_centers):
@@ -475,6 +575,17 @@ def main() -> None:
             residuals_colmap.append(float(np.linalg.norm(aligned - T_cmap_center)))
             cmap_as_gt = _colmap_point_to_gt(T_cmap_center, scale=scale, R=R, t=t)
             residuals_gt.append(float(np.linalg.norm(cmap_as_gt - T_gt_center)))
+        residuals_gt_arr = np.asarray(residuals_gt, dtype=np.float64)
+        residuals_colmap_arr = np.asarray(residuals_colmap, dtype=np.float64)
+        alignment_outliers = [
+            {
+                "name": str(used_names[idx]),
+                "residual_gt_m": float(residuals_gt_arr[idx]),
+                "residual_colmap_units": float(residuals_colmap_arr[idx]),
+            }
+            for idx in np.argsort(residuals_gt_arr)[::-1].tolist()
+            if not bool(alignment_mask[idx])
+        ]
         if args.out_model.exists():
             shutil.rmtree(args.out_model)
         _write_metric_colmap_text_model_from_structures(
@@ -502,6 +613,14 @@ def main() -> None:
             "num_registered_images": int(len(images_raw)),
             "num_points3D": int(len(points3d)),
             "num_alignment_poses": int(len(used_names)),
+            "num_alignment_inliers": int(alignment_mask.sum()),
+            "num_alignment_outliers": int(len(used_names) - int(alignment_mask.sum())),
+            "robust_alignment": bool(args.robust_alignment),
+            "robust_alignment_min_threshold_m": float(args.robust_alignment_min_threshold_m),
+            "robust_alignment_mad_scale": float(args.robust_alignment_mad_scale),
+            "robust_alignment_max_iters": int(args.robust_alignment_max_iters),
+            "robust_alignment_history": robust_history,
+            "alignment_outliers": alignment_outliers[:50],
             "scale_gt_to_colmap": float(scale),
             "scale_colmap_to_gt": float(1.0 / max(float(scale), 1e-12)),
             "R_gt_to_colmap": R.tolist(),
@@ -511,6 +630,15 @@ def main() -> None:
             "mean_train_center_residual_gt_m": float(np.mean(residuals_gt)) if residuals_gt else None,
             "median_train_center_residual_gt_m": float(np.median(residuals_gt)) if residuals_gt else None,
             "max_train_center_residual_gt_m": float(np.max(residuals_gt)) if residuals_gt else None,
+            "mean_train_center_inlier_residual_gt_m": (
+                float(np.mean(residuals_gt_arr[alignment_mask])) if residuals_gt_arr.size else None
+            ),
+            "median_train_center_inlier_residual_gt_m": (
+                float(np.median(residuals_gt_arr[alignment_mask])) if residuals_gt_arr.size else None
+            ),
+            "max_train_center_inlier_residual_gt_m": (
+                float(np.max(residuals_gt_arr[alignment_mask])) if residuals_gt_arr.size else None
+            ),
             "mean_train_center_residual_colmap_units": float(np.mean(residuals_colmap)) if residuals_colmap else None,
             "median_train_center_residual_colmap_units": float(np.median(residuals_colmap)) if residuals_colmap else None,
             "max_train_center_residual_colmap_units": float(np.max(residuals_colmap)) if residuals_colmap else None,
@@ -518,6 +646,10 @@ def main() -> None:
         }
         if not (0.5 <= float(scale) <= 2.0):
             alignment["warnings"].append("NVM scale differs strongly from GT metric scale; metric model was rescaled to GT frame.")
+        if alignment_outliers:
+            alignment["warnings"].append(
+                f"Robust NVM alignment rejected {len(alignment_outliers)} train camera-center outliers."
+            )
         if residuals_gt and float(np.median(residuals_gt)) > 0.25:
             alignment["warnings"].append("Median train camera-center alignment residual is large; inspect NVM alignment before paper metrics.")
         args.out_alignment.parent.mkdir(parents=True, exist_ok=True)

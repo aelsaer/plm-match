@@ -22,12 +22,19 @@ from loo_utils import load_split, split_map_names, split_query_names
 def _single_process_dataloader(torch_module):
     original_dataloader = torch_module.utils.data.DataLoader
 
-    def _patched_dataloader(*args, **kwargs):
-        kwargs["num_workers"] = 0
-        kwargs["pin_memory"] = False
-        return original_dataloader(*args, **kwargs)
+    class _PatchedDataLoader(original_dataloader):
+        # Keep the generic class interface: Kornia evaluates DataLoader[Any]
+        # while importing ALIKED, which a function replacement cannot support.
+        @classmethod
+        def __class_getitem__(cls, item):
+            return original_dataloader[item]
 
-    torch_module.utils.data.DataLoader = _patched_dataloader
+        def __init__(self, *args, **kwargs):
+            kwargs["num_workers"] = 0
+            kwargs["pin_memory"] = False
+            super().__init__(*args, **kwargs)
+
+    torch_module.utils.data.DataLoader = _PatchedDataLoader
     try:
         yield
     finally:

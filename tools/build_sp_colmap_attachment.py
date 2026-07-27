@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sys
 from typing import Iterable
 
@@ -178,6 +179,165 @@ def _can_attach_by_feature_index(
     return float(np.percentile(finite, 95)) <= max(float(radius), 1.0)
 
 
+def _write_global_arrays_from_obs_files(
+    *,
+    out_dir: Path,
+    image_obs_dir: Path,
+    entry_obs_files: list[str],
+    entry_obs_counts: list[int],
+    descriptor_dim: int,
+    descriptor_dtype: np.dtype,
+    chunk_size: int,
+) -> int:
+    """Write landmark-memory global arrays without keeping all observations in RAM.
+
+    The per-image NPZ files are the durable source of truth. This function first
+    writes unsorted arrays as on-disk ``.npy`` memmaps, sorts observations by
+    point id with an in-memory int64 permutation, then writes the final sorted
+    arrays in chunks. This avoids the large descriptor concatenate/copy spike
+    that kills full RobotCar attachments.
+    """
+
+    total_obs = int(sum(int(c) for c in entry_obs_counts))
+    if total_obs <= 0:
+        np.save(out_dir / "point_obs_offsets.npy", np.zeros((1,), dtype=np.int64))
+        np.save(out_dir / "point_obs_descs.npy", np.zeros((0, int(descriptor_dim)), dtype=descriptor_dtype))
+        np.save(out_dir / "point_obs_frame_ids.npy", np.zeros((0,), dtype=np.int32))
+        np.save(out_dir / "point_obs_uvs.npy", np.zeros((0, 2), dtype=np.float32))
+        np.save(out_dir / "point_obs_scores.npy", np.zeros((0,), dtype=np.float32))
+        np.save(out_dir / "point_obs_attach_dist.npy", np.zeros((0,), dtype=np.float32))
+        np.save(out_dir / "point_obs_reproj_error.npy", np.zeros((0,), dtype=np.float32))
+        np.save(out_dir / "point_ids.npy", np.zeros((0,), dtype=np.int64))
+        np.save(out_dir / "point_xyz.npy", np.zeros((0, 3), dtype=np.float32))
+        return 0
+
+    if int(descriptor_dim) <= 0:
+        for obs_file, count in zip(entry_obs_files, entry_obs_counts, strict=False):
+            if not obs_file or int(count) <= 0:
+                continue
+            with np.load(image_obs_dir / obs_file) as data:
+                descs = np.asarray(data["descs"])
+                if descs.ndim == 2:
+                    descriptor_dim = int(descs.shape[1])
+                    break
+    descriptor_dim = int(descriptor_dim)
+    if descriptor_dim <= 0:
+        raise RuntimeError("Could not infer descriptor dimension from attached observation files.")
+
+    chunk = max(1, int(chunk_size))
+    tmp_dir = out_dir / "_tmp_global_arrays"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_pids_path = tmp_dir / "point_ids_unsorted.npy"
+    tmp_xyz_path = tmp_dir / "point_xyz_per_obs_unsorted.npy"
+    tmp_frame_ids_path = tmp_dir / "point_obs_frame_ids_unsorted.npy"
+    tmp_uvs_path = tmp_dir / "point_obs_uvs_unsorted.npy"
+    tmp_descs_path = tmp_dir / "point_obs_descs_unsorted.npy"
+    tmp_scores_path = tmp_dir / "point_obs_scores_unsorted.npy"
+    tmp_attach_dist_path = tmp_dir / "point_obs_attach_dist_unsorted.npy"
+    tmp_reproj_error_path = tmp_dir / "point_obs_reproj_error_unsorted.npy"
+
+    tmp_pids = np.lib.format.open_memmap(tmp_pids_path, mode="w+", dtype=np.int64, shape=(total_obs,))
+    tmp_xyz = np.lib.format.open_memmap(tmp_xyz_path, mode="w+", dtype=np.float32, shape=(total_obs, 3))
+    tmp_frame_ids = np.lib.format.open_memmap(tmp_frame_ids_path, mode="w+", dtype=np.int32, shape=(total_obs,))
+    tmp_uvs = np.lib.format.open_memmap(tmp_uvs_path, mode="w+", dtype=np.float32, shape=(total_obs, 2))
+    tmp_descs = np.lib.format.open_memmap(
+        tmp_descs_path,
+        mode="w+",
+        dtype=descriptor_dtype,
+        shape=(total_obs, descriptor_dim),
+    )
+    tmp_scores = np.lib.format.open_memmap(tmp_scores_path, mode="w+", dtype=np.float32, shape=(total_obs,))
+    tmp_attach_dist = np.lib.format.open_memmap(tmp_attach_dist_path, mode="w+", dtype=np.float32, shape=(total_obs,))
+    tmp_reproj_error = np.lib.format.open_memmap(tmp_reproj_error_path, mode="w+", dtype=np.float32, shape=(total_obs,))
+
+    cursor = 0
+    for obs_file, expected_count in tqdm(
+        list(zip(entry_obs_files, entry_obs_counts, strict=False)),
+        desc="Staging attached observations",
+        unit="image",
+    ):
+        expected_count = int(expected_count)
+        if expected_count <= 0:
+            continue
+        if not obs_file:
+            raise RuntimeError(f"Attachment entry has {expected_count} observations but no obs_file.")
+        obs_path = image_obs_dir / obs_file
+        if not obs_path.exists():
+            raise FileNotFoundError(f"Missing attached observation file: {obs_path}")
+        with np.load(obs_path) as data:
+            pids = np.asarray(data["point_ids"], dtype=np.int64).reshape(-1)
+            count = int(pids.shape[0])
+            if count != expected_count:
+                raise RuntimeError(
+                    f"Observation count mismatch for {obs_path}: entry={expected_count}, file={count}"
+                )
+            end = cursor + count
+            descs = np.asarray(data["descs"])
+            if descs.ndim != 2 or int(descs.shape[1]) != descriptor_dim:
+                raise RuntimeError(
+                    f"Descriptor shape mismatch for {obs_path}: got {descs.shape}, expected (*, {descriptor_dim})"
+                )
+            frame_id = int(np.asarray(data["frame_id"]).reshape(()))
+
+            tmp_pids[cursor:end] = pids
+            tmp_xyz[cursor:end] = np.asarray(data["xyz"], dtype=np.float32).reshape(count, 3)
+            tmp_frame_ids[cursor:end] = frame_id
+            tmp_uvs[cursor:end] = np.asarray(data["uvs"], dtype=np.float32).reshape(count, 2)
+            tmp_descs[cursor:end] = np.asarray(descs, dtype=descriptor_dtype).reshape(count, descriptor_dim)
+            tmp_scores[cursor:end] = np.asarray(data["scores"], dtype=np.float32).reshape(count)
+            tmp_attach_dist[cursor:end] = np.asarray(data["attach_dist"], dtype=np.float32).reshape(count)
+            tmp_reproj_error[cursor:end] = np.asarray(data["reproj_error"], dtype=np.float32).reshape(count)
+            cursor = end
+
+    if cursor != total_obs:
+        raise RuntimeError(f"Staged {cursor} observations, expected {total_obs}.")
+
+    for arr in (tmp_pids, tmp_xyz, tmp_frame_ids, tmp_uvs, tmp_descs, tmp_scores, tmp_attach_dist, tmp_reproj_error):
+        arr.flush()
+    del tmp_pids, tmp_xyz, tmp_frame_ids, tmp_uvs, tmp_descs, tmp_scores, tmp_attach_dist, tmp_reproj_error
+
+    pids = np.load(tmp_pids_path, mmap_mode="r")
+    order = np.argsort(pids, kind="stable")
+    sorted_pids = pids[order]
+    unique_pids, first, counts = np.unique(sorted_pids, return_index=True, return_counts=True)
+    offsets = np.concatenate([[0], np.cumsum(counts, dtype=np.int64)]).astype(np.int64)
+    np.save(out_dir / "point_obs_offsets.npy", offsets)
+    np.save(out_dir / "point_ids.npy", unique_pids.astype(np.int64, copy=False))
+
+    xyz = np.load(tmp_xyz_path, mmap_mode="r")
+    point_xyz = np.asarray(xyz[order[first]], dtype=np.float32)
+    np.save(out_dir / "point_xyz.npy", point_xyz)
+    del sorted_pids, point_xyz, xyz
+
+    def copy_sorted(src_path: Path, dst_name: str, dtype: np.dtype, shape_tail: tuple[int, ...] = ()) -> None:
+        src = np.load(src_path, mmap_mode="r")
+        dst = np.lib.format.open_memmap(
+            out_dir / dst_name,
+            mode="w+",
+            dtype=dtype,
+            shape=(total_obs, *shape_tail),
+        )
+        for start in tqdm(range(0, total_obs, chunk), desc=f"Writing {dst_name}", unit="chunk"):
+            end = min(total_obs, start + chunk)
+            dst[start:end] = src[order[start:end]]
+        dst.flush()
+        del dst, src
+
+    copy_sorted(tmp_descs_path, "point_obs_descs.npy", descriptor_dtype, (descriptor_dim,))
+    copy_sorted(tmp_frame_ids_path, "point_obs_frame_ids.npy", np.int32)
+    copy_sorted(tmp_uvs_path, "point_obs_uvs.npy", np.float32, (2,))
+    copy_sorted(tmp_scores_path, "point_obs_scores.npy", np.float32)
+    copy_sorted(tmp_attach_dist_path, "point_obs_attach_dist.npy", np.float32)
+    copy_sorted(tmp_reproj_error_path, "point_obs_reproj_error.npy", np.float32)
+
+    del order, pids
+    shutil.rmtree(tmp_dir)
+    return int(unique_pids.shape[0])
+
+
 def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     cfg = load_config(args.config)
     split: dict[str, object] | None = None
@@ -197,6 +357,8 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     if not hasattr(dataset, "points3d"):
         raise ValueError("build_sp_colmap_attachment requires a COLMAP localization dataset")
 
+    if bool(getattr(args, "overwrite", False)) and args.out_dir.exists():
+        shutil.rmtree(args.out_dir)
     out_dir = ensure_dir(args.out_dir)
     image_obs_dir = ensure_dir(out_dir / "image_to_attached_obs")
     fine_extractor = _make_fine_extractor(cfg, args)
@@ -229,6 +391,7 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     entry_obs_counts: list[int] = []
     entry_obs_offsets: list[int] = []
 
+    collect_global_arrays = not bool(args.stream_global_arrays)
     global_pids: list[np.ndarray] = []
     global_xyz: list[np.ndarray] = []
     global_frame_ids: list[np.ndarray] = []
@@ -244,6 +407,52 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
     try:
         for frame_id, frame, image_name in tqdm(frames, desc="Attaching local features to COLMAP", unit="image"):
             image_id = int(frame.meta.get("image_id", -1))
+            reuse_obs_file = _safe_obs_filename(image_id, image_name)
+            reuse_obs_path = image_obs_dir / reuse_obs_file
+            if bool(args.reuse_image_obs) and reuse_obs_path.exists():
+                required_obs_keys = {
+                    "point_ids",
+                    "descs",
+                    "uvs",
+                    "scores",
+                    "attach_dist",
+                    "reproj_error",
+                    "xyz",
+                }
+                try:
+                    with np.load(reuse_obs_path) as data:
+                        missing_keys = sorted(required_obs_keys.difference(data.files))
+                        if missing_keys:
+                            raise KeyError(
+                                f"{reuse_obs_path} is missing required observation keys: {missing_keys}"
+                            )
+                        attached_count = int(np.asarray(data["point_ids"]).reshape(-1).shape[0])
+                        descs = np.asarray(data["descs"])
+                        if descs.ndim != 2:
+                            raise ValueError(f"{reuse_obs_path} has invalid descs shape: {descs.shape}")
+                        if int(descs.shape[0]) != attached_count:
+                            raise ValueError(
+                                f"{reuse_obs_path} count mismatch: point_ids={attached_count}, descs={descs.shape}"
+                            )
+                        descriptor_dim = max(descriptor_dim, int(descs.shape[1]))
+                except Exception as exc:
+                    print(f"Warning: ignoring cached attached obs {reuse_obs_path}: {exc}", file=sys.stderr)
+                    try:
+                        reuse_obs_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                else:
+                    entry_obs_offsets.append(int(total_obs))
+                    total_obs += attached_count
+                    if attached_count > 0:
+                        frames_with_obs += 1
+                    entry_names.append(image_name)
+                    entry_image_ids.append(image_id)
+                    entry_frame_ids.append(int(frame_id))
+                    entry_obs_files.append(reuse_obs_file)
+                    entry_obs_counts.append(attached_count)
+                    continue
+
             colmap_xys = np.asarray(frame.meta.get("xys", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32)
             colmap_pids = np.asarray(frame.meta.get("point3D_ids", np.zeros((0,), dtype=np.int64)), dtype=np.int64)
             n_colmap = min(colmap_xys.shape[0], colmap_pids.shape[0])
@@ -337,14 +546,15 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                         attach_dist=attached_dists,
                         reproj_error=attached_reproj_errors,
                     )
-                    global_pids.append(attached_pids)
-                    global_xyz.append(attached_xyz)
-                    global_frame_ids.append(np.full((attached_count,), int(frame_id), dtype=np.int32))
-                    global_uvs.append(attached_uvs)
-                    global_descs.append(attached_descs)
-                    global_scores.append(attached_scores)
-                    global_attach_dists.append(attached_dists)
-                    global_reproj_errors.append(attached_reproj_errors)
+                    if collect_global_arrays:
+                        global_pids.append(attached_pids)
+                        global_xyz.append(attached_xyz)
+                        global_frame_ids.append(np.full((attached_count,), int(frame_id), dtype=np.int32))
+                        global_uvs.append(attached_uvs)
+                        global_descs.append(attached_descs)
+                        global_scores.append(attached_scores)
+                        global_attach_dists.append(attached_dists)
+                        global_reproj_errors.append(attached_reproj_errors)
                     total_obs += attached_count
                     frames_with_obs += 1
             if run_detected_nearest:
@@ -427,14 +637,15 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
                             attach_dist=attached_dists,
                             reproj_error=attached_reproj_errors,
                         )
-                        global_pids.append(attached_pids)
-                        global_xyz.append(attached_xyz)
-                        global_frame_ids.append(np.full((attached_count,), int(frame_id), dtype=np.int32))
-                        global_uvs.append(attached_uvs)
-                        global_descs.append(attached_descs)
-                        global_scores.append(attached_scores)
-                        global_attach_dists.append(attached_dists)
-                        global_reproj_errors.append(attached_reproj_errors)
+                        if collect_global_arrays:
+                            global_pids.append(attached_pids)
+                            global_xyz.append(attached_xyz)
+                            global_frame_ids.append(np.full((attached_count,), int(frame_id), dtype=np.int32))
+                            global_uvs.append(attached_uvs)
+                            global_descs.append(attached_descs)
+                            global_scores.append(attached_scores)
+                            global_attach_dists.append(attached_dists)
+                            global_reproj_errors.append(attached_reproj_errors)
                         total_obs += attached_count
                         frames_with_obs += 1
 
@@ -463,29 +674,40 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
 
     num_landmarks = 0
     if total_obs > 0:
-        all_pids = np.concatenate(global_pids, axis=0).astype(np.int64, copy=False)
-        all_xyz_per_obs = np.concatenate(global_xyz, axis=0).astype(np.float32, copy=False)
-        all_frame_ids = np.concatenate(global_frame_ids, axis=0).astype(np.int32, copy=False)
-        all_uvs = np.concatenate(global_uvs, axis=0).astype(np.float32, copy=False)
-        all_descs = np.concatenate(global_descs, axis=0).astype(descriptor_dtype, copy=False)
-        all_scores = np.concatenate(global_scores, axis=0).astype(np.float32, copy=False)
-        all_attach_dists = np.concatenate(global_attach_dists, axis=0).astype(np.float32, copy=False)
-        all_reproj_errors = np.concatenate(global_reproj_errors, axis=0).astype(np.float32, copy=False)
-        order = np.argsort(all_pids, kind="stable")
-        sorted_pids = all_pids[order]
-        unique_pids, first, counts = np.unique(sorted_pids, return_index=True, return_counts=True)
-        offsets = np.concatenate([[0], np.cumsum(counts, dtype=np.int64)]).astype(np.int64)
-        point_xyz = all_xyz_per_obs[order][first].astype(np.float32, copy=False)
-        np.save(out_dir / "point_obs_offsets.npy", offsets)
-        np.save(out_dir / "point_obs_descs.npy", all_descs[order])
-        np.save(out_dir / "point_obs_frame_ids.npy", all_frame_ids[order])
-        np.save(out_dir / "point_obs_uvs.npy", all_uvs[order])
-        np.save(out_dir / "point_obs_scores.npy", all_scores[order])
-        np.save(out_dir / "point_obs_attach_dist.npy", all_attach_dists[order])
-        np.save(out_dir / "point_obs_reproj_error.npy", all_reproj_errors[order])
-        np.save(out_dir / "point_ids.npy", unique_pids.astype(np.int64, copy=False))
-        np.save(out_dir / "point_xyz.npy", point_xyz)
-        num_landmarks = int(unique_pids.shape[0])
+        if bool(args.stream_global_arrays):
+            num_landmarks = _write_global_arrays_from_obs_files(
+                out_dir=out_dir,
+                image_obs_dir=image_obs_dir,
+                entry_obs_files=entry_obs_files,
+                entry_obs_counts=entry_obs_counts,
+                descriptor_dim=descriptor_dim,
+                descriptor_dtype=descriptor_dtype,
+                chunk_size=int(args.stream_chunk_size),
+            )
+        else:
+            all_pids = np.concatenate(global_pids, axis=0).astype(np.int64, copy=False)
+            all_xyz_per_obs = np.concatenate(global_xyz, axis=0).astype(np.float32, copy=False)
+            all_frame_ids = np.concatenate(global_frame_ids, axis=0).astype(np.int32, copy=False)
+            all_uvs = np.concatenate(global_uvs, axis=0).astype(np.float32, copy=False)
+            all_descs = np.concatenate(global_descs, axis=0).astype(descriptor_dtype, copy=False)
+            all_scores = np.concatenate(global_scores, axis=0).astype(np.float32, copy=False)
+            all_attach_dists = np.concatenate(global_attach_dists, axis=0).astype(np.float32, copy=False)
+            all_reproj_errors = np.concatenate(global_reproj_errors, axis=0).astype(np.float32, copy=False)
+            order = np.argsort(all_pids, kind="stable")
+            sorted_pids = all_pids[order]
+            unique_pids, first, counts = np.unique(sorted_pids, return_index=True, return_counts=True)
+            offsets = np.concatenate([[0], np.cumsum(counts, dtype=np.int64)]).astype(np.int64)
+            point_xyz = all_xyz_per_obs[order][first].astype(np.float32, copy=False)
+            np.save(out_dir / "point_obs_offsets.npy", offsets)
+            np.save(out_dir / "point_obs_descs.npy", all_descs[order])
+            np.save(out_dir / "point_obs_frame_ids.npy", all_frame_ids[order])
+            np.save(out_dir / "point_obs_uvs.npy", all_uvs[order])
+            np.save(out_dir / "point_obs_scores.npy", all_scores[order])
+            np.save(out_dir / "point_obs_attach_dist.npy", all_attach_dists[order])
+            np.save(out_dir / "point_obs_reproj_error.npy", all_reproj_errors[order])
+            np.save(out_dir / "point_ids.npy", unique_pids.astype(np.int64, copy=False))
+            np.save(out_dir / "point_xyz.npy", point_xyz)
+            num_landmarks = int(unique_pids.shape[0])
     else:
         np.save(out_dir / "point_obs_offsets.npy", np.zeros((1,), dtype=np.int64))
         np.save(out_dir / "point_obs_descs.npy", np.zeros((0, descriptor_dim), dtype=descriptor_dtype))
@@ -526,6 +748,8 @@ def build_attachment_index(args: argparse.Namespace) -> dict[str, object]:
         "max_keypoints": int(args.max_keypoints),
         "descriptor_dim": int(descriptor_dim),
         "descriptor_dtype": str(np.dtype(descriptor_dtype)),
+        "stream_global_arrays": bool(args.stream_global_arrays),
+        "reuse_image_obs": bool(args.reuse_image_obs),
         "min_colmap_track_len": int(min_track_len),
         "max_colmap_point_error": float(max_error) if max_error is not None else None,
         "observation_quality_arrays": {
@@ -547,6 +771,11 @@ def main() -> None:
     parser.add_argument("--dataset_root", type=str, default=None)
     parser.add_argument("--split_json", type=Path, default=None)
     parser.add_argument("--out_dir", type=Path, default=Path("attached_sp_colmap"))
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete the output attachment directory before rebuilding, including cached per-image observations.",
+    )
     parser.add_argument("--image_names", type=Path, default=None, help="Optional line-separated DB image names to process.")
     parser.add_argument("--max_images", type=int, default=0)
     parser.add_argument("--max_keypoints", type=int, default=4096)
@@ -598,6 +827,17 @@ def main() -> None:
     parser.add_argument("--repo_root", type=str, default=None)
     parser.add_argument("--patch_size", type=int, default=None)
     parser.add_argument("--descriptor_dtype", choices=("float16", "float32"), default="float16")
+    parser.add_argument(
+        "--stream_global_arrays",
+        action="store_true",
+        help="Stage and sort global landmark-memory arrays through on-disk memmaps to avoid full-RAM concatenation.",
+    )
+    parser.add_argument(
+        "--reuse_image_obs",
+        action="store_true",
+        help="Reuse existing image_to_attached_obs/*.npz files when present, then rebuild db/global arrays.",
+    )
+    parser.add_argument("--stream_chunk_size", type=int, default=200000)
     parser.add_argument("--min_colmap_track_len", type=int, default=1)
     parser.add_argument("--max_colmap_point_error", type=float, default=None)
     args = parser.parse_args()

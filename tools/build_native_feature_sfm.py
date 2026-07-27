@@ -41,12 +41,19 @@ MATCHER_CONF_ALIASES: dict[str, str] = {
 def _single_process_dataloader(torch_module):
     original_dataloader = torch_module.utils.data.DataLoader
 
-    def _patched_dataloader(*args, **kwargs):
-        kwargs["num_workers"] = 0
-        kwargs["pin_memory"] = False
-        return original_dataloader(*args, **kwargs)
+    class _PatchedDataLoader(original_dataloader):
+        # Kornia evaluates DataLoader[Any] while importing ALIKED/LightGlue.
+        # Preserve the generic class interface while forcing HLoc to one worker.
+        @classmethod
+        def __class_getitem__(cls, item):
+            return original_dataloader[item]
 
-    torch_module.utils.data.DataLoader = _patched_dataloader
+        def __init__(self, *args, **kwargs):
+            kwargs["num_workers"] = 0
+            kwargs["pin_memory"] = False
+            super().__init__(*args, **kwargs)
+
+    torch_module.utils.data.DataLoader = _PatchedDataLoader
     try:
         yield
     finally:
@@ -181,6 +188,8 @@ def _reduce_reference_model_to_map_images(
             reuse_existing = all(existing_summary.get(k) == v for k, v in expected_summary.items())
         except Exception:
             reuse_existing = False
+    if overwrite:
+        reuse_existing = False
     if (overwrite or not reuse_existing) and reduced_model.exists():
         shutil.rmtree(reduced_model)
     if not reuse_existing:
@@ -374,6 +383,8 @@ def _run_extraction(args: argparse.Namespace, features_dir: Path) -> tuple[Path,
         cmd += ["--feature_config", str(args.feature_config)]
     if args.hloc_root is not None:
         cmd += ["--hloc_root", str(args.hloc_root)]
+    if getattr(args, "superglue_root", None) is not None:
+        cmd += ["--superglue_root", str(args.superglue_root)]
     if args.resize_max is not None:
         cmd += ["--resize_max", str(args.resize_max)]
     if args.max_keypoints is not None:
@@ -463,6 +474,7 @@ def main() -> None:
     parser.add_argument("--native_sfm_dir", type=Path, default=None)
     parser.add_argument("--superglue_weights", choices=("outdoor", "indoor"), default=None)
     parser.add_argument("--superglue_weights_path", type=Path, default=None)
+    parser.add_argument("--superglue_root", type=Path, default=None)
     parser.add_argument("--download_superglue_weights", action="store_true")
     parser.add_argument("--num_covis", type=int, default=20)
     parser.add_argument("--hloc_root", type=Path, default=None)
@@ -535,6 +547,7 @@ def main() -> None:
             weights=str(matcher_model.get("weights", "outdoor")),
             weights_path=args.superglue_weights_path,
             download_weights=bool(args.download_superglue_weights),
+            source_root=args.superglue_root,
         )
     matches_path = args.matches_path or artifacts / f"{Path(hloc_db_features).stem}_{matcher_conf['output']}_{pairs_path.stem}.h5"
     if matches_path.exists() and not args.overwrite_matches:

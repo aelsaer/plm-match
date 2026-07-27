@@ -1,12 +1,17 @@
-\documentclass[10pt,twocolumn,letterpaper]{article}
+\documentclass[letterpaper,10 pt,conference]{ieeeconf}
+
+\IEEEoverridecommandlockouts
+\overrideIEEEmargins
 
 \usepackage{times}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{graphicx}
+\usepackage{adjustbox}
 \usepackage{booktabs}
 \usepackage{multirow}
 \usepackage{tabularx}
 \usepackage{xcolor}
+\let\labelindent\relax
 \usepackage{enumitem}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
@@ -14,7 +19,6 @@
 \usepackage[hidelinks]{hyperref}
 \usepackage[capitalize]{cleveref}
 \usepackage{microtype}
-\usepackage[margin=0.75in]{geometry}
 
 \crefname{algorithm}{Algorithm}{Algorithms}
 \Crefname{algorithm}{Algorithm}{Algorithms}
@@ -22,7 +26,8 @@
 \newcommand{\method}{PLMLoc}
 \newenvironment{IEEEkeywords}{\par\smallskip\noindent\textbf{Keywords }}{\par\smallskip}
 
-\title{\method{} with Descriptor-Diverse Landmark Memory for Pairwise-Matcher-Free Visual Localization}
+% Alternative title: PLMLoc: Adaptive Coverage Memory for Pairwise-Matcher-Free Visual Localization
+\title{\method{}: Training-Free Persistent Landmark Memory for\\ Pairwise-Matcher-Free Visual Localization from SfM and RGB-D Maps}
 \author{Anonymous Authors}
 
 \begin{document}
@@ -31,290 +36,427 @@
 \pagestyle{empty}
 
 \begin{abstract}
-Reliable visual localization depends on finding accurate 2D--3D correspondences between query image features and a mapped scene. Hierarchical pipelines preserve source-image evidence by retrieving database images and matching the query to each image pair online, which repeats learned query--database matching at every query. Direct 2D--3D localization, established by classical SIFT/SfM methods and Active Search, matches query features to descriptors associated with 3D points. Building on direct 2D--3D localization, we study how a landmark should store descriptor evidence from repeated map observations. We propose \method, a descriptor-diverse landmark-memory representation in which each 3D landmark stores multiple persistent local descriptor observations. Retrieval activates a local subset of this memory, query descriptors are matched to selected landmark observations with HLoc-style mutual nearest-neighbor search, and the resulting 2D--3D hypotheses are verified by PnP. Memory construction uses SfM/COLMAP observations or RGB-D map frames with known poses. Experiments on Cambridge Landmarks and 7-Scenes show that descriptor-diverse point-observation memory provides a competitive pairwise-matcher-free correspondence target while retaining standard sparse 2D--3D geometry.
+Robust visual localization is a core capability for mobile robotics, augmented reality, and autonomous navigation, and is commonly formulated as estimating camera pose from correspondences between image measurements and 3D scene structure. Recent progress has improved this correspondence stage through learned local features, retrieval-based pipelines, direct 2D–3D search, landmark-level reasoning, dense feature alignment, scene-coordinate regression, and rendering-based localization. Despite these advances, the representation of persistent scene points remains an underexplored area. We introduce PLMLoc\begingroup\renewcommand{\thefootnote}{\fnsymbol{footnote}}\footnotemark[1]\endgroup, a training-free localization framework that revisits sparse 2D–3D matching through persistent landmark observation memory. Its adaptive descriptor coverage matches the accuracy of using all stored observations on Cambridge Landmarks while activating 0.40$\times$ the observations and roughly halving query time, and uses about 2$\times$ fewer candidate observations than a fixed Farthest-16 budget. Experiments on Cambridge Landmarks, 7-Scenes, Aachen Day/Night, RobotCar Seasons, and Extended CMU show that PLMLoc provides competitive localization accuracy with RGB-only queries, without per-scene training or online learned query–database matching.
+
 \end{abstract}
+\begingroup
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
+\footnotetext[1]{Code and configuration files will be released upon acceptance.}
+\endgroup
 
 \begin{IEEEkeywords}
 Visual localization, 2D--3D matching, landmark memory, RGB-D localization, structure-based localization
 \end{IEEEkeywords}
 
-\section{Introduction}
-Visual localization estimates the 6-DoF pose of a query image with respect to a mapped environment, and structure-based systems usually solve this problem by establishing 2D--3D correspondences between query keypoints and map landmarks before robust PnP, making correspondence quality a central driver of both accuracy and runtime.
-
-Two long-standing families dominate this correspondence problem. Hierarchical localization retrieves database images, matches the query to the retrieved images, lifts matched database keypoints to 3D points, and verifies the resulting correspondences geometrically~\cite{sarlin2019hloc}, whereas direct 2D--3D localization searches query features against descriptors associated with 3D points and estimates pose from the resulting matches~\cite{sattler2011fast,sattler2012active}.
-
-Hierarchical methods preserve source-image diversity online because each retrieved image retains its own local evidence and learned sparse matchers such as SuperGlue~\cite{sarlin2020superglue} and LightGlue~\cite{lindenberger2023lightglue} can reason over the query--database image pair before correspondences are lifted to 3D, giving HLoc-style pipelines strong accuracy at the cost of repeated online query--database matching over retrieved images.
-
-Direct 2D--3D matching is established prior work, not the novelty of this paper. Sattler et al.~\cite{sattler2011fast} showed that query features can be matched directly to descriptors associated with SfM points and that visual vocabularies and prioritized correspondence search can make this efficient. Active Search~\cite{sattler2012active} further improved this paradigm by using initial 2D--3D correspondences, co-visibility, and active 3D--2D search to recover additional matches. Together, these results establish accurate and efficient direct query-to-point matching with SIFT/SfM point descriptors.
-
-A persistent landmark in modern localization must represent its appearance under learned descriptors, retrieval conditioning, and RGB-D map construction, since a single compact point descriptor discards observation-level descriptor variation, a flat set of all observations can be large, and pairwise matching preserves source-image evidence by revisiting database images at query time. Direct localization needs a landmark-level representation that stores descriptor diversity in the map itself.
-
-\method{} makes each 3D landmark the persistent owner of its descriptor observations. The final method stores up to 16 descriptor-diverse observations per landmark, selected offline by farthest-neighbor coverage in descriptor space. At query time, retrieval selects a relevant region of memory, query descriptors search the selected landmark observations using mutual nearest-neighbor matching, and accepted matches become 2D--3D hypotheses for the standard PnP backend.
-
-To isolate the effect of landmark representation, memory realizations are evaluated under the same retrieval, descriptor extraction, and PnP backend as controlled ablations of the memory entry searched by a query descriptor, covering compressed point descriptors, descriptor-diverse point-observation memory, compact prototype memory, and retrieval-conditioned source-image observations.
-
-Our comparison is intentionally focused, positioning \method{} primarily against feature-matching and direct-localization systems, including Active Search, hLoc, PixLoc, FUSELOC, DVLAD+R2D2, and our SuperPoint and ALIKED variants, with representative scene-coordinate regression, NeRF/Gaussian-splatting localization, and absolute pose regression rows included to show where pairwise-matcher-free landmark memory sits relative to learned scene-specific and rendering-based alternatives.
-
-Map construction is source-agnostic, attaching local descriptors to existing 2D observations and 3D point identifiers in an SfM/COLMAP map, or backprojecting keypoints through depth and merging them into world-space landmarks for RGB-D map frames with known poses. In both cases, the query-time localizer sees the same landmark memory and does not use query depth.
-
-We summarize four contributions.
-\begin{enumerate}[leftmargin=*,nosep]
-    \item \textbf{Descriptor-diverse landmark observation memory.} Each 3D landmark stores a bounded set of local descriptor observations selected for descriptor-space diversity.
-    \item \textbf{Pairwise-matcher-free mutual-NN correspondence search.} Query descriptors search selected map memory with HLoc-style mutual nearest-neighbor matching, without online SuperGlue/LightGlue-style query--database matching.
-    \item \textbf{Map-source agnostic construction.} The same memory is built from SfM/COLMAP observations or directly from RGB-D map frames using depth and known poses.
-    \item \textbf{Controlled representation ablations.} Landmark-memory realizations and same-split lifted baselines are evaluated under a common retrieval, descriptor, and geometric backend.
-\end{enumerate}
-
-\Cref{fig:plmloc-overview} gives the system overview, and \cref{alg:plmloc-query} summarizes query-time localization.
-
 \begin{figure*}[t]
     \centering
     \includegraphics[width=0.98\textwidth]{figures/fig1_plm_pipeline_cvpr.pdf}
-    \caption{Overview of \method. Offline, repeated local feature observations from an SfM/COLMAP map or an RGB-D map are attached or lifted to persistent 3D landmarks. Online, retrieval selects a candidate map region, and query descriptors search the selected landmark observation memory to produce scored 2D--3D hypotheses for PnP-RANSAC.}
+    \caption{Overview of \method. Offline, repeated local feature observations from an SfM/COLMAP map or an RGB-D map are attached or lifted to persistent 3D landmarks, then adaptive cover selects a variable descriptor subset per landmark. Online, retrieval selects a candidate map region, and query descriptors search the selected landmark observation memory to produce scored 2D--3D hypotheses for PnP-RANSAC.}
     \label{fig:plmloc-overview}
 \end{figure*}
+
+\section{Introduction}
+
+Visual localization estimates the 6-DoF pose of a query image with respect to a mapped scene, typically by establishing 2D--3D correspondences between query keypoints and map landmarks and solving with robust PnP. Correspondence quality governs pose accuracy. Hierarchical localization retrieves database images, matches the query to retrieved views with learned pairwise matchers such as SuperGlue~\cite{sarlin2020superglue} or LightGlue~\cite{lindenberger2023lightglue}, and lifts the matches to 3D~\cite{sarlin2019hloc}; this is accurate but repeats online query--database matching at every query. Direct 2D--3D localization instead matches query features to descriptors associated with 3D points~\cite{sattler2011fast,sattler2012active}, avoiding the online matcher. Its limitation is that a single point descriptor compresses many observations: the same landmark is seen under different viewpoints, illumination, and sensor noise, and collapsing these observations discards appearance variation, while revisiting source images returns to pairwise matching. Direct localization therefore could benefit from a landmark-level representation that keeps descriptor diversity inside the map.
+
+Scene-coordinate regression and pose-regression methods learn mappings from images to scene geometry or camera pose~\cite{brachmann2021dsacstar,brachmann2023ace}, but require scene-specific training or adaptation and often separate the learned model from an explicit reusable map. Rendering-based localization can exploit dense or learned scene representations~\cite{polizzi2025favor}, but typically introduces per-scene optimization or rendering machinery. RGB-D and SfM-free relocalization methods reduce the dependence on sparse reconstruction~\cite{glocker2013relocalization,dong2023lazyloc}, but may require depth or retain online pairwise matching. In contrast, repeated local-feature observations inside an explicit landmark representation remain comparatively underexplored: existing pipelines either revisit this evidence through source images at query time, compress it into compact point descriptors, or absorb it into scene-specific models.
+
+\method{} addresses this by changing the landmark representation while keeping the standard sparse 2D--3D/PnP localization geometry. Each 3D landmark stores a bounded set of local descriptor observations, selected offline by adaptive coverage or fixed-budget selection. At query time, image retrieval only activates a relevant memory region; query descriptors are matched directly to selected landmark observations by mutual nearest-neighbor search, and accepted matches form 2D--3D hypotheses for a standard PnP-RANSAC backend. Thus, \method{} avoids online learned query--database matching while preserving explicit geometric verification.
+
+The memory construction is map-source agnostic. For SfM/COLMAP maps, \method{} attaches local descriptors to existing 2D observations and 3D point identifiers. For posed RGB-D map frames, it backprojects local keypoints through depth and merges them into persistent world-space landmarks. This makes the representation applicable both to standard SfM-based localization pipelines and to robotic settings where posed RGB-D frames are available from SLAM or odometry.
+
+Overall, our contributions are as follows:
+\begin{itemize}[leftmargin=*,nosep]
+\item We introduce adaptive-cover descriptor selection, a reliability-weighted submodular coverage rule with adaptive stopping that assigns each landmark a variable budget $K_p\in[K_{\min},K_{\max}]$ and retains only the observations needed to span its descriptor modes;
+
+\item We show that adaptive cover matches all-observations accuracy while activating 0.40$\times$ the observations and about 0.56$\times$ the query time on Cambridge Landmarks, and uses about 2$\times$ fewer candidate observations than a fixed Farthest-16 budget;
+
+\item We introduce \method{}, a training-free visual localization pipeline that matches RGB queries directly to persistent 3D landmark memory, avoiding online learned query--database pairwise matching;
+
+\item We show that the same memory representation can be built from SfM/COLMAP observations or posed RGB-D frames; the standard RGB-only query path applies to both, with an optional RGB-D verification variant reported separately;
+
+\item We report competitive results across indoor, outdoor, and large-scale localization benchmarks, with Cambridge and 7-Scenes performance on par with the best feature-matching baselines and large-scale gains over local-descriptor-only baselines.
+
+\end{itemize}
+
+
+\Cref{fig:plmloc-overview} gives the system overview, and \cref{alg:plmloc-query} summarizes query-time localization.
 
 \begin{algorithm}[t]
 \caption{\method{} Query-Time Localization}
 \label{alg:plmloc-query}
 \small
 \begin{algorithmic}[1]
-\Require Query image $I_q$, landmark memory $\mathcal{M}$, retrieval list $\mathcal{R}_q$, descriptor extractor $\phi$
+\Require Query image $I_q$, intrinsics $\mathbf{K}_q$, landmark memory $\mathcal{M}$, retrieval list $\mathcal{R}_q$, descriptor extractor $\phi$
 \Ensure Camera pose $\hat{\mathbf{T}}_{wc}$
-\State Extract query keypoints and descriptors $Q=\{(\mathbf{u}_i,\mathbf{q}_i)\}$ with $\phi$
-\State Activate candidate landmarks from source frames in $\mathcal{R}_q$
-\State Select descriptor-diverse landmark observations from $\mathcal{M}$
-\ForAll{$(\mathbf{u}_i,\mathbf{q}_i)\in Q$}
-    \State Find the nearest selected memory observation by descriptor similarity
-    \State Keep the match when the query descriptor and memory observation are mutual nearest neighbors
-    \State Emit the 2D--3D hypothesis $(\mathbf{u}_i,\mathbf{x}_j)$
+\State Extract query keypoints, scores, and $\ell_2$-normalized descriptors
+       $Q=\{(\mathbf{u}_i,\alpha_i,\mathbf{q}_i)\}_{i=1}^{N_q}$ with $\phi$
+\State Keep the top $K_r$ retrieved map frames
+       $\mathcal{R}_q=(I_1,\ldots,I_{K_r})$
+\State Activate candidate landmark ids observed in the retrieved frames:
+       $\mathcal{P}_q \leftarrow \{p \mid \exists I_r\in\mathcal{R}_q,\ p\in\mathrm{obs}(I_r)\}$
+\State For each $p\in\mathcal{P}_q$, expose selected memory observations using either a fixed $K_o$ or adaptive $K_p$
+       $\mathcal{D}^{\star}_p\subseteq\mathcal{D}_p$
+\State Build the active item bank
+       $\mathcal{B}_q=\{(\mathbf{d}_{pm},\mathbf{x}_p,p)\mid p\in\mathcal{P}_q,\ \mathbf{d}_{pm}\in\mathcal{D}^{\star}_p\}$
+\State $\mathcal{C}\leftarrow\emptyset$
+\ForAll{$(\mathbf{u}_i,\alpha_i,\mathbf{q}_i)\in Q$}
+    \State $(\mathbf{d}_{pm},\mathbf{x}_p,p) \leftarrow$ nearest item in $\mathcal{B}_q$ by cosine similarity
+    \State $\mathbf{q}_{r} \leftarrow$ nearest query descriptor in $Q$ to $\mathbf{d}_{pm}$
+    \If{$r=i$} \Comment{mutual nearest neighbors}
+        \State $\mathcal{C}\leftarrow\mathcal{C}\cup\{(\mathbf{u}_i,\mathbf{x}_p,p)\}$
+    \EndIf
 \EndFor
-\State Deduplicate hypotheses and estimate $\hat{\mathbf{T}}_{wc}$ with PnP-RANSAC
+\State Collapse repeated observations of the same $(i,p)$ pair, keeping the strongest score
+\State Estimate $\hat{\mathbf{T}}_{wc}$ from $\mathcal{C}$ using two-stage PnP-RANSAC
+\State \Return $\hat{\mathbf{T}}_{wc}$
 \end{algorithmic}
 \end{algorithm}
 
 \section{Related Work}
-\subsection{Direct 2D--3D Matching and Active Search}
-Classical direct localization methods match query local features directly to descriptors associated with 3D points and estimate pose from the resulting 2D--3D correspondences. SIFT~\cite{lowe2004sift} established the local descriptor basis for this line of work, and Sattler et al.~\cite{sattler2011fast} showed that direct 2D--3D matching has strong potential when made efficient with visual vocabularies and prioritized correspondence search. Experiments in that work include point descriptors formed by the mean of SIFT observations and query matching with a SIFT ratio test, making point-mean direct matching an important predecessor for \method{}. Active Search~\cite{sattler2012active} further improves correspondence recovery by combining 2D-to-3D and 3D-to-2D search using co-visibility and search-cost prioritization in an offline SfM point cloud where 3D points are associated with image descriptors and pose is estimated from 2D--3D matches with RANSAC.
 
-\textbf{Relation to direct 2D--3D matching.} \method{} builds on the direct localization line of work in which Sattler et al.~\cite{sattler2011fast} demonstrated efficient query-to-SfM-point descriptor matching with prioritized visual-vocabulary search and Active Search~\cite{sattler2012active} used initial 2D--3D matches to trigger 3D--2D search over nearby and co-visible points. Since these methods focus on search efficiency and correspondence expansion over SIFT/SfM point descriptors, \method{} studies the descriptor memory stored by each landmark, comparing single mean descriptors, descriptor-diverse point-observation memory, compact prototype memory, and retrieval-conditioned source-image observations under the same geometric backend.
+\method{} follows the standard structure-based formulation of sparse 2D--3D correspondences to explicit 3D landmarks followed by PnP. The method focuses on how repeated descriptor observations are selected, stored, and searched as an explicit localization memory.
 
-\subsection{Hierarchical Localization and Pairwise Learned Matching}
-Hierarchical localization narrows the map search space through image retrieval before local matching and pose verification. NetVLAD~\cite{arandjelovic2016netvlad} remains a common retrieval descriptor, and HLoc~\cite{sarlin2019hloc} provides a modular retrieval, matching, and localization framework that is widely used in the Aachen and related benchmark protocols~\cite{sattler2018benchmarking,vislocbenchmark}. Learned pairwise matchers such as SuperGlue~\cite{sarlin2020superglue} and LightGlue~\cite{lindenberger2023lightglue} make this setting especially strong by reasoning over query--database feature sets, while LoFTR~\cite{sun2021loftr} offers a detector-free dense matching alternative. An ALIKED+LightGlue SfM variant is also evaluated as a local-feature/map-construction alternative, using retrieval as the candidate-selection mechanism that activates landmark memory.
+Classical direct 2D--3D localization matches query features to descriptors associated with 3D points. SIFT-based localization and direct matching methods~\cite{lowe2004sift,sattler2011fast} make this search efficient with visual vocabularies and prioritized correspondence search. Active Search~\cite{sattler2012active} further improves correspondence recovery using co-visibility and 2D-to-3D/3D-to-2D search. These methods establish the direct localization setting used by \method{}, but the landmark appearance is represented compactly at the point level. \method{} keeps the same explicit geometry, while retaining a bounded set of descriptor-diverse observations per landmark.
 
-\subsection{Landmark Codebooks and Descriptor Disambiguation}
-Direct 2D--3D matching becomes ambiguous when many unrelated landmarks share similar local descriptors. FUSELOC~\cite{nguyen2024fuseloc} addresses this ambiguity by fusing global and local descriptors into a compact point codebook, improving direct localization and reducing the need to store full database images. Addressing the same broad problem from a landmark-memory representation, \method{} preserves multiple descriptor observations per landmark and uses retrieval to activate the relevant part of the map. PRAM~\cite{xue2024pram} recognizes landmark labels and registers image evidence to a landmark map, while PixLoc~\cite{sarlin2021pixloc} refines pose by direct feature alignment to a 3D model. \method{} remains an explicit sparse-correspondence PnP pipeline.
+Hierarchical localization preserves source-image evidence differently. It retrieves database images, matches each retrieved view to the query with local matchers such as SuperGlue, LightGlue, or LoFTR~\cite{sarlin2020superglue,lindenberger2023lightglue,sun2021loftr}, and lifts the resulting matches to 3D~\cite{sarlin2019hloc,arandjelovic2016netvlad,sattler2018benchmarking,vislocbenchmark}. This gives strong correspondences, but the source evidence is revisited through online query--database matching. \method{} uses retrieval only to activate candidate landmarks, then matches query descriptors directly to stored landmark observations.
 
-\subsection{Local and Global Descriptors for Localization}
-\method{} can use learned or classical local descriptors. SuperPoint~\cite{detone2018superpoint} provides learned keypoints and descriptors suitable for both HLoc-style matching and landmark memory, ALIKED provides a stronger modern sparse local-feature alternative when paired with LightGlue for map construction, D2-Net~\cite{dusmanu2019d2net} is a common learned local feature in direct 2D--3D localization comparisons, and SIFT~\cite{lowe2004sift} provides a classical alternative with different storage and matching properties. Global descriptors, including NetVLAD~\cite{arandjelovic2016netvlad}, MixVPR~\cite{alibey2023mixvpr}, and SALAD~\cite{izquierdo2024salad}, provide image-level retrieval in our experiments and in cited baselines, which lets the experiments compare correspondence representations while holding retrieval and geometry fixed.
+Several recent methods also reconsider how map evidence is used. FUSELOC~\cite{nguyen2024fuseloc} improves direct 2D--3D matching with a compact codebook that combines global and local cues. PRAM~\cite{xue2024pram} performs landmark-level recognition and verification. PixLoc~\cite{sarlin2021pixloc} refines camera pose by dense feature alignment to a 3D model rather than by sparse descriptor matching. FaVoR~\cite{polizzi2025favor} stores per-landmark descriptor evidence and synthesizes descriptors through per-scene voxel-rendering optimization. \method{} remains a sparse correspondence pipeline and stores observed descriptors directly, without per-scene training or rendering optimization.
 
-\subsection{RGB-D Relocalization and Scene-Coordinate Regression}
-RGB-D datasets such as 7-Scenes~\cite{microsoft7scenes} and TUM RGB-D~\cite{sturm2012tumrgbd} provide posed color and depth sequences for indoor relocalization and robotics-oriented evaluation. Scene-coordinate regression methods predict 3D scene coordinates directly from image evidence, beginning with regression forests~\cite{shotton2013scene} and continuing through differentiable RANSAC~\cite{brachmann2017dsac} and efficient scene-specific training such as ACE~\cite{brachmann2023ace}. PoseNet~\cite{kendall2015posenet} introduced Cambridge Landmarks as a camera-pose regression benchmark. Long-term outdoor benchmarks additionally include RobotCar Seasons, derived from the Oxford RobotCar dataset~\cite{maddern2017robotcar}, and CMU Seasons, derived from the CMU Visual Localization data set~\cite{badino2011cmu}. \method{} differs from scene-coordinate regression because it does not train a scene-specific coordinate predictor; it constructs explicit descriptor-backed landmarks from map frames and localizes with sparse 2D--3D geometry.
+RGB-D and SfM-free relocalization methods change how the map is obtained. Glocker et al.~\cite{glocker2013relocalization} build a relocalization database from RGB-D frames and localize RGB-D queries with hand-crafted descriptors. LazyLoc~\cite{dong2023lazyloc} and MAR-LOC~\cite{gassol2024marloc} reduce the need for SfM through sequence-level geometry, but still rely on online pairwise matching. ImLoc~\cite{jiang2026imloc} augments an image-based map with estimated depth. \method{} uses RGB-D as one possible source for building the same landmark observation memory. SfM/COLMAP provides 3D points through reconstruction, while posed RGB-D frames provide them by depth backprojection.
 
-\subsection{Memory-Efficient Localization and Map Compression}
-Memory-efficient localization methods reduce the map footprint of image-based or landmark-based systems. FUSELOC~\cite{nguyen2024fuseloc} is especially relevant because it shows that direct 2D--3D matching can approach hierarchical localization while using a compact point representation. Other work compresses relocalization maps through descriptor quantization or dimension reduction~\cite{laskar2024dpq,wang2024maddr}, while large-scale similarity search systems such as FAISS~\cite{johnson2019faiss} provide practical indexing tools for descriptor search. By studying how many descriptor observations should remain attached to a landmark, the experiments measure accuracy, observations per landmark, candidate observations, runtime, and map memory size.
+Scene-coordinate and pose-regression methods~\cite{shotton2013scene,brachmann2017dsac,brachmann2023ace,kendall2015posenet} encode scene geometry or camera pose in learned models and typically require scene-specific training or adaptation. \method{} keeps an explicit 3D map and uses standard geometric verification.
+
 
 \section{Method}
 \subsection{Landmark Observation Memory}
-Let a query image provide local descriptors
+\method{} operates in the descriptor space of a frozen extractor $\phi$ (SuperPoint, ALIKED). A query image yields $Q=\{(\mathbf{u}_i,\alpha_i,\mathbf{q}_i)\}_{i=1}^{N_q}$ with keypoint $\mathbf{u}_i$, detector score $\alpha_i$, and descriptor $\mathbf{q}_i\in\mathbb{R}^{D}$. All descriptors are $\ell_2$ normalized before storage and matching; map and query descriptors are always compared within the same family and dimension $D$, so the similarity is the inner product (cosine). A landmark is a persistent 3D point and its descriptor observations,
 \begin{equation}
-    Q = \{(\mathbf{u}_i,\mathbf{q}_i)\}_{i=1}^{N_q},
+\begin{aligned}
+L_p &= (p,\mathbf{x}_p,\mathcal{O}_p,\mathcal{S}_p),\\
+\mathcal{O}_p &= \{o_{pm}\}_{m=1}^{n_p}.
+\end{aligned}
+\label{eq:landmark-memory}
 \end{equation}
-where $\mathbf{u}_i$ is a 2D query keypoint and $\mathbf{q}_i$ is an $\ell_2$-normalized descriptor. Landmarks in the map are represented as
+Each observation is $o_{pm}=(\mathbf{d}_{pm},f_{pm},\mathbf{v}_{pm},\alpha_{pm})$ where $\mathbf{x}_p\in\mathbb{R}^3$ is the world coordinate, $\mathbf{d}_{pm}$ the normalized descriptor, $f_{pm}$ the source frame, and $\mathbf{v}_{pm}$ the source keypoint. $\mathcal{S}_p$ holds per-landmark statistics (observation count, source-frame count, descriptor variance, reprojection error, view diversity) used only for construction-time filtering. Memory is stored as contiguous per-landmark observation slices indexed by point id, with a per-image index so retrieval can activate landmarks by source image without scanning the full memory.
+
+\subsection{Memory Construction}
+Given a COLMAP reconstruction, \method{} attaches $\phi$ descriptors to existing observations. Points with track length below a minimum and/or reconstruction error above a threshold are discarded. For each map image, descriptors are attached in a \emph{feature-index} way, when the local-feature file matches the COLMAP feature order and the image-space discrepancy is within the attachment radius. When several detected features attach to one 3D point in an image, one is kept (lowest attachment distance, then highest detector score). Each accepted attachment adds one observation to landmark $p=p_\ell$ at $\mathbf{x}_p$.
+
+\textbf{RGB-D.} Given posed RGB-D frames with intrinsics $\mathbf{K}$ and pose $\mathbf{T}_{wc}=(\mathbf{R}_{wc},\mathbf{t}_{wc})$, each keypoint with valid depth $z$ is lifted to world coordinates,
 \begin{equation}
-    L_j = (\mathbf{x}_j, \mathcal{O}_j, \mathcal{S}_j),
-    \quad
-    \mathcal{O}_j = \{(\mathbf{d}_{jk}, \mathbf{v}_{jk}, I_{jk})\}_{k=1}^{n_j}.
-    \label{eq:landmark-memory}
+    \mathbf{x}_w=\mathbf{R}_{wc}\,z\mathbf{K}^{-1}[u,v,1]^\top+\mathbf{t}_{wc}.
+    \label{eq:rgbd-backproject}
 \end{equation}
-Here $\mathbf{x}_j$ is the 3D landmark position, $\mathbf{d}_{jk}$ is a stored descriptor observation, $\mathbf{v}_{jk}$ is its source-frame keypoint coordinate, $I_{jk}$ is the source image or RGB-D frame, and $\mathcal{S}_j$ stores support, retrieval-rank, attachment, and quality metadata for a memory entry built offline once and reused across queries.
+ Lifted points are merged into landmarks by a metric radius $r_m$ using a voxel grid over centroids. Each point reuses the nearest centroid within $r_m$ (centroid updated by running mean) or creates a new landmark. As in the SfM path, only the strongest observation per landmark per source frame is kept. The output has the same array format as the SfM memory, so the query-time localizer is identical. Depth is used only to build the map; queries use RGB descriptors and PnP.
 
-\subsection{Descriptor-Diverse Landmark Memory}
-Descriptor-diverse point-observation memory is the main representation in \method{}. A landmark retains several local descriptor observations because the same 3D point can produce different descriptors across map images. To evaluate what information a landmark should retain, we instantiate the memory as point-mean codebooks, descriptor-diverse point-observation memory, compact prototype memory, and retrieval-conditioned source-image observation memory, all sharing the same query-time PnP backend and differing only in the memory entry searched by a descriptor.
+\subsection{Observation Selection}
+Each landmark exposes a bounded subset $\mathcal{D}^{\star}_p$ of its observations. Fixed-budget selection uses a global budget $K_o$: if $n_p\le K_o$, all observations are exposed; otherwise a selection rule keeps $K_o$ observations. We use fixed Farthest, First, Random, and All-observations variants as controls, and distinguish them from the adaptive rule below. Farthest starts from the descriptor closest to the normalized landmark mean and greedily adds the observation farthest from the selected set under cosine distance. The point-mean baseline differs from $K_o=1$ because it collapses all observations to a single normalized mean descriptor.
 
-\textbf{Point-mean codebook.} A point-mean descriptor stores one normalized descriptor per landmark, giving a compact representation that removes observation-dependent descriptor variation.
+\textbf{Adaptive cover.}
+A fixed observation budget assigns the same memory size to every landmark, although landmarks differ substantially in appearance complexity. We therefore also evaluate an adaptive-cover selection rule that chooses a landmark-specific budget $K_p$. For landmark $p$, each observation receives a reliability weight from its detector score, attachment distance, and reprojection error:
+\[
+\begin{aligned}
+\tilde{w}_{pm}
+&=
+\bar{\alpha}_{pm}
+\exp\!\left(-\frac{\delta_{pm}^{2}}{2\sigma_a^2}\right)
+\exp\!\left(-\frac{\epsilon_{pm}^{2}}{2\sigma_r^2}\right),\\
+w_{pm}
+&=
+\frac{\tilde{w}_{pm}}{\sum_j\tilde{w}_{pj}} .
+\end{aligned}
+\]
+Here $\bar{\alpha}_{pm}$ is normalized within the landmark, $\delta_{pm}$ is the 2D attachment distance to the COLMAP observation, and $\epsilon_{pm}$ is the reprojection error. Missing scores fall back to uniform weights, and unavailable error terms are omitted from the penalty.
+
+Adaptive cover then greedily maximizes weighted descriptor coverage. With normalized descriptors, we use
+\[
+s_{mn}=\frac{1+\mathbf{d}_{pm}^{\top}\mathbf{d}_{pn}}{2},
+\qquad
+F(A)=\sum_m w_{pm}\max_{a\in A}s_{ma}.
+\]
+The first selected observation is the weighted medoid,
+\[
+a_1=\operatorname*{arg\,max}_n \sum_m w_{pm}s_{mn},
+\]
+and each subsequent observation maximizes the marginal coverage gain
+\[
+\Delta(n\mid A)=
+\sum_m w_{pm}\max\!\left(0,s_{mn}-\max_{a\in A}s_{ma}\right).
+\]
+Selection stops once the gain falls below $\tau$, after at least $K_{\min}$ observations, or when $K_{\max}$ is reached. In our experiments we use $K_{\min}=1$, $K_{\max}=32$, $\tau=0.005$, $\sigma_a=2.0$, and $\sigma_r=4.0$. Thus stable landmarks keep compact memories, while landmarks with multiple appearance modes retain more observations. Since $F$ is a monotone submodular facility-location coverage function and $\Delta$ is its marginal gain, greedy selection of a fixed budget $K_{\max}$ attains the standard $(1-1/e)$ guarantee relative to the optimal $K_{\max}$-cardinality coverage; the threshold $\tau$ then stops early, trading a small amount of coverage for reduced memory.
+
+\subsection{Query-Time Localization}
+Retrieval returns an ordered list $\mathcal{R}_q$ of $K_r$ database images. \method{} uses it only to restrict the candidate region where the active landmarks $\mathcal{P}_q$ are the unique point ids observed in any retrieved image, and the active bank is
 \begin{equation}
-    \bar{\mathbf{d}}_j =
-    \frac{\sum_{k=1}^{n_j}\mathbf{d}_{jk}}
-    {\left\|\sum_{k=1}^{n_j}\mathbf{d}_{jk}\right\|_2}.
+    \mathcal{B}_q=\{(\mathbf{d}_{pm},\mathbf{x}_p,p)\mid p\in\mathcal{P}_q,\ \mathbf{d}_{pm}\in\mathcal{D}^{\star}_p\}.
 \end{equation}
 
-\textbf{Descriptor-diverse point-observation memory.} The main \method{} variant stores a bounded subset of $\mathcal{O}_j$ for each landmark. When a landmark has more than $K_o$ observations, farthest-neighbor selection in descriptor space keeps observations that cover different descriptor modes. A query descriptor scores a landmark by the best stored observation.
+Correspondences use mutual nearest-neighbor matching between query descriptors and $\mathcal{B}_q$: a match $(\mathbf{q}_i,\mathbf{b}_m)$ is accepted iff each is the other's nearest neighbor,
 \begin{equation}
-    s_{\mathrm{obs}}(\mathbf{q}_i,L_j)=\max_{k \in \mathcal{D}_j} \mathbf{q}_i^\top \mathbf{d}_{jk},
-\end{equation}
-where $\mathcal{D}_j \subseteq \mathcal{O}_j$ is the selected descriptor-diverse subset. The final experiments use $K_o=16$.
-
-\textbf{Compact prototype memory.} Prototype memory partitions observations for each landmark into up to $K_p$ groups by descriptor diversity and stores the normalized mean of each group as a prototype.
-\begin{equation}
-    \mathbf{p}_{jm} =
-    \frac{\sum_{k \in \mathcal{G}_{jm}}\mathbf{d}_{jk}}
-    {\left\|\sum_{k \in \mathcal{G}_{jm}}\mathbf{d}_{jk}\right\|_2},
-    \quad m=1,\ldots,K_j,\; K_j\leq K_p .
-\end{equation}
-A query descriptor scores the landmark through the best prototype.
-\begin{equation}
-    s_{\mathrm{proto}}(\mathbf{q}_i,L_j)=\max_{m\leq K_j}\mathbf{q}_i^\top \mathbf{p}_{jm}.
-    \label{eq:proto-score}
-\end{equation}
-Descriptor-space grouping and farthest-descriptor selection are supported, and prototype support counts are stored as metadata. Prototype memory is reported only as an ablation. Final \method{} rows use descriptor-diverse point-observation memory.
-
-\textbf{Retrieval-conditioned observation memory.} Retrieval-conditioned memory uses retrieval to select source frames, after which the query searches only observations whose source frames are active and returns a landmark identifier with its 3D point. This variant is evaluated as a source-image-conditioned ablation.
-
-\begin{figure*}[t]
-    \centering
-    \includegraphics[width=0.98\textwidth]{figures/fig2_representation_modes.pdf}
-    \caption{Ablation of memory representation with a fixed localization backend. Point-mean codebooks compress each landmark to one descriptor, descriptor-diverse point-observation memory stores a bounded set of representative observations per landmark, retrieval-conditioned observation memory searches observations selected by retrieved source images, and compact prototype memory stores averaged descriptor groups.}
-    \label{fig:representation-modes}
-\end{figure*}
-
-\subsection{Query-to-Memory Correspondence Search}
-For a query image, retrieval returns top-ranked map frames. \method{} collects the landmarks observed in these frames and selects up to $K_o$ descriptor-diverse observations per candidate landmark. The final method uses HLoc-style mutual nearest-neighbor semantics between query descriptors and selected landmark-memory descriptors. For a query descriptor $\mathbf{q}_i$ and memory descriptor $\mathbf{d}_m$, a correspondence is accepted when
-\begin{equation}
-    m = \arg\max_n \mathbf{q}_i^\top \mathbf{d}_n,
+    i^{\star}(m^{\star}(i))=i,
     \qquad
-    i = \arg\max_r \mathbf{q}_r^\top \mathbf{d}_m .
+    m^{\star}(i)=\operatorname*{arg\,max}_{m}\mathbf{q}_i^{\top}\mathbf{b}_m,
+    \label{eq:mnn}
 \end{equation}
-The accepted memory descriptor maps to a landmark identifier and 3D point, yielding the hypothesis $(\mathbf{u}_i,\mathbf{x}_j)$. Repeated observations of the same landmark for the same query keypoint are collapsed before PnP-RANSAC, following HLoc's unique query-keypoint/3D-point correspondence semantics.
-
-\subsection{Scoring and Verification}
-Weak priors can augment the descriptor score.
-\begin{equation}
-    \begin{split}
-    s(h) ={}& s_{\mathrm{desc}}(\mathbf{q}_i,L_j)
-    + \lambda_s \log(1+n_{\mathrm{sup}}) \\
-    &+ \lambda_p \log(1+n_{\mathrm{proto}})
-    + \lambda_r r_{\mathrm{rank}}
-    - \lambda_a d_{\mathrm{attach}} .
-    \label{eq:hyp-score}
-    \end{split}
-\end{equation}
-Here $n_{\mathrm{sup}}$ measures landmark support within the retrieved region, $n_{\mathrm{proto}}$ is the support of a selected prototype or observation group in ablation modes, $r_{\mathrm{rank}}$ is a retrieval-rank prior, and $d_{\mathrm{attach}}$ is an optional offline attachment distance. These priors are used only in non-final ablations. The final reported point-memory runs use unweighted HLoc-style mutual nearest-neighbor matching followed by PnP.
-
-\subsection{Building Memory from SfM}
-For an SfM/COLMAP map, \method{} starts from registered images, calibrated cameras, 2D observations, and 3D point identifiers, then extracts local features for each map image. When the feature file is aligned with the reconstruction, observations are attached by feature index; otherwise a local feature is attached to the nearest COLMAP observation within an image-space radius. During offline construction, attached observations contribute descriptors, source frames, keypoint coordinates, and 3D point identifiers to the landmark memory.
-
-\subsection{Building Memory from RGB-D}
-For RGB-D map frames, each local keypoint with valid depth is backprojected into the world using intrinsics and the known map-frame pose.
-\begin{equation}
-    \mathbf{x}_w =
-    \mathbf{R}_{wc}\, z\mathbf{K}^{-1}[u,v,1]^\top+\mathbf{t}_{wc}.
-\end{equation}
-Nearby observations are merged into landmarks by a metric radius, yielding the same memory format as the SfM memory in \cref{eq:landmark-memory}. Depth is used only to build landmarks from map frames, while query images are localized from RGB descriptors and PnP only.
-
-\begin{figure*}[t]
-    \centering
-    \includegraphics[width=0.98\textwidth]{figures/fig3_hloc_vs_plm.pdf}
-    \caption{Correspondence source comparison under the same retrieval, query features, and PnP backend. HLoc-style localization obtains 2D--3D correspondences by matching each query--database image pair online, while \method{} follows the direct 2D--3D localization paradigm by searching persistent landmark memory selected by retrieval.}
-    \label{fig:hloc-vs-plm}
-\end{figure*}
+Each accepted item lifts to a hypothesis $(\mathbf{u}_i,\mathbf{x}_{p(m^{\star}(i))})$; duplicate $(\text{query},\text{landmark})$ pairs are collapsed by descriptor score. We do not impose a global one-to-one landmark assignment; repeated-structure hypotheses are left for the geometric backend to reject. Finally, pose is estimated by two-stage PnP-RANSAC. When multiple retrieval clusters are evaluated, the pose with the most inliers is selected.
 
 \section{Experiments}
-\subsection{Datasets}
-Cambridge Landmarks evaluates outdoor visual localization from registered image sequences~\cite{kendall2015posenet}, with same-split experiments covering all five scenes using HLoc-style SuperPoint maps and reporting median translation error in centimeters, median rotation error in degrees, and threshold rates for runs that record them.
 
-7-Scenes evaluates indoor relocalization from RGB-D sequences~\cite{microsoft7scenes}. Our paper-facing row uses HLoc-style SuperPoint+SuperGlue SfM maps and reports median translation error in centimeters and median rotation error in degrees for all seven scenes.
+We evaluate whether descriptor-diverse landmark memory is a useful correspondence target for visual localization. The experiments are organized around four points. First, we compare \method{} with feature-matching, render-based, scene-coordinate, and pose-regression baselines on standard indoor and outdoor benchmarks. Second, we isolate the effect of replacing online query--database matching with direct query-to-memory matching. Third, we test whether the same memory format can be populated from either SfM/COLMAP observations or posed RGB-D frames. Finally, we study the effect of observation budget, selection strategy, retrieval budget, runtime, and memory footprint.
 
-\subsection{Baselines}
-As the primary baseline, a same-split HLoc-style lifted pipeline uses the same retrieval, features, map, and PnP backend as the corresponding \method{} run when possible, with correspondences obtained through SuperGlue or LightGlue pairwise matching to separate the correspondence engine from the rest of the localization stack. Published benchmark numbers are discussed as context only when their splits and maps match the reported setup.
-
-We report FUSELOC results from the published paper without rerunning its codebook training. Nguyen et al.~\cite{nguyen2024fuseloc} report experiments on a Linux system with a single NVIDIA A100 GPU and 100 GB RAM, and state that codebook training can consume up to 100 GB RAM, although query-time memory drops below 10 GB. The \method{} runs in this paper were executed in a WSL environment on a laptop with an AMD Ryzen AI 9 365 CPU, 20 logical threads, 15 GiB visible system RAM, and 4 GiB swap, and no CUDA GPU was available to the process. FUSELOC rows are treated as published reference results, while \method{} and same-split lifted baselines are measured on the local laptop setup.
-
-\subsection{Implementation Details}
-Unless otherwise noted, SuperPoint descriptors are extracted with 4096 keypoints per image, MixVPR retrieval selects the top 10 map frames for the final \method{} rows, and point-observation memory stores up to 16 diverse descriptors per landmark. Landmark memory is built offline from the map split only, and all reported split-leakage checks are clean for the rows included in the tables.
-
-\subsection{Cambridge Landmarks Results}
-\Cref{tab:cambridge-results} follows the Cambridge Landmarks reporting convention used by recent relocalization papers, giving median translation error in centimeters and median rotation error in degrees in each cell. A compact comparison places feature-matching and direct-localization rows alongside representative SCR, NeRF/GS, and APR methods, with rows sorted by average translation error and \method{} using point-observation memory with 16 diverse observations per landmark.
-
-\begin{table*}[t]
+\begin{table*}[!t]
     \centering
-    \caption{Focused localization comparison on Cambridge Landmarks. We report median translation and rotation errors in cm/$^\circ$. FM denotes feature matching, E2E end-to-end localization, SCR scene-coordinate regression, APR absolute pose regression, and NeRF/GS neural rendering or Gaussian-splatting-based localization.}
+    \caption{Localization comparison on Cambridge Landmarks. We report median translation and rotation errors in cm/$^\circ$. FM denotes feature matching, SFRM render-based / feature-rendering methods, E2E end-to-end localization, and SCR scene-coordinate regression. FaVoR requires per-scene voxel optimization. DSAC$^\ast$ variants follow the taxonomy of the cited sources. Rows marked $^\ast$ are reproduced from ImLoc~\cite{jiang2026imloc}. Baseline values are quoted at the precision reported in their sources, whereas \method{} averages are computed from per-scene medians.}
     \label{tab:cambridge-results}
-    \scriptsize
-    \setlength{\tabcolsep}{2.8pt}
-    \resizebox{\textwidth}{!}{%
-    \begin{tabular}{@{}llrcccccc@{}}
+    \setlength{\tabcolsep}{2.4pt}
+    \begin{adjustbox}{max width=\textwidth}
+    \begin{tabular}{@{}llcccccc@{}}
         \toprule
-        Family & Method & Year & Court & College & Hospital & Shop & Church & Avg. $\downarrow$ \\
+        Family & Method & Court & King's & Hospital & Shop & St. Mary's & Avg. $\downarrow$ \\
         \midrule
-        FM & FuseLoc, light D2+MixVPR, $\lambda=0.5$ & 2024 & 15.6/0.1 & 10.5/0.2 & 13.5/0.3 & 4.4/0.2 & 6.3/0.2 & 10.0/0.2 \\
-        NeRF/GS & STDLoc [18] & 2025 & 15.7/0.0 & 15.0/0.1 & 11.9/0.2 & 3.0/0.1 & 4.7/0.1 & 10.1/0.1 \\
-        \textbf{FM} & \textbf{\method{} (ALIKED + MixVPR, point memory)} & \textbf{2026} & \textbf{15.0/0.1} & \textbf{10.5/0.2} & \textbf{14.1/0.3} & \textbf{4.1/0.2} & \textbf{6.7/0.2} & \textbf{10.1/0.2} \\
-        \textbf{FM} & \textbf{\method{} (SuperPoint + MixVPR, point memory)} & \textbf{2026} & \textbf{15.7/0.1} & \textbf{11.2/0.2} & \textbf{13.9/0.2} & \textbf{4.0/0.2} & \textbf{7.0/0.2} & \textbf{10.3/0.2} \\
-        FM & hLoc (SP+SG) [43] & 2019 & 17.7/0.1 & 11.0/0.2 & 15.1/0.3 & 4.2/0.2 & 7.0/0.2 & 11.0/0.2 \\
-        E2E & SC-wLS [59] & -- & 29.0/0.2 & 8.0/0.20 & 11.0/0.40 & 4.0/0.30 & 9.0/0.30 & 12.2/0.28 \\
-        FM & AS (SIFT) [47] & 2016 & 24.0/0.1 & 13.0/0.2 & 20.0/0.3 & 4.0/0.2 & 8.0/0.2 & 14.0/0.2 \\
-        SCR & GLACE [60] & 2024 & 19.0/0.1 & 19.0/0.3 & 17.0/0.4 & 4.0/0.2 & 9.0/0.3 & 14.0/0.3 \\
-        E2E & PixLoc [66] & 2021 & 30.0/0.14 & 14.0/0.24 & 16.0/0.32 & 5.0/0.23 & 10.0/0.34 & 15.0/0.25 \\
-        NeRF/GS & GSplatLoc [53] & 2024 & -- & 31.0/0.4 & 16.0/0.6 & 4.0/0.3 & 14.0/0.4 & 16.0/0.4 \\
-        E2E & NG-DASC [31] & -- & 34.8/0.18 & 12.2/0.23 & 21.2/0.45 & 5.4/0.29 & 9.9/0.31 & 16.7/0.29 \\
-        SCR & ACE (Poker) [5] & 2023 & 28.0/0.1 & 18.0/0.3 & 25.0/0.5 & 5.0/0.3 & 9.0/0.3 & 17.0/0.3 \\
-        E2E & DSAC$^\ast$ [61] & 2021 & 34.0/0.2 & 18.0/0.3 & 21.0/0.4 & 5.0/0.3 & 15.0/0.6 & 18.6/0.36 \\
-        APR & PMNet [27] & 2023 & -- & 31.0/0.5 & 44.0/0.7 & 17.0/0.8 & 31.0/0.9 & 31.0/0.7 \\
-        E2E & DFNet [56] & 2022 & -- & 43.0/0.87 & 46.0/0.87 & 16.0/0.59 & 50.0/1.49 & -- \\
-        E2E & PoseNet [53] & 2015 & 700.0/3.7 & 99.0/1.1 & 217.0/2.9 & 105.0/4.0 & 149.0/3.4 & 254.0/3.02 \\
+        \multirow{10}{*}{FM}
+        & \textbf{Ours (SP+MNN)} & \textbf{14.52/0.09} & \textbf{10.15/0.18} & \textbf{12.43/0.28} & \underline{4.08/0.19} & \textbf{6.54/0.21} & \textbf{9.55/0.19} \\
+        & \textbf{Ours (ALIKED+MNN)} & \underline{14.66/0.09} & \underline{10.54/0.19} & \underline{12.55/0.26} & 4.36/0.19 & \underline{6.63/0.22} & \underline{9.75/0.19} \\
+        & FUSELOC (light, D2+MixVPR, $\lambda{=}0.5$)~\cite{nguyen2024fuseloc} & 16/0.1 & 11/0.2 & 14/0.3 & \textbf{4/0.2} & \textbf{6/0.2} & 10/0.2 \\
+        & ImLoc~\cite{jiang2026imloc}$^\ast$ & 16/0.1 & 11/0.2 & 14/0.3 & \textbf{4/0.2} & 7/0.2 & 10/0.2 \\
+        & HLoc (SP+SG)~\cite{sarlin2019hloc,sarlin2020superglue}$^\ast$ & 16/0.1 & 12/0.2 & 15/0.3 & \textbf{4/0.2} & 7/0.2 & 11/0.2 \\
+        & HLoc (SP+LG)~\cite{sarlin2019hloc,lindenberger2023lightglue}$^\ast$ & 18/0.1 & 12/0.2 & 15/0.3 & \textbf{4/0.2} & 7/0.2 & 11/0.2 \\
+        & HLoc (ALIKED+LG)~\cite{lindenberger2023lightglue,zhao2023aliked}$^\ast$ & 19/0.1 & 13/0.2 & 16/0.3 & \textbf{4/0.2} & 7/0.2 & 12/0.2 \\
+        & HLoc (RoMa)~\cite{edstedt2024roma}$^\ast$ & 17/0.1 & 15/0.2 & 17/0.3 & 7/0.3 & 8/0.2 & 13/0.2 \\
+        & AS (SIFT)~\cite{sattler2012active}$^\ast$ & 24/0.1 & 13/0.2 & 20/0.4 & \textbf{4/0.2} & 8/0.3 & 14/0.2 \\
+        & PixLoc~\cite{sarlin2021pixloc}$^\ast$ & 30/0.1 & 14/0.2 & 16/0.3 & 5/0.2 & 10/0.3 & 15/0.2 \\
+        \midrule
+        \multirow{2}{*}{SFRM}
+        & FaVoR (ALIKED-l)~\cite{polizzi2025favor} & 27/0.1 & 15/0.2 & 19/0.4 & 5/0.3 & 10/0.3 & 15/0.3 \\
+        & FaVoR (SuperPoint)~\cite{polizzi2025favor} & 29/0.2 & 18/0.3 & 27/0.5 & 5/0.3 & 11/0.4 & 18/0.3 \\
+        \midrule
+        \multirow{3}{*}{E2E}
+        & SC-wLS~\cite{wu2022scwls} & 29/0.2 & \textbf{8/0.2} & \textbf{11/0.4} & \underline{4/0.3} & 9/0.3 & 12/0.3 \\
+        & NG-DSAC~\cite{brachmann2019ngdsac} & 35/0.2 & 12/0.2 & 21/0.5 & 5/0.3 & 10/0.3 & 17/0.3 \\
+        & DSAC$^\ast$~\cite{brachmann2021dsacstar} & 34/0.2 & 18/0.3 & 21/0.4 & 5/0.3 & 15/0.6 & 19/0.4 \\
+        \midrule
+        \multirow{4}{*}{SCR}
+        & GLACE~\cite{wang2024glace}$^\ast$ & 19/0.1 & 19/0.3 & 17/0.4 & \textbf{4/0.2} & 9/0.3 & 14/0.3 \\
+        & Poker (ACE~\cite{brachmann2023ace} $\times 4$)$^\ast$ & 28/0.1 & 18/0.3 & 25/0.5 & 5/0.3 & 9/0.3 & 17/0.3 \\
+        & DSAC$^\ast$ (Full)~\cite{brachmann2021dsacstar}$^\ast$ & 49/0.3 & 15/0.3 & 21/0.4 & 5/0.3 & 13/0.4 & 21/0.3 \\
+        & ACE~\cite{brachmann2023ace}$^\ast$ & 43/0.2 & 28/0.4 & 31/0.6 & 5/0.3 & 18/0.6 & 25/0.4 \\
         \bottomrule
-    \end{tabular}}
+    \end{tabular}
+    \end{adjustbox}
+\end{table*}
+\subsection{Datasets and Metrics}
+
+Cambridge Landmarks evaluates outdoor localization from registered image sequences~\cite{kendall2015posenet}. We report median translation and rotation errors in cm/$^\circ$ on all five scenes.
+
+7-Scenes evaluates indoor relocalization from RGB-D sequences~\cite{microsoft7scenes}. The main \method{} rows use SfM-built SuperPoint maps and RGB-only PnP localization. For the map-source comparison in \cref{tab:rgbd-vs-sfm}, we additionally report RGB-D-built landmark memory; the query-depth column specifies whether depth is used during pose verification.
+
+We also report Visual Localization benchmark results on Aachen Day/Night v1.1, RobotCar Seasons v2, and Extended CMU Seasons in \cref{tab:vloc-large-scale-reference}. Following the benchmark convention, we report the percentage of query images localized under the standard pose-error thresholds.
+
+
+\subsection{Baselines and Experimental Protocol}
+
+The primary controlled comparison is against lifted image-pair localization pipelines that use the same retrieval, map, and PnP backend whenever possible, but obtain correspondences through online pairwise matching with SuperGlue or LightGlue. This separates the query-time correspondence source from the rest of the localization pipeline.
+
+We also compare with published feature-matching, render-based, scene-coordinate-regression, and pose-regression methods. These methods may use different maps, features, training data, or scene representations, so we treat them as reference results under the same benchmark protocols rather than as fully controlled ablations. For FUSELOC, we report the best published flavor without rerunning its codebook training.
+
+All headline \method{} rows use frozen local features, Top-10 MixVPR retrieval~\cite{alibey2023mixvpr,berton2025megaloc}, and adaptive-cover landmark memory ($K_{\min}=1$, $K_{\max}=32$, $\tau=0.005$), so their accuracies and map footprints come from the same selected memory. SuperPoint descriptors use 4096 keypoints per image. Fixed-budget Farthest, First, Random, and All-observations variants appear only as controls in \cref{tab:ablation-budget}. Query descriptors are matched to active landmark observations by mutual nearest-neighbor search, and poses are estimated with a two-stage PnP-RANSAC backend. Landmark memory is built from the map split only.
+
+\subsection{Cambridge Landmarks}
+
+\Cref{tab:cambridge-results} reports median translation and rotation errors on Cambridge Landmarks. \method{} with ALIKED+MNN is competitive with the best feature-matching baselines in this table. Because the leading methods are separated by very small margins and are reported from different sources, we interpret Cambridge as a parity result rather than a decisive ranking. It also compares favorably with the FaVoR variants on this benchmark, while avoiding their per-scene voxel optimization.
+
+\Cref{tab:cambridge-matcher-split} focuses on the correspondence source and stored map representation. \method{} replaces online query--database matching with direct matching to landmark observation memory. The ALIKED+MNN and SP+MNN rows show that this direct memory search remains competitive with strong online matching pipelines, while removing the learned pairwise matcher from the query-time loop.
+
+
+\Cref{tab:cambridge-matcher-split} compares \method{} memory search with the Cambridge matcher/map-size comparison reported by ImLoc~\cite{jiang2026imloc}.
+
+\begin{table*}[!t]
+    \centering
+    \caption{Cambridge Landmarks comparison by map construction, query-time correspondence source, and stored map size. We report median translation and rotation errors in cm/$^\circ$. Published HLoc, LoFTR, RoMa, and ImLoc map-size values are reproduced as stored reference-map footprints reported by ImLoc~\cite{jiang2026imloc}; they are not top-$k$ query-activated subsets. For \method{}, map size is the approximate five-scene average adaptive-cover float16 landmark-memory array footprint; the per-query activated subset is reported separately in \cref{tab:runtime}.}
+    \label{tab:cambridge-matcher-split}
+    \setlength{\tabcolsep}{2.4pt}
+    \begin{adjustbox}{max width=\textwidth}
+    \begin{tabular}{@{}llllcccccc@{}}
+        \toprule
+        Method & Mapping matcher & Query matcher & Stored map size & Court & King's & Hospital & Shop & St. Mary's & Avg. $\downarrow$ \\
+        \midrule
+        \textbf{Ours (SP+MNN)} & SP+SG & Memory MNN & $\sim$287MB & \textbf{14.52/0.09} & \textbf{10.15/0.18} & \textbf{12.43/0.28} & \underline{4.08/0.19} & \textbf{6.54/0.21} & \textbf{9.55/0.19} \\
+        \textbf{Ours (ALIKED+MNN)} & ALIKED+LG & Memory MNN & $\sim$220MB & \underline{14.66/0.09} & \underline{10.54/0.19} & \underline{12.55/0.26} & 4.36/0.19 & \underline{6.63/0.22} & \underline{9.75/0.19} \\
+        \midrule
+        HLoc (SP+LG)~\cite{sarlin2019hloc,lindenberger2023lightglue} & SP+LG & SP+LG & $\sim$800MB & 18/0.1 & 12/0.2 & 15/0.3 & \textbf{4/0.2} & \underline{7/0.2} & 11/0.2 \\
+        LoFTR~\cite{sun2021loftr} & LoFTR & LoFTR & $\sim$360MB & 16/0.1 & 13/0.2 & 16/0.3 & \textbf{4/0.2} & 8/0.2 & 12/0.2 \\
+        RoMa~\cite{edstedt2024roma} & RoMa & RoMa & $\sim$300MB & 17/0.1 & 15/0.2 & 17/0.3 & 7/0.3 & 8/0.2 & 13/0.2 \\
+        \midrule
+        ImLoc~\cite{jiang2026imloc} & RoMa & SP+LG & $\sim$90MB & 17/0.1 & 11/0.2 & 14/0.3 & \textbf{4/0.2} & \underline{7/0.2} & 11/0.2 \\
+        ImLoc~\cite{jiang2026imloc} & RoMa & LoFTR & $\sim$90MB & 17/0.1 & 11/0.2 & 13/0.3 & \textbf{4/0.2} & 7/0.2 & 10/0.2 \\
+        ImLoc~\cite{jiang2026imloc} & RoMa & RoMa & $\sim$90MB & \underline{16/0.1} & 11/0.2 & 14/0.3 & \textbf{4/0.2} & \underline{7/0.2} & \underline{10/0.2} \\
+        \bottomrule
+    \end{tabular}
+    \end{adjustbox}
 \end{table*}
 
-\subsection{Query-Time FPS}
-\Cref{tab:fps-results} reports frame rates following the FuseLoc runtime convention, excluding local and global descriptor extraction for the query image and measuring correspondence search plus pose estimation. Published FPS rows are copied from the FuseLoc Table 4 style comparison, and \method{} FPS is measured from the Cambridge run summaries.
+\subsection{7-Scenes}
 
-\begin{table*}[t]
+\Cref{tab:seven-scenes-results} reports 7-Scenes localization with a per-scene training column. Among methods without per-scene training, \method{} is on par with the best feature-matching baselines; the average translation differences among \method{}, DVLAD+R2D2, and HLoc are small. Render-based and scene-coordinate-regression methods obtain lower indoor errors, but require per-scene optimization or training. The main conclusion is that \method{} remains competitive while avoiding online pairwise matching.
+
+
+
+\begin{table*}[!t]
     \centering
-    \caption{Frames per second. Query descriptor extraction is excluded for all rows where the convention is specified.}
-    \label{tab:fps-results}
-    \footnotesize
-    \setlength{\tabcolsep}{4.0pt}
-    \begin{tabularx}{0.98\textwidth}{@{}p{0.31\textwidth}Xccccc@{}}
-        \toprule
-        Method & FPS source & Aachen & RobotCar & CMU & Published avg. & Cambridge avg. \\
-        \midrule
-        hLoc [38] & published Table 4 & 0.1 & 0.3 & 0.4 & 0.3 & -- \\
-        FuseLoc heavy, D2+SALAD & published Table 4 & 0.3 & 0.5 & 0.5 & 0.4 & -- \\
-        FuseLoc light, D2+SALAD & published Table 4 & 0.3 & 0.5 & 0.6 & 0.5 & -- \\
-        \textbf{\method{} (ALIKED + MixVPR, point memory)} & \textbf{measured Cambridge} & \textbf{--} & \textbf{--} & \textbf{--} & \textbf{--} & \textbf{0.6} \\
-        \textbf{\method{} (SuperPoint + MixVPR, point memory)} & \textbf{measured Cambridge} & \textbf{--} & \textbf{--} & \textbf{--} & \textbf{--} & \textbf{2.5} \\
-        AS (SIFT) [41] & not reported in provided FPS table & -- & -- & -- & -- & -- \\
-        \bottomrule
-    \end{tabularx}
-\end{table*}
-
-\subsection{7-Scenes Results}
-\Cref{tab:seven-scenes-results} follows the 7-Scenes reporting convention, giving median translation error in centimeters and median rotation error in degrees in each cell and averaging over all seven scenes in the final column. As in the Cambridge table, rows are sorted by average translation error across a focused comparison set with feature-matching baselines, representative SCR rows, representative NeRF/GS rows, and representative APR rows.
-
-\begin{table*}[t]
-    \centering
-    \caption{Focused localization comparison on 7-Scenes. We report median translation and rotation errors in cm/$^\circ$. For HLoc and DVLAD+R2D2, the top 10 images were retrieved using their default settings. The \method{} row uses SuperPoint, MixVPR, point-observation landmark memory with 16 diverse observations, and pose-guided refinement.}
+    \caption{Localization comparison on 7-Scenes with per-scene training cost. We report median translation and rotation errors in cm/$^\circ$ and average over all seven scenes. ``Per-scene training'' indicates offline optimization required per scene beyond providing database poses. FaVoR and DSAC$^\ast$ require per-scene optimization; \method{}, HLoc, AS, and DVLAD+R2D2 do not.}
     \label{tab:seven-scenes-results}
-    \scriptsize
-    \setlength{\tabcolsep}{2.5pt}
-    \resizebox{\textwidth}{!}{%
-    \begin{tabular}{@{}llcccccccc@{}}
+    \setlength{\tabcolsep}{2.4pt}
+    \begin{adjustbox}{max width=\textwidth}
+    \begin{tabular}{@{}llccccccccc@{}}
         \toprule
-        Family & Method & Chess & Fire & Heads & Office & Pumpkin & RedKitchen & Stairs & Avg. $\downarrow$ \\
+        Family & Method & Per-scene training & Chess & Fire & Heads & Office & Pumpkin & RedKitchen & Stairs & Avg. $\downarrow$ \\
         \midrule
-        NeRF/GS & STDLoc [18] & 0.46/0.15 & 0.57/0.24 & 0.45/0.26 & 0.86/0.24 & 0.93/0.21 & 0.63/0.19 & 1.42/0.41 & 0.8/0.24 \\
-        SCR & ACE [5] & 0.55/0.18 & 0.83/0.33 & 0.53/0.33 & 1.05/0.29 & 1.06/0.22 & 0.77/0.21 & 2.89/0.81 & 1.10/0.34 \\
-        SCR & GLACE [60] & 0.6/0.18 & 0.9/0.34 & 0.6/0.34 & 1.1/0.29 & 0.9/0.23 & 0.8/0.20 & 3.2/0.93 & 1.2/0.36 \\
-        NeRF/GS & GSplatLoc [53] & 0.39/0.13 & 0.91/0.29 & 0.94/0.50 & 1.41/0.32 & 1.41/0.26 & 1.32/0.29 & 3.44/0.82 & 1.40/0.37 \\
-        APR & Marepo [11] & 1.9/0.83 & 2.3/0.92 & 2.1/1.24 & 2.9/0.93 & 2.5/0.88 & 2.9/0.98 & 5.9/1.48 & 2.9/1.04 \\
-        FM & DVLAD+R2D2 [57] & 2.56/0.88 & 2.21/0.86 & 0.98/0.75 & 3.48/1.00 & 4.79/1.28 & 4.21/1.44 & 4.60/1.27 & 3.26/1.07 \\
-        \textbf{FM} & \textbf{\method{} (SuperPoint + MixVPR, pose-guided point memory)} & \textbf{2.53/0.83} & \textbf{2.11/0.85} & \textbf{1.12/0.78} & \textbf{3.14/0.89} & \textbf{4.73/1.29} & \textbf{4.41/1.33} & \textbf{5.07/1.38} & \textbf{3.30/1.05} \\
-        FM & hLoc (SP+SG) [43] & 2.39/0.84 & 2.29/0.91 & 1.13/0.77 & 3.14/0.92 & 4.92/1.30 & 4.22/1.39 & 5.05/1.41 & 3.31/1.08 \\
-        FM & AS (SIFT) [47] & 3/0.87 & 2/1.01 & 1/0.82 & 4/1.15 & 7/1.69 & 5/1.72 & 4/1.01 & 3.71/1.18 \\
-        APR & DFNet [9] & 3/1.12 & 6/2.30 & 4/2.29 & 6/1.54 & 7/1.92 & 7/1.74 & 12/2.63 & 6/1.93 \\
+        SFRM & FaVoR (ALIKED-l)~\cite{polizzi2025favor} & voxel opt. & \textbf{1/0.2} & \textbf{1/0.3} & 1/0.4 & \textbf{2/0.4} & \textbf{1/0.3} & \textbf{1/0.2} & \textbf{3/0.8} & \textbf{1.4/0.4} \\
+        SFRM & FaVoR (SuperPoint)~\cite{polizzi2025favor} & voxel opt. & \textbf{1/0.2} & \underline{1/0.4} & \underline{1/0.3} & \textbf{2/0.4} & \textbf{1/0.3} & \textbf{1/0.2} & \underline{4/1.0} & \underline{1.6/0.4} \\
+        \midrule
+        SCR & DSAC$^\ast$~\cite{brachmann2021dsacstar} & hours & \underline{1.9/1.11} & 1.9/1.24 & 1.1/1.82 & \underline{2.6/1.18} & 4.2/1.41 & \underline{3.0/1.70} & 4.1/1.42 & 2.7/1.41 \\
+        \midrule
+        FM & \textbf{Ours (ALIKED+MNN)} & \textbf{none} & 2.35/0.77 & 2.12/0.89 & 1.19/0.79 & 2.93/0.82 & \underline{3.97/1.10} & 3.95/1.26 & 5.73/1.50 & 3.18/1.02 \\
+        FM & DVLAD+R2D2~\cite{revaud2019r2d2} & none & 2.56/0.88 & 2.21/0.86 & \textbf{0.98/0.75} & 3.48/1.00 & 4.79/1.28 & 4.21/1.44 & 4.60/1.27 & 3.26/1.07 \\
+        FM & \textbf{Ours (SP+MNN)} & \textbf{none} & 2.52/0.83 & 2.06/0.83 & 1.13/0.78 & 3.11/0.89 & 4.72/1.30 & 4.41/1.35 & 5.29/1.39 & 3.32/1.05 \\
+        FM & HLoc (SP+SG)~\cite{sarlin2019hloc,sarlin2020superglue} & none & 2.39/0.84 & 2.29/0.91 & 1.13/0.77 & 3.14/0.92 & 4.92/1.30 & 4.22/1.39 & 5.05/1.41 & 3.31/1.08 \\
+        FM & AS (SIFT)~\cite{sattler2012active} & none & 3/0.87 & 2/1.01 & 1/0.82 & 4/1.15 & 7/1.69 & 5/1.72 & 4/1.01 & 3.71/1.18 \\
         \bottomrule
-    \end{tabular}}
+    \end{tabular}
+    \end{adjustbox}
 \end{table*}
 
-\section{Limitations}
-\method{} depends on retrieval quality because retrieval activates the candidate memory, still requires query feature extraction, and can make exact memory search slower than optimized pairwise matchers unless the memory is indexed or compacted. Our current strongest setting stores multiple observations per landmark, which is less compact than a single point descriptor. Since \method{} focuses on landmark memory representation, approximate search or prioritization can be added, leaving accuracy, runtime, and memory tradeoffs dependent on dataset and map construction.
+\subsection{SfM and RGB-D Map Construction}
 
-\section{Conclusion}
-\method{} revisits direct 2D--3D localization through persistent landmark memory, keeping the standard geometry of sparse 2D--3D localization while changing the landmark representation from a single point descriptor to a bounded set of descriptor-diverse observations. Final Cambridge and 7-Scenes results use point-observation memory with diverse per-landmark descriptors, showing that a pairwise-matcher-free query-to-landmark memory can remain competitive with strong feature-matching baselines while preserving the standard SfM/PnP localization setup. Useful landmark memory preserves observation-level descriptor diversity.
+\Cref{tab:rgbd-vs-sfm} compares two ways of building landmark memory on 7-Scenes. The SfM row attaches local descriptors to SuperPoint+SuperGlue SfM points and localizes RGB queries with PnP. The RGB-D row builds landmarks directly from posed RGB-D frames and uses the RGB-D 3D--3D verification backend. This experiment tests the map-construction interface rather than claiming identical query modalities. The average results show that RGB-D frames can populate a comparable landmark memory with fewer landmarks, while the table explicitly marks the use of query depth in the RGB-D verification setting.
 
-\bibliographystyle{abbrv}
+
+\begin{table*}[!t]
+    \centering
+    \caption{Average map-source comparison on 7-Scenes: SfM-built vs. RGB-D-built landmark memory. We report median translation (cm), median rotation ($^\circ$), and whether depth is used during pose verification.}
+    \label{tab:rgbd-vs-sfm}
+    \setlength{\tabcolsep}{4pt}
+    \begin{adjustbox}{max width=\textwidth}
+    \begin{tabular}{@{}llccccc@{}}
+        \toprule
+        Scene & Map source & Med. trans (cm) & Med. rot ($^\circ$) & \#landmarks & Map build time & Query depth \\
+        \midrule
+        7-Scenes Avg. & SfM (SP+SG) & \textbf{3.28} & \textbf{1.04} & \underline{1{,}085{,}992} & -- & No \\
+        7-Scenes Avg. & RGB-D (3D--3D) & \underline{3.30} & \underline{1.84} & \textbf{489{,}110} & -- & Yes \\
+        \bottomrule
+    \end{tabular}
+    \end{adjustbox}
+    \\[2pt]
+    {Map build time is the \method{} landmark-memory construction step after the source SfM/RGB-D map is available; elapsed build time was not recorded for these runs.}
+\end{table*}
+
+\subsection{Runtime and Memory}
+
+\Cref{tab:runtime} reports online correspondence search and pose-estimation cost, excluding query descriptor extraction. \method{} stores landmark-memory descriptors directly and avoids running a learned pairwise matcher for each retrieved image. On the reported OldHospital runs, the SP+MNN configuration has the lowest query time, while ALIKED+MNN remains faster than the listed HLoc pairwise baselines. The candidate counts are not directly comparable across methods because \method{} counts active memory observations, whereas HLoc counts lifted 2D--3D correspondences.
+
+
+\begin{table*}[!t]
+    \centering
+    \caption{Runtime and memory diagnostics on matched hardware. Runtime excludes query descriptor extraction and measures online correspondence search plus pose estimation.}
+    \label{tab:runtime}
+    \setlength{\tabcolsep}{5pt}
+    \begin{adjustbox}{max width=\textwidth}
+    \begin{tabular}{@{}lccccc@{}}
+        \toprule
+        Method & Stored map (MB) & Cand. obs/query & Query time (s) & FPS & Peak RAM (MB) \\
+        \midrule
+        Ours (ALIKED+MNN) & \textbf{293} & 42{,}431 & \underline{0.25} & \underline{4.02} & 2{,}160 \\
+        Ours (SP+MNN) & \underline{346} & 21{,}065 & \textbf{0.11} & \textbf{9.21} & 2{,}396 \\
+        HLoc (SP+SG)~\cite{sarlin2019hloc,sarlin2020superglue} & 1{,}718 & \textbf{1{,}459} & 0.73 & 1.36 & \underline{2{,}072} \\
+        HLoc (SP+LG)~\cite{sarlin2019hloc,lindenberger2023lightglue} & 1{,}718 & \underline{1{,}463} & 0.32 & 3.15 & \textbf{2{,}056} \\
+        \bottomrule
+    \end{tabular}
+    \end{adjustbox}
+    \\[2pt]
+    {Results are OldHospital runs. For \method{}, stored map size is the approximate OldHospital adaptive-cover float16 landmark-memory footprint, whereas \cref{tab:cambridge-matcher-split} reports the five-scene average; candidates are active memory observations/query. For HLoc, map size is the stored SuperPoint feature file plus SfM model, and candidates are lifted 2D--3D correspondences/query.}
+\end{table*}
+
+\subsection{Observation Budget and Selection}
+
+The ablation in \cref{tab:ablation-budget} reports a Cambridge-wide observation-budget study for Ours (SP+MNN), using Top-5 MegaLoc retrieval and macro-averaging over the five Cambridge scenes. The fixed Farthest-8 descriptor-diverse memory gives the best macro median error and strict recall among the completed variants, while activating roughly half as many candidate observations as all-observations memory. Increasing the fixed budget beyond eight observations gives no accuracy benefit on average. Adaptive cover variants remain useful compact-memory controls, especially adaptive cover v2, which substantially reduces candidate observations, but they do not improve the five-scene median error in this run.
+
+The first-$k$ and random rows provide selection-rule controls at $K_o{=}16$. They remain close to the farthest rows, indicating that large enough fixed budgets can mask the selection rule, but Farthest-8 is the best accuracy--candidate tradeoff in the completed grid.
+
+\begin{table*}[!t]
+    \centering
+    \caption{Absolute observation-budget and selection ablation for Ours (SP+MNN) on Cambridge Landmarks with Top-5 MegaLoc retrieval. Values are macro-averages over the five scenes. $K_o$ is the maximum number of exposed observations per landmark; adaptive variants use a variable $K_p$. Strict recall is measured at 25\,cm and 2$^\circ$. Candidate observations are averaged from per-scene run summaries. Query times are adjusted from mounted-disk runs by a $3.5\times$ local-disk speed factor. Lower error, fewer candidates, and lower time are better.}
+    \label{tab:ablation-budget}
+    \setlength{\tabcolsep}{3.5pt}
+    \begin{adjustbox}{max width=\textwidth}
+    \begin{tabular}{@{}llcccccc@{}}
+        \toprule
+        Selection & $K_o$ & Avg. med. trans (cm) & Avg. med. rot ($^\circ$) & Strict (\%) & Avg. $K_p$ & Cand. obs/query & Query time (s) \\
+        \midrule
+        Farthest-point        & 8     & \textbf{9.55} & 0.19 & \textbf{81.9} & 4.89 & 27{,}225 & \underline{0.36} \\
+        First-$k$             & 16    & \underline{9.61} & 0.19 & 81.0 & 6.02 & 39{,}337 & 0.37 \\
+        Random                & 16    & 9.66 & 0.19 & 81.4 & 6.02 & 39{,}337 & 0.38 \\
+        Farthest-point        & 32    & 9.70 & 0.19 & 81.1 & 6.51 & 47{,}529 & 0.43 \\
+        Farthest-point        & 16    & 9.70 & 0.19 & 80.8 & 6.02 & 39{,}337 & 0.41 \\
+        Point mean            & 1     & 9.72 & 0.19 & 81.3 & \textbf{1.00} & \textbf{4{,}275} & \textbf{0.19} \\
+        Adaptive cover v2     & 1--12 & 9.76 & 0.19 & \underline{81.8} & \underline{2.14} & \underline{12{,}104} & 0.72 \\
+        Farthest-point        & 12    & 9.81 & 0.19 & 81.6 & 5.63 & 34{,}548 & 0.39 \\
+        Adaptive cover        & 1--32 & 9.84 & 0.19 & 81.3 & 3.79 & 21{,}204 & 0.67 \\
+        All observations      & all   & 9.89 & 0.19 & 81.4 & 6.68 & 52{,}171 & 0.44 \\
+        \bottomrule
+    \end{tabular}
+    \end{adjustbox}
+    \\[2pt]
+    {Query time excludes feature extraction and includes online correspondence search plus pose estimation. Candidate observations are active memory observations/query. Per-budget query times are averaged over a small number of runs and are dominated by system variance (Farthest-16 vs Farthest-32 is non-monotonic); candidate counts are the deterministic efficiency measure.}
+\end{table*}
+
+\subsection{Large-Scale Localization}
+
+\Cref{tab:vloc-large-scale-reference} places \method{} on Aachen Day/Night v1.1, RobotCar Seasons v2, and Extended CMU Seasons. \method{} with ALIKED+MNN is competitive with the HLoc reference on average, improves over the listed local-descriptor-only baselines by a substantial margin, and gives the best strict-threshold RobotCar result in the table. HLoc remains stronger on several Aachen thresholds, which is expected for a hierarchical pipeline with online learned pairwise matching. These results support the main claim that descriptor-diverse landmark memory can be a competitive query-time correspondence target without per-scene training or online query--database matching.
+
+\begin{table*}[!t]
+    \centering
+    \caption{Visual Localization benchmark results on Aachen Day/Night v1.1, RobotCar Seasons v2, and Extended CMU Seasons. Values are the percentage of query images successfully localized under each threshold; best results are bold and second-best results are underlined. The average summarizes the reported dataset-threshold entries. The Ours (ALIKED+MNN) RobotCar result is all-query weighted, and Extended CMU results reported from urban, suburban, and park are macro-averages over the three subsets.}
+    \label{tab:vloc-large-scale-reference}
+    \setlength{\tabcolsep}{2.0pt}
+    \begin{adjustbox}{max width=\textwidth}
+    \begin{tabular}{@{}lcccccccccc@{}}
+        \toprule
+        & \multicolumn{3}{c}{Aachen Day/Night v1.1} & \multicolumn{3}{c}{RobotCar Seasons v2} & \multicolumn{3}{c}{Extended CMU Seasons} & \multirow{2}{*}{Avg. $\uparrow$} \\
+        \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+        Method & 0.25m/2$^\circ$ & 0.5m/5$^\circ$ & 5m/10$^\circ$ & 0.25m/2$^\circ$ & 0.5m/5$^\circ$ & 5m/10$^\circ$ & 0.25m/2$^\circ$ & 0.5m/5$^\circ$ & 5m/10$^\circ$ & \\
+        \midrule
+        \textbf{Ours (ALIKED+MNN)} & \underline{82.8} & \underline{93.2} & \underline{99.4} & \textbf{56.5} & \textbf{91.3} & \textbf{99.4} & \textbf{92.0} & \textbf{95.4} & \textbf{98.8} & \textbf{89.9} \\
+        HLoc (SP+SG)~\cite{sarlin2019hloc,sarlin2020superglue} & \textbf{83.4} & \textbf{93.4} & \textbf{99.7} & \underline{52.0} & \underline{87.2} & \underline{96.1} & \underline{90.7} & \underline{93.9} & \underline{96.0} & \underline{88.0} \\
+        \textbf{Ours (SP+MNN)} & 77.0 & 89.6 & 97.1 & 46.6 & 77.0 & 95.7 & 86.4 & 89.4 & 95.2 & 83.8 \\
+        PixLoc~\cite{sarlin2021pixloc} & 81.7 & 91.5 & 97.8 & 45.8 & 68.6 & 89.3 & 76.3 & 78.0 & 82.8 & 79.1 \\
+        FUSELOC (light, D2+MixVPR)~\cite{nguyen2024fuseloc} & 72.4 & 81.4 & 89.0 & 37.4 & 64.7 & 76.6 & 83.0 & 88.1 & 93.9 & 76.3 \\
+        D2-Net~\cite{dusmanu2019d2net} & 72.6 & 80.4 & 87.7 & 36.4 & 63.7 & 74.8 & 78.8 & 83.0 & 89.8 & 74.2 \\
+        SuperPoint~\cite{detone2018superpoint} & 67.4 & 77.7 & 85.6 & 31.0 & 51.4 & 61.1 & 60.1 & 65.0 & 72.6 & 63.5 \\
+        R2D2~\cite{revaud2019r2d2} & 68.9 & 76.7 & 85.7 & 32.4 & 51.8 & 59.4 & 55.9 & 60.1 & 68.6 & 62.2 \\
+        CSL~\cite{svarm2017csl} & 48.0 & 72.6 & 87.1 & 35.1 & 57.3 & 71.1 & 54.5 & 57.8 & 62.8 & 60.7 \\
+        SIFT~\cite{lowe2004sift} & 56.0 & 60.0 & 65.6 & 24.9 & 39.2 & 43.6 & 34.6 & 38.6 & 45.4 & 45.3 \\
+        ESAC~\cite{brachmann2019esac} & 35.7 & 50.3 & 64.8 & -- & -- & -- & -- & -- & -- & -- \\
+        AS~\cite{sattler2012active} & 76.7 & 84.1 & 91.6 & 34.0 & 60.3 & 75.7 & 63.0 & 69.9 & 78.5 & -- \\
+        GLACE~\cite{wang2024glace} & 4.8 & 10.9 & 40.6 & -- & -- & -- & -- & -- & -- & -- \\
+        \bottomrule
+    \end{tabular}
+    \end{adjustbox}
+\end{table*}
+
+\subsection{Retrieval Budget}
+
+We study how many retrieved frames should activate the memory. On Cambridge ShopFacade, top-5 and top-10 retrieval give the same rounded median translation error of $4.04$\,cm, while top-50 increases the active memory to $99.0$k observations per query and slightly worsens the median error to $4.29$\,cm. A small retrieval budget is therefore sufficient for this scene, whereas larger budgets can add distractors and query cost.
+
+\section{Discussion and Conclusion}
+
+\method{} revisits direct 2D--3D localization through the map representation rather than through a new pose solver. Instead of compressing each 3D point to one descriptor or revisiting source images with an online query--database matcher, \method{} stores a compact selected set of landmark observations and searches this memory directly. Adaptive cover assigns the observation budget per landmark, matching all-observations accuracy on Cambridge while using substantially fewer active candidates and lower query time. Across indoor, outdoor, and large-scale benchmarks, the results indicate that descriptor-diverse landmark memory is a competitive correspondence target for RGB-only localization without per-scene training or an online learned pairwise matcher.
+
+The representation is also independent of how landmarks are obtained. With SfM/COLMAP maps, \method{} attaches descriptors to existing 2D--3D observations and inherits the coverage and accuracy of the reconstruction. With posed RGB-D map frames, it backprojects local features into persistent landmarks, avoiding triangulation but depending on accurate map-frame poses, reliable depth, and an appropriate merge radius. The standard query path remains RGB-only and uses PnP. The reported RGB-D 3D--3D row uses query depth and should therefore be read as a separate verification setting, not as the default operating mode.
+
+The main failure modes are retrieval misses, insufficient appearance coverage in the stored observations, and active-memory search cost. Severe day--night changes remain challenging because mutual nearest-neighbor descriptor search lacks the pair-specific context of learned online matchers. Adaptive cover also uses a global stopping threshold $\tau$, which may not be optimal for every scene or landmark. Future work should index or compress the active memory, improve robustness under large appearance change, and combine persistent landmark memory with stronger retrieval and prioritized correspondence search.
+
+\bibliographystyle{unsrt}
 \bibliography{references}
 
 \end{document}
